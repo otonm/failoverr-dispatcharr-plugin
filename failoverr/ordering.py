@@ -67,3 +67,51 @@ def quality_key(stats, codec_priority=DEFAULT_CODEC_PRIORITY):
         _number(stats.get("bitrate_kbps")),
         height,
     )
+
+
+def _group_by_provider(candidates):
+    """Provider ids sorted for determinism across runs."""
+    groups = defaultdict(list)
+    for candidate in candidates:
+        groups[candidate.provider_id].append(candidate)
+    return [groups[key] for key in sorted(groups, key=lambda p: str(p))]
+
+
+def _interleave(groups):
+    """Round-robin across groups. zip_longest degrades correctly when one
+    provider has fewer entries than another."""
+    return [c for row in zip_longest(*groups) for c in row if c is not None]
+
+
+def _quality_first(candidates, codec_priority):
+    buckets = defaultdict(list)
+    for candidate in candidates:
+        buckets[quality_key(candidate.stats, codec_priority)].append(candidate)
+    ordered = []
+    for key in sorted(buckets, reverse=True):
+        ordered.extend(_interleave(_group_by_provider(buckets[key])))
+    return ordered
+
+
+def _provider_first(candidates, codec_priority):
+    ranked = [
+        sorted(group, key=lambda c: quality_key(c.stats, codec_priority), reverse=True)
+        for group in _group_by_provider(candidates)
+    ]
+    return _interleave(ranked)
+
+
+def order_candidates(candidates, strategy="quality_first", codec_priority=DEFAULT_CODEC_PRIORITY):
+    """Rank candidates and interleave providers.
+
+    Known limitation (spec §11, documented not fixed): under quality_first,
+    if one bucket holds only provider A and the next bucket also starts with
+    A, two A entries appear consecutively. Interleaving is within-bucket by
+    design.
+    """
+    candidates = list(candidates)
+    if not candidates:
+        return []
+    if strategy == "provider_first":
+        return _provider_first(candidates, codec_priority)
+    return _quality_first(candidates, codec_priority)
