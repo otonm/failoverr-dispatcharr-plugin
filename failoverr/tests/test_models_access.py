@@ -1,6 +1,6 @@
 import pytest
 
-from failoverr.models_access import FieldResolutionError, resolve_field
+from failoverr.models_access import FieldResolutionError, plan_writes, resolve_field
 
 
 class FakeField:
@@ -44,3 +44,29 @@ def test_raises_listing_available_fields_when_none_match():
     assert "channel" in message and "stream" in message, (
         "the error must list what IS available, not just what is missing"
     )
+
+
+def test_empty_ordered_list_produces_no_writes():
+    """Spec §12: a channel that matched nothing is never cleared."""
+    assert plan_writes({1: 0, 2: 1}, [], [1, 2], use_offset=False) == {
+        "attach": [], "detach": [], "orders": []
+    }
+
+
+def test_new_streams_are_attached_and_missing_ones_detached():
+    result = plan_writes({1: 0, 2: 1}, [1, 3], [2], use_offset=False)
+    assert result["attach"] == [3]
+    assert result["detach"] == [2]
+    assert result["orders"] == [(1, 0), (3, 1)]
+
+
+def test_offset_mode_bumps_existing_rows_first():
+    result = plan_writes({1: 0, 2: 1}, [2, 1], [], use_offset=True)
+    bumps = [o for o in result["orders"] if o[1] >= 100000]
+    assert len(bumps) == 2
+    assert result["orders"][-2:] == [(2, 0), (1, 1)]
+
+
+def test_detach_list_never_includes_a_stream_being_kept():
+    result = plan_writes({1: 0, 2: 1}, [1, 2], [1], use_offset=False)
+    assert result["detach"] == []

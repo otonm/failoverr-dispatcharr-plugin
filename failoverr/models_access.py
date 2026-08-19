@@ -9,6 +9,8 @@ import dataclasses
 import shutil
 import subprocess
 
+from .ordering import rewrite_plan
+
 ORDER_FIELD_CANDIDATES = ["order", "position", "priority", "sort_order"]
 PROVIDER_FIELD_CANDIDATES = ["m3u_account", "m3u_source", "account", "source"]
 
@@ -145,3 +147,70 @@ def environment_report(ffprobe_path, ffmpeg_path):
         "zoneinfo": _module_available("zoneinfo"),
         "pytz": _module_available("pytz"),
     }
+
+
+def plan_writes(current, ordered_ids, detach_ids, use_offset, offset=100000):
+    """Turn a channel plan into concrete write operations.
+
+    `current` maps attached stream_id -> current order. Returns attach /
+    detach / order operations. An empty `ordered_ids` produces nothing at
+    all: a channel that matched nothing is never cleared (spec §12).
+    """
+    if not ordered_ids:
+        return {"attach": [], "detach": [], "orders": []}
+    keep = set(ordered_ids)
+    return {
+        "attach": [sid for sid in ordered_ids if sid not in current],
+        "detach": [sid for sid in detach_ids if sid not in keep],
+        "orders": rewrite_plan(current, ordered_ids, use_offset, offset),
+    }
+
+
+def apply_channel_plan(resolved, channel, ordered_ids, detach_ids, dry_run):
+    """Write one channel's plan. All order changes in a single transaction."""
+    from django.db import transaction
+
+    link_model = resolved.channel_stream_model
+    order_field = resolved.order_field
+
+    current = {
+        link.stream_id: getattr(link, order_field)
+        for link in link_model.objects.filter(channel=channel)
+    }
+    plan = plan_writes(
+        current, ordered_ids, detach_ids, resolved.has_unique_order_constraint
+    )
+    summary = {
+        "attached": len(plan["attach"]),
+        "detached": len(plan["detach"]),
+        "reordered": len(ordered_ids),
+    }
+    if dry_run or not plan["orders"]:
+        return summary
+
+    with transaction.atomic():
+        for stream_id in plan["attach"]:
+            link_model.objects.create(
+                channel=channel, stream_id=stream_id, **{order_field: 0}
+            )
+        for stream_id, new_order in plan["orders"]:
+            link_model.objects.filter(
+                channel=channel, stream_id=stream_id
+            ).update(**{order_field: new_order})
+        if plan["detach"]:
+            link_model.objects.filter(
+                channel=channel, stream_id__in=plan["detach"]
+            ).delete()
+    return summary
+
+
+def save_stream_stats(resolved, stream_id, stats):
+    """Write probe results using the key names Dispatcharr already uses.
+
+    Plugin-private bookkeeping never goes here — it lives in the sidecar.
+    """
+    from django.utils import timezone
+
+    resolved.stream_model.objects.filter(id=stream_id).update(
+        stream_stats=stats, stream_stats_updated_at=timezone.now()
+    )
