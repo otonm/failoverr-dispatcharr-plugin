@@ -10,11 +10,15 @@ from failoverr.ordering import (
 
 
 def stats(width, height, codec, fps=25, bitrate=5000):
+    """Build a stats dict using Dispatcharr's real stream_stats key names.
+
+    Confirmed via Diagnose against the live pool (CLAUDE.md §4).
+    """
     return {
         "video_codec": codec,
         "resolution": f"{width}x{height}",
-        "bitrate_kbps": bitrate,
-        "fps": fps,
+        "video_bitrate": bitrate,
+        "source_fps": fps,
         "audio_codec": "aac",
         "audio_channels": 2,
     }
@@ -228,43 +232,3 @@ def test_empty_desired_produces_no_final_assignments():
     """A channel that matched nothing is never cleared — spec §12."""
     assert rewrite_plan({1: 0, 2: 1}, [], use_offset=True) == []
 
-
-# Real stream_stats keys, captured from Diagnose against the live pool.
-# Dispatcharr writes source_fps and video_bitrate, not fps and bitrate_kbps.
-def live_stats(codec, fps, video_bitrate):
-    return {
-        "width": 1920,
-        "height": 1080,
-        "resolution": "1920x1080",
-        "source_fps": fps,
-        "audio_codec": "aac",
-        "sample_rate": 44100,
-        "stream_type": "mpegts",
-        "video_codec": codec,
-        "pixel_format": "yuv420p",
-        "audio_bitrate": 268.0,
-        "video_bitrate": video_bitrate,
-        "audio_channels": "stereo",
-        "ffmpeg_output_bitrate": 2416.1,
-    }
-
-
-def test_live_fps_key_is_read():
-    """Read source_fps, not fps.
-
-    Reading the wrong name silently ranks every stream as 0 fps and
-    kills the tiebreaker.
-    """
-    assert quality_key(live_stats("hevc", 50.0, 3100)) > quality_key(
-        live_stats("hevc", 25.0, 3100)
-    )
-
-
-def test_live_bitrate_key_is_read():
-    assert quality_key(live_stats("hevc", 25.0, 8000)) > quality_key(
-        live_stats("hevc", 25.0, 3100)
-    )
-
-
-def test_live_stats_rank_above_a_stream_with_no_probe_data():
-    assert quality_key(live_stats("hevc", 25.0, 3100)) > quality_key({})
