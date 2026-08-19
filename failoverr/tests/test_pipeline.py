@@ -1,5 +1,6 @@
 import csv
 import pathlib
+import re
 
 from failoverr.naming import normalize
 from failoverr.pipeline import (
@@ -8,6 +9,7 @@ from failoverr.pipeline import (
     find_matches,
     load_settings,
     plan_channel,
+    report_path,
     write_report,
 )
 from failoverr.state import INCONCLUSIVE, INVALID, VALID, State
@@ -171,6 +173,20 @@ def test_truncation_detaches_the_excess(tmp_path):
     assert set(ordered) | set(detach) == {1, 2, 3}
 
 
+def test_truncation_never_detaches_never_probed_streams(tmp_path):
+    """Never-probed attached streams must survive truncation too.
+
+    Only ranked (VALID/demoted-INVALID) streams count against max_streams;
+    streams with no probe history yet are exempt and must never land in
+    detach purely because the channel is over its cap.
+    """
+    state = make_state(tmp_path, {1: (VALID, 1)})  # streams 2 and 3 never probed
+    ordered, detach = plan(state, attached=(1, 2, 3), max_streams=1)
+    assert 2 not in detach
+    assert 3 not in detach
+    assert set(ordered) | set(detach) == {1, 2, 3}
+
+
 def test_result_is_provider_interleaved(tmp_path):
     state = make_state(tmp_path, {1: (VALID, 1), 2: (VALID, 1), 3: (VALID, 1)})
     ordered, _ = plan(state)
@@ -211,6 +227,14 @@ def test_write_report_creates_missing_directories(tmp_path):
 def test_write_report_with_no_rows_still_writes_a_header(tmp_path):
     path = write_report([], tmp_path / "empty.csv")
     assert "channel" in pathlib.Path(path).read_text()
+
+
+def test_report_path_is_version_independent_and_well_formed():
+    """Regression: this used to call datetime.UTC, a Python 3.11+ attribute."""
+    path = report_path("preview")
+    assert isinstance(path, pathlib.Path)
+    assert path.parent == pathlib.Path("/data/exports")
+    assert re.match(r"^failoverr-preview-\d{8}-\d{6}\.csv$", path.name)
 
 
 def test_load_settings_applies_defaults_for_missing_keys():

@@ -150,24 +150,28 @@ def plan_channel(  # noqa: PLR0913, PLR0917 - interface fixed by the task spec
             codec_priority=codec_priority,
         )
 
-    ordered = [c.stream_id for c in ranked(promotable)]
-    ordered += [c.stream_id for c in ranked(demoted)]
+    ranked_ids = [c.stream_id for c in ranked(promotable)]
+    ranked_ids += [c.stream_id for c in ranked(demoted)]
 
-    if not ordered:
+    if not ranked_ids:
         # Nothing has ever been learned about this channel: leave it
         # completely alone, including any never-probed attached streams —
         # never clear a channel on an empty result.
         return [], []
 
-    ordered += [c.stream_id for c in ranked(never_probed)]
+    never_probed_ids = [c.stream_id for c in ranked(never_probed)]
 
-    kept = ordered[: max(1, int(max_streams))]
-    truncated = [sid for sid in ordered[len(kept):] if sid in attached_ids]
+    # Truncation applies only to streams with a recorded verdict. Never-probed
+    # attached streams don't count against the limit and are never detached
+    # for it — they just haven't had a chance to earn or lose their place yet.
+    kept = ranked_ids[: max(1, int(max_streams))]
+    truncated = [sid for sid in ranked_ids[len(kept):] if sid in attached_ids]
     detach.extend(truncated)
     detach.extend(
-        sid for sid in attached_ids if sid not in ordered and sid not in detach
+        sid for sid in attached_ids
+        if sid not in ranked_ids and sid not in never_probed_ids and sid not in detach
     )
-    return kept, detach
+    return kept + never_probed_ids, detach
 
 
 def _csv_tuple(raw, fallback):
@@ -228,7 +232,9 @@ def write_report(rows, path):
 
 
 def report_path(action):
-    stamp = datetime.datetime.now(tz=datetime.UTC).strftime("%Y%m%d-%H%M%S")
+    # datetime.timezone.utc, not datetime.UTC (py3.11+) - the container's
+    # Python version is unconfirmed (CLAUDE.md §4).
+    stamp = datetime.datetime.now(tz=datetime.timezone.utc).strftime("%Y%m%d-%H%M%S")  # noqa: UP017
     return pathlib.Path(EXPORT_DIR) / f"failoverr-{action}-{stamp}.csv"
 
 
@@ -329,6 +335,7 @@ def run_preview(context):
         )
         current = attached_rows(resolved, channel)
         attached_ids = {stream_id for stream_id, _ in current}
+        matched_ids = {row.stream_id for row in matched}
         by_id = {row.stream_id: row for row in matched}
         for row in iter_attached_rows(resolved, channel, settings):
             by_id.setdefault(row.stream_id, row)
@@ -381,7 +388,8 @@ def run_preview(context):
                 "verdict": state.last_verdict(row.stream_id) or "unprobed",
                 "resolution": (row.stats or {}).get("resolution", ""),
                 "codec": (row.stats or {}).get("video_codec", ""),
-                "action": "matched - would be probed",
+                "action": "matched - would be probed"
+                if row.stream_id in matched_ids else "attached - not matched",
             })
 
         if not candidates:
