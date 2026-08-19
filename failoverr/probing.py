@@ -187,9 +187,9 @@ def is_blank(url, ffmpeg_path, seconds, runner=run_command):
     ]
     try:
         returncode, _stdout, stderr = runner(argv, seconds * 4 + 10)
+        if returncode != 0:
+            return False
+        black = sum(float(d) for d in _BLACK_DURATION.findall(stderr or ""))
+        return black >= seconds * BLANK_FRACTION
     except Exception:  # noqa: BLE001
         return False
-    if returncode != 0:
-        return False
-    black = sum(float(d) for d in _BLACK_DURATION.findall(stderr or ""))
-    return black >= seconds * BLANK_FRACTION

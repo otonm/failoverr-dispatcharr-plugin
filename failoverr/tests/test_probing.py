@@ -210,3 +210,10 @@ def test_ffmpeg_exception_fails_open():
 
     assert is_blank("http://p.example/1.ts", "ffmpeg", 5,
                     runner=exploding_runner) is False
+
+
+def test_malformed_black_duration_fails_open():
+    """Malformed duration values must not crash; fail-open is mandatory."""
+    malformed_stderr = "[blackdetect @ 0x55d] black_duration:1.2.3\n"
+    assert is_blank("http://p.example/1.ts", "ffmpeg", 5,
+                    runner=fake_runner(0, "", malformed_stderr)) is False
