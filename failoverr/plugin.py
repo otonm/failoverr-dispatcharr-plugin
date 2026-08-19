@@ -17,6 +17,36 @@ BACKUP_WARNING = (
     "There is no undo. Back up your Dispatcharr database before running this."
 )
 
+# Substrings that mark a setting whose value must never reach the log.
+_REDACT = ("password", "secret", "api_key")
+
+
+def _flatten(value, path=""):
+    """Yield (dotted.path, leaf) pairs. Empty containers are leaves."""
+    if isinstance(value, dict) and value:
+        for key, item in value.items():
+            yield from _flatten(item, f"{path}.{key}" if path else str(key))
+    elif isinstance(value, (list, tuple)) and any(
+        isinstance(item, (dict, list, tuple)) for item in value
+    ):
+        for index, item in enumerate(value):
+            yield from _flatten(item, f"{path}[{index}]")
+    else:
+        yield path or "value", value
+
+
+def _log_report(log, action, label, payload):
+    """Log one prefixed line per value.
+
+    Dispatcharr shows nothing in the UI, so `docker logs -f dispatcharr |
+    grep FAILOVERR` is the only channel - and grep is line-based, so a
+    single multi-line dump would match on its first line only.
+    """
+    for path, value in _flatten(payload):
+        lowered = path.lower()
+        shown = "***" if any(word in lowered for word in _REDACT) else value
+        log.info("FAILOVERR %s %s.%s = %s", action, label, path, shown)
+
 
 class Plugin:
     name = "Failoverr"
@@ -402,6 +432,8 @@ class Plugin:
     def run(self, action, params=None, context=None):
         context = context or {}
         log = context.get("logger", logger)
+        log.info("FAILOVERR %s START", action)
+        _log_report(log, action, "settings", context.get("settings", {}))
         handlers = {
             "diagnose": self._diagnose,
         }
@@ -410,16 +442,19 @@ class Plugin:
             log.error("FAILOVERR %s FAILED: unknown action", action)
             return {"status": "error", "message": f"Unknown action: {action}"}
         try:
-            return handler(params or {}, context)
-        except Exception as exc:  # surfaced to the UI rather than swallowed
+            result = handler(params or {}, context)
+        except Exception as exc:  # surfaced to the log rather than swallowed
             log.exception("FAILOVERR %s FAILED", action)
             return {"status": "error", "message": str(exc)}
+        _log_report(log, action, "result", result)
+        failed = isinstance(result, dict) and result.get("status") == "error"
+        log.info("FAILOVERR %s %s", action, "FAILED" if failed else "COMPLETED")
+        return result
 
     def _diagnose(self, params, context):
         from . import models_access, naming
 
         settings = context.get("settings", {})
-        log = context.get("logger", logger)
 
         strip_tokens = tuple(
             t.strip().lower()
@@ -460,7 +495,7 @@ class Plugin:
             channel_model.objects.values_list("name", flat=True)[:10]
         )
 
-        report = {
+        return {
             "status": "ok",
             "models": {
                 "channel_stream_model": str(resolved.channel_stream_model),
@@ -493,9 +528,6 @@ class Plugin:
                 ],
             },
         }
-        log.info("FAILOVERR diagnose COMPLETED: %s streams, order field %r",
-                 pool_size, resolved.order_field)
-        return report
 
     def stop(self, context=None):
         """Shut the scheduler down. Called on disable/delete/reload."""
