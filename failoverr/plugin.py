@@ -436,6 +436,7 @@ class Plugin:
         _log_report(log, action, "settings", context.get("settings", {}))
         handlers = {
             "diagnose": self._diagnose,
+            "preview": self._preview,
         }
         handler = handlers.get(action)
         if handler is None:
@@ -528,6 +529,11 @@ class Plugin:
                 ],
             },
         }
+
+    def _preview(self, params, context):
+        from . import pipeline
+
+        return pipeline.run_preview(context)
 
     def stop(self, context=None):
         """Shut the scheduler down. Called on disable/delete/reload."""

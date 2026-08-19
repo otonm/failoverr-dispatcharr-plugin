@@ -1,5 +1,15 @@
+import csv
+import pathlib
+
 from failoverr.naming import normalize
-from failoverr.pipeline import StreamRow, build_index, find_matches, plan_channel
+from failoverr.pipeline import (
+    StreamRow,
+    build_index,
+    find_matches,
+    load_settings,
+    plan_channel,
+    write_report,
+)
 from failoverr.state import INCONCLUSIVE, INVALID, VALID, State
 
 
@@ -173,3 +183,65 @@ def test_planning_is_idempotent(tmp_path):
     first, _ = plan(state, attached=(1, 2, 3))
     second, _ = plan(state, attached=set(first))
     assert first == second
+
+
+# --- Settings and reporting -------------------------------------------------
+
+def test_write_report_creates_a_csv_with_a_header(tmp_path):
+    path = write_report(
+        [{"channel": "RAI 1", "position": 0, "stream": "IT: Rai 1 4K",
+          "provider": "B", "verdict": "valid", "resolution": "3840x2160",
+          "codec": "hevc", "action": "attach"}],
+        tmp_path / "report.csv",
+    )
+    with pathlib.Path(path).open(newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert rows[0]["channel"] == "RAI 1"
+    assert rows[0]["action"] == "attach"
+
+
+def test_write_report_creates_missing_directories(tmp_path):
+    path = write_report([{"channel": "X", "position": 0, "stream": "s",
+                          "provider": "A", "verdict": "valid",
+                          "resolution": "", "codec": "", "action": "keep"}],
+                        tmp_path / "deep" / "nested" / "report.csv")
+    assert pathlib.Path(path).read_text()
+
+
+def test_write_report_with_no_rows_still_writes_a_header(tmp_path):
+    path = write_report([], tmp_path / "empty.csv")
+    assert "channel" in pathlib.Path(path).read_text()
+
+
+def test_load_settings_applies_defaults_for_missing_keys():
+    settings = load_settings({"settings": {}})
+    assert settings["dry_run"] is True
+    assert settings["match_mode"] == "strict"
+    assert settings["removal_failure_threshold"] == 3
+
+
+def test_load_settings_coerces_numeric_strings():
+    """Dispatcharr may hand back numbers as strings."""
+    settings = load_settings({"settings": {"max_streams_per_channel": "5",
+                                           "probe_ttl_hours": "12"}})
+    assert settings["max_streams_per_channel"] == 5
+    assert settings["probe_ttl_hours"] == 12
+
+
+def test_load_settings_parses_the_token_lists():
+    settings = load_settings({"settings": {
+        "strip_tokens": "hd, 4k ,uhd",
+        "codec_priority": "h264,hevc",
+    }})
+    assert settings["strip_tokens"] == ("hd", "4k", "uhd")
+    assert settings["codec_priority"] == ("h264", "hevc")
+
+
+def test_load_settings_falls_back_to_default_tokens_when_blank():
+    settings = load_settings({"settings": {"strip_tokens": "  "}})
+    assert "hevc" in settings["strip_tokens"]
+
+
+def test_load_settings_parses_the_channel_name_list():
+    settings = load_settings({"settings": {"channel_names": "RAI 1\n RAI 2 \n\n"}})
+    assert settings["channel_names"] == ["RAI 1", "RAI 2"]
