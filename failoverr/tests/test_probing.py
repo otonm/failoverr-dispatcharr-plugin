@@ -1,8 +1,16 @@
 import json
+import threading
 
 import pytest
 
-from failoverr.probing import classify, is_blank, probe
+from failoverr.probing import (
+    Prober,
+    ProbeResult,
+    classify,
+    is_blank,
+    probe,
+    should_abort_provider,
+)
 from failoverr.state import INCONCLUSIVE, INVALID, VALID
 
 
@@ -217,3 +225,81 @@ def test_malformed_black_duration_fails_open():
     malformed_stderr = "[blackdetect @ 0x55d] black_duration:1.2.3\n"
     assert is_blank("http://p.example/1.ts", "ffmpeg", 5,
                     runner=fake_runner(0, "", malformed_stderr)) is False
+
+
+# --- Concurrency and provider abort -------------------------------------------
+
+
+def test_provider_not_aborted_below_the_minimum_sample():
+    """One genuinely dead stream must not abort a healthy provider."""
+    assert should_abort_provider([INVALID] * 4) is False
+
+
+def test_provider_aborted_when_every_verdict_is_bad():
+    assert should_abort_provider([INCONCLUSIVE] * 5) is True
+    assert should_abort_provider([INVALID] * 5) is True
+    assert should_abort_provider([INVALID, INCONCLUSIVE] * 3) is True
+
+
+def test_a_single_success_prevents_abort():
+    assert should_abort_provider([INCONCLUSIVE] * 9 + [VALID]) is False
+
+
+def test_per_provider_concurrency_is_never_exceeded():
+    live = {"A": 0}
+    peak = {"A": 0}
+    lock = threading.Lock()
+
+    def counting_probe(_url, _ffprobe_path, _timeout, _runner=None):
+        with lock:
+            live["A"] += 1
+            peak["A"] = max(peak["A"], live["A"])
+        try:
+            return ProbeResult(VALID, {}, "ok")
+        finally:
+            with lock:
+                live["A"] -= 1
+
+    prober = Prober("ffprobe", 15, per_account=1, global_limit=8, cooldown=0,
+                    probe_fn=counting_probe, sleep_fn=lambda _s: None)
+    threads = [
+        threading.Thread(target=prober.probe_one, args=("A", f"u{i}"))
+        for i in range(8)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert peak["A"] == 1, "provider connection cap was exceeded"
+
+
+def test_probes_on_an_aborted_provider_return_inconclusive_without_running():
+    calls = []
+
+    def failing_probe(url, _ffprobe_path, _timeout, _runner=None):
+        calls.append(url)
+        return ProbeResult(INCONCLUSIVE, {}, "connection limit")
+
+    prober = Prober("ffprobe", 15, per_account=1, global_limit=4, cooldown=0,
+                    probe_fn=failing_probe, sleep_fn=lambda _s: None)
+    for i in range(5):
+        prober.probe_one("A", f"u{i}")
+    assert "A" in prober.aborted_providers
+
+    before = len(calls)
+    result = prober.probe_one("A", "u-after-abort")
+    assert len(calls) == before, "no further probes may be sent to this provider"
+    assert result.verdict == INCONCLUSIVE, (
+        "an aborted provider's streams must never be marked invalid"
+    )
+
+
+def test_cooldown_is_applied_between_probes_on_one_provider():
+    slept = []
+    prober = Prober("ffprobe", 15, per_account=1, global_limit=4, cooldown=2,
+                    probe_fn=lambda *_a, **_k: ProbeResult(VALID, {}, "ok"),
+                    sleep_fn=slept.append)
+    prober.probe_one("A", "u1")
+    prober.probe_one("A", "u2")
+    assert slept == [2, 2]

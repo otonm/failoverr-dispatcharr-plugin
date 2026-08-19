@@ -8,6 +8,9 @@ comment before changing anything here.
 import json
 import re
 import subprocess
+import threading
+import time
+from collections import defaultdict
 from typing import NamedTuple
 
 from .state import INCONCLUSIVE, INVALID, VALID
@@ -193,3 +196,66 @@ def is_blank(url, ffmpeg_path, seconds, runner=run_command):
         return black >= seconds * BLANK_FRACTION
     except Exception:  # noqa: BLE001
         return False
+
+
+# Never abort a provider on a sample of one: a provider that legitimately
+# carries a single dead stream is not a provider that is down.
+PROVIDER_ABORT_MINIMUM = 5
+
+
+def should_abort_provider(verdicts):
+    """Determine if a provider should be aborted based on its probing verdicts.
+
+    Returns True when a provider has produced enough verdicts, all of them bad.
+    """
+    if len(verdicts) < PROVIDER_ABORT_MINIMUM:
+        return False
+    return all(v != VALID for v in verdicts)
+
+
+class Prober:
+    """Runs probes under a per-provider cap and a global cap.
+
+    Different providers are probed in parallel while each stays serialized
+    internally. That is most of the available speedup.
+    """
+
+    def __init__(self, ffprobe_path, timeout, per_account, global_limit,  # noqa: PLR0913,PLR0917
+                 cooldown, probe_fn=probe, sleep_fn=time.sleep):
+        self.ffprobe_path = ffprobe_path
+        self.timeout = timeout
+        self.cooldown = cooldown
+        self.probe_fn = probe_fn
+        self.sleep_fn = sleep_fn
+        self._per_account = max(1, int(per_account))
+        self._global = threading.Semaphore(max(1, int(global_limit)))
+        self._locks = {}
+        self._locks_guard = threading.Lock()
+        self._verdicts = defaultdict(list)
+        self._verdicts_guard = threading.Lock()
+        self.aborted_providers = set()
+
+    def _semaphore(self, provider_id):
+        with self._locks_guard:
+            if provider_id not in self._locks:
+                self._locks[provider_id] = threading.Semaphore(self._per_account)
+            return self._locks[provider_id]
+
+    def probe_one(self, provider_id, url):
+        if provider_id in self.aborted_providers:
+            return ProbeResult(
+                INCONCLUSIVE, {},
+                "provider aborted this run; existing ranking left untouched",
+            )
+
+        with self._global, self._semaphore(provider_id):
+            result = self.probe_fn(url, self.ffprobe_path, self.timeout)
+            if self.cooldown:
+                self.sleep_fn(self.cooldown)
+
+        with self._verdicts_guard:
+            verdicts = self._verdicts[provider_id]
+            verdicts.append(result.verdict)
+            if should_abort_provider(verdicts):
+                self.aborted_providers.add(provider_id)
+        return result
