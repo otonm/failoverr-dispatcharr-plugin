@@ -1,0 +1,418 @@
+"""Failoverr - Dispatcharr plugin entry point.
+
+Django and Dispatcharr imports are lazy (inside functions) so the pure
+modules stay importable in a bare pytest run.
+"""
+
+import logging
+
+logger = logging.getLogger("failoverr")
+
+BACKUP_WARNING = (
+    "There is no undo. Back up your Dispatcharr database before running this."
+)
+
+
+class Plugin:
+    name = "Failoverr"
+    version = "0.1.0"
+    description = (
+        "Matches M3U streams to your channels, probes them for real validity "
+        "and quality, and maintains failover order with providers interleaved."
+    )
+    author = "otonvm"
+
+    fields = [
+        {
+            "id": "dry_run",
+            "label": "Dry run",
+            "type": "boolean",
+            "default": True,
+            "help_text": (
+                "ON: computes everything and writes a CSV report, but never "
+                "attaches, detaches, or reorders a stream. Probe results are "
+                "still saved, so turning this off afterwards runs almost "
+                "instantly. Leave it on until a Preview looks right."
+            ),
+        },
+        {
+            "id": "ffprobe_path",
+            "label": "ffprobe path",
+            "type": "string",
+            "default": "/usr/local/bin/ffprobe",
+            "help_text": (
+                "Wrong path means every probe fails as inconclusive and "
+                "nothing is ever attached. Run Diagnose to confirm this path "
+                "exists before your first run."
+            ),
+        },
+        {
+            "id": "ffmpeg_path",
+            "label": "ffmpeg path",
+            "type": "string",
+            "default": "/usr/local/bin/ffmpeg",
+            "help_text": (
+                "Used only for blank-screen detection. Ignored when that "
+                "setting is off."
+            ),
+        },
+        {
+            "id": "probe_timeout_seconds",
+            "label": "Probe timeout (seconds)",
+            "type": "number",
+            "default": 15,
+            "help_text": (
+                "Lower is faster but marks slow-but-working streams as "
+                "inconclusive, so they keep their old ranking and are retried "
+                "next run. A timeout never counts toward removal."
+            ),
+        },
+        {
+            "id": "channel_group",
+            "label": "Channel group",
+            "type": "string",
+            "default": "",
+            "help_text": (
+                "Only channels in this group are touched. Blank means every "
+                "channel, which on a large lineup is a much longer run."
+            ),
+        },
+        {
+            "id": "channel_names",
+            "label": "Channel names",
+            "type": "text",
+            "default": "",
+            "help_text": (
+                "One channel name per line. When set, only these channels are "
+                "processed and the group filter is ignored. Use this to test "
+                "on one channel before a full run."
+            ),
+        },
+        {
+            "id": "match_mode",
+            "label": "Match mode",
+            "type": "select",
+            "default": "strict",
+            "options": ["strict", "fuzzy"],
+            "help_text": (
+                "strict requires an exact token match, so 'RAI 1' never picks "
+                "up 'RAI 2' or 'RAI Sport 1'. fuzzy accepts near matches and "
+                "will eventually attach a wrong channel - always Preview "
+                "before running it."
+            ),
+        },
+        {
+            "id": "fuzzy_threshold",
+            "label": "Fuzzy match threshold",
+            "type": "number",
+            "default": 85,
+            "help_text": (
+                "Only used in fuzzy mode. Lower values match more streams and "
+                "more wrong ones: 'RAI 2 HD' scores 80 against 'RAI 1', so "
+                "anything at or below 80 will attach the wrong channel."
+            ),
+        },
+        {
+            "id": "strip_tokens",
+            "label": "Quality tokens to ignore",
+            "type": "text",
+            "default": (
+                "4k,uhd,fhd,hd,sd,hevc,h265,h264,avc,raw,fullhd,ultrahd,"
+                "1080p,1080i,720p,576p,480p,multi,backup,alt"
+            ),
+            "help_text": (
+                "Comma separated. These are removed from names before "
+                "matching, so 'RAI 1 HD' and 'RAI 1 4K' both reduce to "
+                "'rai 1'. Removing a token here that is part of a real "
+                "channel name will break that channel's matching."
+            ),
+        },
+        {
+            "id": "map_number_words",
+            "label": "Treat spelled-out numbers as digits",
+            "type": "boolean",
+            "default": True,
+            "help_text": (
+                "Maps one-to-ten in English, Italian, German and French, so "
+                "'Rai Uno' matches the channel 'RAI 1'. Turn off if your "
+                "channel names contain those words literally."
+            ),
+        },
+        {
+            "id": "codec_priority",
+            "label": "Codec priority",
+            "type": "string",
+            "default": "hevc,h265,h264,avc",
+            "help_text": (
+                "Best first, comma separated. Codecs not listed sort last. "
+                "This only breaks ties within a resolution tier - a 1080p "
+                "h264 stream always outranks a 720p HEVC one."
+            ),
+        },
+        {
+            "id": "order_strategy",
+            "label": "Order strategy",
+            "type": "select",
+            "default": "quality_first",
+            "options": ["quality_first", "provider_first"],
+            "help_text": (
+                "quality_first puts the best stream at position 1 and "
+                "alternates providers within each quality tier. "
+                "provider_first alternates providers from position 1, giving "
+                "better outage protection at the cost of sometimes ranking a "
+                "lower-quality stream higher."
+            ),
+        },
+        {
+            "id": "max_streams_per_channel",
+            "label": "Max streams per channel",
+            "type": "number",
+            "default": 10,
+            "help_text": (
+                "Streams beyond this are detached after ordering. Too low "
+                "loses working fallbacks; too high makes Dispatcharr walk a "
+                "long list of poor sources during an outage."
+            ),
+        },
+        {
+            "id": "probe_ttl_hours",
+            "label": "Probe cache lifetime (hours)",
+            "type": "number",
+            "default": 24,
+            "help_text": (
+                "Streams probed more recently than this are skipped entirely, "
+                "which is what makes repeat runs fast. A stream whose URL "
+                "changed is always re-probed regardless of this setting."
+            ),
+        },
+        {
+            "id": "per_account_concurrency",
+            "label": "Concurrent probes per provider",
+            "type": "number",
+            "default": 1,
+            "help_text": (
+                "Must not exceed your provider's connection limit. Setting "
+                "this too high makes your own probes fail each other, and the "
+                "plugin then concludes that working streams are dead. If "
+                "unsure, leave it at 1."
+            ),
+        },
+        {
+            "id": "account_cooldown_seconds",
+            "label": "Cooldown between probes per provider",
+            "type": "number",
+            "default": 2,
+            "help_text": (
+                "Pause after each probe on the same provider. Raise it if a "
+                "provider starts returning connection-limit errors partway "
+                "through a run."
+            ),
+        },
+        {
+            "id": "global_concurrency",
+            "label": "Global concurrent probes",
+            "type": "number",
+            "default": 4,
+            "help_text": (
+                "Ceiling across all providers combined. Different providers "
+                "are probed in parallel, which is most of the available "
+                "speedup, but each is still limited by the per-provider "
+                "setting above."
+            ),
+        },
+        {
+            "id": "removal_failure_threshold",
+            "label": "Failures before removal",
+            "type": "number",
+            "default": 3,
+            "help_text": (
+                "A stream is detached only after this many consecutive runs "
+                "found it genuinely broken. Earlier failures just move it to "
+                "the bottom of the list. Setting this to 1 will detach "
+                "streams over a single provider hiccup."
+            ),
+        },
+        {
+            "id": "blank_detect",
+            "label": "Detect blank (black) streams",
+            "type": "boolean",
+            "default": False,
+            "help_text": (
+                "Samples a few seconds of video and rejects an all-black "
+                "picture. Roughly doubles run time, which at this lineup size "
+                "is still only a few extra minutes. Any ffmpeg error leaves "
+                "the stream accepted rather than rejected."
+            ),
+        },
+        {
+            "id": "blank_detect_seconds",
+            "label": "Blank detection sample (seconds)",
+            "type": "number",
+            "default": 5,
+            "help_text": (
+                "Longer samples are more reliable but slower. A stream is "
+                "only rejected when essentially the whole sample is black."
+            ),
+        },
+        {
+            "id": "max_probes_per_run",
+            "label": "Max probes per run",
+            "type": "number",
+            "default": 400,
+            "help_text": (
+                "Safety stop, not a normal limit - a typical run uses about "
+                "200. On reaching it the run stops cleanly and keeps what it "
+                "learned; the next run continues where this one left off."
+            ),
+        },
+        {
+            "id": "max_run_minutes",
+            "label": "Max run time (minutes)",
+            "type": "number",
+            "default": 60,
+            "help_text": (
+                "Safety stop for a provider that hangs every connection. A "
+                "typical run takes 10 to 20 minutes. Stopping early is not "
+                "destructive - progress is saved."
+            ),
+        },
+        {
+            "id": "schedule_enabled",
+            "label": "Run on a schedule",
+            "type": "boolean",
+            "default": False,
+            "help_text": (
+                "Starts the scheduler when the plugin is enabled and survives "
+                "container restarts. Turn dry run off first, or the scheduled "
+                "run will change nothing."
+            ),
+        },
+        {
+            "id": "cron_expression",
+            "label": "Schedule (cron)",
+            "type": "string",
+            "default": "0 4 * * *",
+            "help_text": (
+                "Standard five-field cron. The default is 04:00 daily. Probing "
+                "consumes provider connections, so pick an hour when nobody "
+                "is watching."
+            ),
+        },
+        {
+            "id": "timezone",
+            "label": "Timezone",
+            "type": "string",
+            "default": "UTC",
+            "help_text": (
+                "Timezone the cron expression is interpreted in, e.g. "
+                "Europe/Rome. Falls back to UTC with a log warning if the "
+                "system has no timezone database."
+            ),
+        },
+    ]
+
+    actions = [
+        {
+            "id": "diagnose",
+            "label": "Diagnose",
+            "description": (
+                "Read-only. Reports what Failoverr can see: resolved database "
+                "fields, ffprobe version, stream pool size, and how your "
+                "channel names normalize. Run this first."
+            ),
+        },
+        {
+            "id": "preview",
+            "label": "Preview",
+            "description": (
+                "Read-only. Shows which streams would be attached and in what "
+                "order, using probe data already cached. Probes nothing, "
+                "changes nothing, writes a CSV."
+            ),
+        },
+        {
+            "id": "run",
+            "label": "Run",
+            "description": "Full pipeline: match, probe, order, and write.",
+            "confirm": {
+                "required": True,
+                "title": "Run Failoverr?",
+                "message": (
+                    "This will attach, detach and reorder streams on your "
+                    "channels. " + BACKUP_WARNING
+                ),
+            },
+        },
+        {
+            "id": "reorder_only",
+            "label": "Reorder Only",
+            "description": (
+                "Re-sorts already attached streams using cached probe data. "
+                "No probing, no matching, nothing attached or detached."
+            ),
+            "confirm": {
+                "required": True,
+                "title": "Reorder attached streams?",
+                "message": (
+                    "This will change the failover order on your channels. "
+                    + BACKUP_WARNING
+                ),
+            },
+        },
+        {
+            "id": "probe_only",
+            "label": "Probe Only",
+            "description": (
+                "Refreshes probe data for attached streams. Does not change "
+                "which streams are attached or their order."
+            ),
+            "confirm": {
+                "required": True,
+                "title": "Probe attached streams?",
+                "message": (
+                    "This will consume provider connections for several "
+                    "minutes and update stored stream statistics. "
+                    + BACKUP_WARNING
+                ),
+            },
+        },
+        {
+            "id": "clear_lock",
+            "label": "Clear Lock",
+            "description": (
+                "Releases a stuck run lock. Use only if a run was interrupted "
+                "and Failoverr still reports one in progress."
+            ),
+        },
+        {
+            "id": "show_status",
+            "label": "Show Status",
+            "description": (
+                "Current run progress, budget use, and which execution mode "
+                "is active."
+            ),
+        },
+    ]
+
+    def run(self, action, params=None, context=None):
+        context = context or {}
+        log = context.get("logger", logger)
+        handlers = {
+            "diagnose": self._diagnose,
+        }
+        handler = handlers.get(action)
+        if handler is None:
+            log.error("FAILOVERR %s FAILED: unknown action", action)
+            return {"status": "error", "message": f"Unknown action: {action}"}
+        try:
+            return handler(params or {}, context)
+        except Exception as exc:  # surfaced to the UI rather than swallowed
+            log.exception("FAILOVERR %s FAILED: %s", action, exc)
+            return {"status": "error", "message": str(exc)}
+
+    def _diagnose(self, params, context):
+        raise NotImplementedError("Task 3")
+
+    def stop(self, context=None):
+        """Called on disable/delete/reload. Shuts the scheduler down."""
+        return None

@@ -1,0 +1,6 @@
+{
+  "name": "Failoverr",
+  "version": "0.1.0",
+  "description": "Matches M3U streams to your channels, probes them for real validity and quality, and maintains failover order with providers interleaved.",
+  "author": "otonvm"
+}
