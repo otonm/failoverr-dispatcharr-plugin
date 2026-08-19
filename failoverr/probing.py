@@ -31,7 +31,10 @@ INCONCLUSIVE_PATTERNS = [
     r"\b401\b|unauthorized",
     r"\b403\b|forbidden",
     r"\b429\b|too many requests",
-    r"\b5\d\d\b",  # any 5xx is the provider's problem, not the stream's
+    # any 5xx is the provider's problem, not the stream's — anchored to the
+    # HTTP context ffmpeg actually emits, not a bare digit run that could be
+    # a port or a stream id embedded in the URL
+    r"(?:HTTP error|Server returned)\s+5\d\d",
     r"connection limit",
     r"max(imum)?\s+(number of\s+)?connections",
     r"end of file",
@@ -42,8 +45,13 @@ INCONCLUSIVE_PATTERNS = [
 # Only affirmatively recognised defects. Anything not listed here and not
 # above stays inconclusive.
 INVALID_PATTERNS = [
-    r"\b404\b|not found",
-    r"\b410\b|gone",
+    # Anchored to the HTTP context ffmpeg actually emits ("HTTP error 404
+    # Not Found" / "Server returned 404 Not Found"). A bare "not found" also
+    # matches an unrelated ffmpeg error ("Protocol not found", "Decoder ...
+    # not found") and a bare "404" also matches a stream-id digit embedded
+    # in the URL — neither is an affirmatively recognised dead-stream defect.
+    r"(?:HTTP error|Server returned)\s+404",
+    r"(?:HTTP error|Server returned)\s+410",
     r"invalid data found",
     r"no such file or directory",
     r"moov atom not found",
@@ -183,6 +191,7 @@ def is_blank(url, ffmpeg_path, seconds, runner=run_command):
     seconds = max(1.0, float(seconds or 1))
     argv = [
         ffmpeg_path,
+        "-nostdin",
         "-t", str(seconds),
         "-i", url,
         "-vf", "blackdetect=d=0.5:pix_th=0.10",

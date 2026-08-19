@@ -126,6 +126,36 @@ def test_rate_limit_that_also_reports_invalid_data_is_inconclusive():
     assert classify(1, "", stderr).verdict == INCONCLUSIVE
 
 
+@pytest.mark.parametrize("stderr", [
+    "http://p.example/1.ts: Protocol not found",
+    "Decoder (codec none) not found for input stream #0:1",
+    "Unrecognized option 'print_format'. Option not found",
+    "http://p.example/live/u/p/404.ts: some novel transport error",
+])
+def test_unrelated_not_found_and_url_digits_are_not_misclassified_as_invalid(stderr):
+    """404/not found must be anchored to real HTTP failures.
+
+    A missing ffmpeg protocol/decoder, our own bad argv, or a stream-id
+    digit that happens to read '404' inside the URL are not affirmatively
+    recognised defects and must fall through to inconclusive.
+    """
+    assert classify(1, "", stderr).verdict == INCONCLUSIVE
+
+
+@pytest.mark.parametrize("stderr", [
+    "rtsp://p.example:554/ch1: Invalid data found when processing input",
+    "http://p.example/live/u/p/512.ts: Invalid data found when processing input",
+])
+def test_url_digits_in_5xx_range_do_not_prevent_a_real_invalid_verdict(stderr):
+    """A port (554) or stream id (512) must not match as a 5xx status.
+
+    Once the bogus inconclusive match is gone, 'Invalid data found when
+    processing input' is still an affirmatively recognised defect and the
+    result must classify invalid.
+    """
+    assert classify(1, "", stderr).verdict == INVALID
+
+
 def test_every_result_carries_a_reason():
     for result in (
         classify(0, ffprobe_json([VIDEO, AUDIO]), ""),
