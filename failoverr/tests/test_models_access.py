@@ -23,7 +23,10 @@ class FakeModel:
 
 def test_returns_first_candidate_present():
     model = FakeModel(["id", "position", "channel"])
-    assert resolve_field(model, ["order", "position", "priority"], "ordering") == "position"
+    assert (
+        resolve_field(model, ["order", "position", "priority"], "ordering")
+        == "position"
+    )
 
 
 def test_prefers_earlier_candidate_when_several_present():

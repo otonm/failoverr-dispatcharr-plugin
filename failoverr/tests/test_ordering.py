@@ -1,6 +1,12 @@
 import pytest
 
-from failoverr.ordering import DEFAULT_CODEC_PRIORITY, quality_key
+from failoverr.ordering import (
+    DEFAULT_CODEC_PRIORITY,
+    Candidate,
+    order_candidates,
+    quality_key,
+    rewrite_plan,
+)
 
 
 def stats(width, height, codec, fps=25, bitrate=5000):
@@ -16,15 +22,21 @@ def stats(width, height, codec, fps=25, bitrate=5000):
 
 def test_higher_resolution_tier_outranks_better_codec():
     """A 1080p h264 stream beats a 720p HEVC one. Tier dominates."""
-    assert quality_key(stats(1920, 1080, "h264")) > quality_key(stats(1280, 720, "hevc"))
+    assert quality_key(stats(1920, 1080, "h264")) > quality_key(
+        stats(1280, 720, "hevc")
+    )
 
 
 def test_codec_breaks_ties_within_a_tier():
-    assert quality_key(stats(1920, 1080, "hevc")) > quality_key(stats(1920, 1080, "h264"))
+    assert quality_key(stats(1920, 1080, "hevc")) > quality_key(
+        stats(1920, 1080, "h264")
+    )
 
 
 def test_unlisted_codec_sorts_last_within_a_tier():
-    assert quality_key(stats(1920, 1080, "mpeg2")) < quality_key(stats(1920, 1080, "avc"))
+    assert quality_key(stats(1920, 1080, "mpeg2")) < quality_key(
+        stats(1920, 1080, "avc")
+    )
 
 
 def test_fps_breaks_ties_after_codec():
@@ -53,7 +65,12 @@ def test_missing_stats_sort_last_and_do_not_raise():
 
 def test_garbage_values_do_not_raise():
     assert quality_key(
-        {"resolution": "unknown", "fps": "n/a", "bitrate_kbps": None, "video_codec": None}
+        {
+            "resolution": "unknown",
+            "fps": "n/a",
+            "bitrate_kbps": None,
+            "video_codec": None,
+        }
     ) == quality_key({})
 
 
@@ -67,8 +84,6 @@ def test_custom_codec_priority_is_respected():
 def test_default_codec_priority_prefers_hevc():
     assert DEFAULT_CODEC_PRIORITY[0] == "hevc"
 
-
-from failoverr.ordering import Candidate, order_candidates
 
 # Spec §16. Note the lies: A's "4K" is really 720p, B's "SD" is really
 # 1080p HEVC. Ranking must follow the stats, not the names.
@@ -150,9 +165,6 @@ def test_uneven_provider_counts_do_not_drop_entries():
 
 def test_unknown_strategy_falls_back_to_quality_first():
     assert order_candidates(SEVEN, strategy="nonsense") == order_candidates(SEVEN)
-
-
-from failoverr.ordering import rewrite_plan
 
 
 class UniqueOrderStore:

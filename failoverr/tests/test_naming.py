@@ -1,6 +1,6 @@
 import pytest
 
-from failoverr.naming import normalize
+from failoverr.naming import matches, normalize, score
 
 # Spec §16, verbatim. Channel "RAI 1" normalizes to ('rai', '1').
 FIXTURES = [
@@ -59,8 +59,6 @@ def test_empty_name_gives_empty_tuple():
     assert normalize("") == ()
     assert normalize("   ") == ()
 
-
-from failoverr.naming import matches, normalize, score
 
 CHANNEL = normalize("RAI 1")
 

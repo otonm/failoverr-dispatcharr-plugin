@@ -1,8 +1,6 @@
 import json
 import pathlib
 
-import pytest
-
 PLUGIN_DIR = pathlib.Path(__file__).resolve().parent.parent
 
 

@@ -91,7 +91,7 @@ def score(a, b):
 
 
 def matches(channel_tokens, stream_tokens, mode="strict", threshold=85):
-    """Does this stream belong on this channel?"""
+    """Decide whether this stream belongs on this channel."""
     if not channel_tokens or not stream_tokens:
         return False
     if mode == "strict":

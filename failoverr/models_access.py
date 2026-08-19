@@ -43,23 +43,27 @@ def _import_channel_stream(channel_model):
     """CLAUDE.md §4: importable directly, or reachable through the M2M."""
     try:
         from apps.channels.models import ChannelStream
-
-        return ChannelStream
     except (ImportError, AttributeError):
         return channel_model.streams.through
+    return ChannelStream
 
 
 def _detect_unique_order_constraint(model, order_field):
-    """A unique (channel, order) constraint forces the offset trick."""
+    """Report a unique (channel, order) constraint: it forces the offset trick."""
     for unique_together in getattr(model._meta, "unique_together", ()) or ():
         if order_field in unique_together:
             return True
     for constraint in getattr(model._meta, "constraints", ()) or ():
         fields = getattr(constraint, "fields", ()) or ()
-        if order_field in fields and constraint.__class__.__name__ == "UniqueConstraint":
+        if (
+            order_field in fields
+            and constraint.__class__.__name__ == "UniqueConstraint"
+        ):
             return True
     for field in model._meta.get_fields():
-        if getattr(field, "name", None) == order_field and getattr(field, "unique", False):
+        if getattr(field, "name", None) == order_field and getattr(
+            field, "unique", False
+        ):
             return True
     return False
 
@@ -90,7 +94,11 @@ def _binary_version(path):
     resolved = shutil.which(path) or path
     try:
         proc = subprocess.run(
-            [resolved, "-version"], capture_output=True, text=True, timeout=10
+            [resolved, "-version"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
         )
     except (OSError, subprocess.SubprocessError) as exc:
         return {"path": resolved, "present": False, "error": str(exc)}
@@ -107,7 +115,7 @@ def _module_available(name):
 
     try:
         module = importlib.import_module(name)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - importing a module can raise anything
         return {"available": False, "error": str(exc)}
     return {"available": True, "version": getattr(module, "__version__", "unknown")}
 

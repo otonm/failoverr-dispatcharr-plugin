@@ -1,0 +1,25 @@
+target-version = "py311"
+line-length = 88
+
+[lint]
+select = ["ALL"]
+ignore = [
+    "ANN",     # this codebase carries no type annotations
+    "D1",      # docstrings where they add something, not everywhere
+    "D203",    # conflicts with D211
+    "D213",    # conflicts with D212
+    "COM812",  # conflicts with the formatter
+    "CPY001",  # no copyright headers
+    "PLC0415", # lazy Django imports are mandatory here (CLAUDE.md §16)
+    "SLF001",  # Model._meta is Django's documented introspection API
+    "RUF012",  # fields/actions must be plain lists: Dispatcharr reads them
+    "ARG002",  # run()/stop() signatures are fixed by Dispatcharr
+    "EM",      # message-in-exception boilerplate
+    "TRY003",  # ditto
+    "FBT",     # boolean settings flags are the public API here
+    "S603",    # subprocess args come from settings, never a shell
+    "PT006",   # "a,b" parametrize names are idiomatic pytest
+]
+
+[lint.per-file-ignores]
+"failoverr/tests/*" = ["S101", "PLR2004", "PT018"]

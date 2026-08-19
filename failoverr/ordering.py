@@ -70,16 +70,19 @@ def quality_key(stats, codec_priority=DEFAULT_CODEC_PRIORITY):
 
 
 def _group_by_provider(candidates):
-    """Provider ids sorted for determinism across runs."""
+    """Group candidates by provider, ids sorted for determinism across runs."""
     groups = defaultdict(list)
     for candidate in candidates:
         groups[candidate.provider_id].append(candidate)
-    return [groups[key] for key in sorted(groups, key=lambda p: str(p))]
+    return [groups[key] for key in sorted(groups, key=str)]
 
 
 def _interleave(groups):
-    """Round-robin across groups. zip_longest degrades correctly when one
-    provider has fewer entries than another."""
+    """Round-robin across groups.
+
+    zip_longest degrades correctly when one provider has fewer entries
+    than another.
+    """
     return [c for row in zip_longest(*groups) for c in row if c is not None]
 
 
@@ -101,7 +104,11 @@ def _provider_first(candidates, codec_priority):
     return _interleave(ranked)
 
 
-def order_candidates(candidates, strategy="quality_first", codec_priority=DEFAULT_CODEC_PRIORITY):
+def order_candidates(
+    candidates,
+    strategy="quality_first",
+    codec_priority=DEFAULT_CODEC_PRIORITY,
+):
     """Rank candidates and interleave providers.
 
     Known limitation (spec §11, documented not fixed): under quality_first,

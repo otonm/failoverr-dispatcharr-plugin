@@ -9,6 +9,10 @@ import logging
 
 logger = logging.getLogger("failoverr")
 
+# How many raw stream_stats rows Diagnose shows, and how many it scans.
+_STATS_SAMPLES = 3
+_STATS_SCAN_LIMIT = 2000
+
 BACKUP_WARNING = (
     "There is no undo. Back up your Dispatcharr database before running this."
 )
@@ -408,12 +412,11 @@ class Plugin:
         try:
             return handler(params or {}, context)
         except Exception as exc:  # surfaced to the UI rather than swallowed
-            log.exception("FAILOVERR %s FAILED: %s", action, exc)
+            log.exception("FAILOVERR %s FAILED", action)
             return {"status": "error", "message": str(exc)}
 
     def _diagnose(self, params, context):
-        from . import models_access
-        from . import naming
+        from . import models_access, naming
 
         settings = context.get("settings", {})
         log = context.get("logger", logger)
@@ -446,10 +449,10 @@ class Plugin:
             if not isinstance(stats, dict):
                 continue
             key_counts.update(stats.keys())
-            if len(samples) < 3:
+            if len(samples) < _STATS_SAMPLES:
                 samples.append(stats)
             sampled += 1
-            if sampled >= 2000:
+            if sampled >= _STATS_SCAN_LIMIT:
                 break
 
         channel_model = resolved.channel_model
@@ -495,5 +498,5 @@ class Plugin:
         return report
 
     def stop(self, context=None):
-        """Called on disable/delete/reload. Shuts the scheduler down."""
-        return None
+        """Shut the scheduler down. Called on disable/delete/reload."""
+        return
