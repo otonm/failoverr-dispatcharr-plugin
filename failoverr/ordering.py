@@ -63,8 +63,10 @@ def quality_key(stats, codec_priority=DEFAULT_CODEC_PRIORITY):
     return (
         _tier(height),
         _codec_rank(stats, codec_priority),
-        _number(stats.get("fps")),
-        _number(stats.get("bitrate_kbps")),
+        # Dispatcharr's own probe writes source_fps and video_bitrate.
+        # CLAUDE.md §4 named fps and bitrate_kbps; keep both as fallbacks.
+        _number(stats.get("source_fps") or stats.get("fps")),
+        _number(stats.get("video_bitrate") or stats.get("bitrate_kbps")),
         height,
     )
 
