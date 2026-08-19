@@ -413,9 +413,16 @@ class Plugin:
 
     def _diagnose(self, params, context):
         from . import models_access
+        from . import naming
 
         settings = context.get("settings", {})
         log = context.get("logger", logger)
+
+        strip_tokens = tuple(
+            t.strip().lower()
+            for t in str(settings.get("strip_tokens", "")).split(",")
+            if t.strip()
+        ) or naming.DEFAULT_STRIP_TOKENS
 
         resolved = models_access.resolve_models()
         environment = models_access.environment_report(
@@ -473,7 +480,14 @@ class Plugin:
             },
             "channels": {
                 "total": channel_model.objects.count(),
-                "sample_names": channel_names,
+                "normalization_examples": [
+                    {"name": n, "tokens": list(naming.normalize(
+                        n,
+                        strip_tokens=strip_tokens,
+                        map_number_words=bool(settings.get("map_number_words", True)),
+                    ))}
+                    for n in channel_names
+                ],
             },
         }
         log.info("FAILOVERR diagnose COMPLETED: %s streams, order field %r",
