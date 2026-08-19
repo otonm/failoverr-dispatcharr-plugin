@@ -57,6 +57,9 @@ _INT_KEYS = (
     "max_probes_per_run", "max_run_minutes",
 )
 
+_BOOL_KEYS = ("dry_run", "map_number_words", "blank_detect", "schedule_enabled")
+_FALSE_STRINGS = ("false", "0", "no", "off")
+
 
 class StreamRow(NamedTuple):
     stream_id: int
@@ -172,6 +175,18 @@ def _csv_tuple(raw, fallback):
     return parts or fallback
 
 
+def _to_bool(raw):
+    """Coerce a boolean setting. Dispatcharr may hand back a string.
+
+    bool("false") is True in plain Python - any non-empty string is
+    truthy - so a real Python bool passes through, and a string is judged
+    by its content instead.
+    """
+    if isinstance(raw, str):
+        return raw.strip().lower() not in _FALSE_STRINGS
+    return bool(raw)
+
+
 def load_settings(context):
     """Typed settings with defaults. Dispatcharr may hand back strings."""
     raw = dict(_DEFAULTS)
@@ -184,8 +199,8 @@ def load_settings(context):
             settings[key] = int(float(raw[key]))
         except (TypeError, ValueError):
             settings[key] = _DEFAULTS[key]
-    for key in ("dry_run", "map_number_words", "blank_detect", "schedule_enabled"):
-        settings[key] = bool(raw[key])
+    for key in _BOOL_KEYS:
+        settings[key] = _to_bool(raw[key])
 
     settings["strip_tokens"] = _csv_tuple(
         raw.get("strip_tokens"), DEFAULT_STRIP_TOKENS

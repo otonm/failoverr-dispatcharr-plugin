@@ -228,6 +228,20 @@ def test_load_settings_coerces_numeric_strings():
     assert settings["probe_ttl_hours"] == 12
 
 
+def test_load_settings_coerces_boolean_strings():
+    """bool("false") is True in plain Python - this must not leak through."""
+    settings = load_settings({"settings": {
+        "map_number_words": "false", "blank_detect": "true",
+    }})
+    assert settings["map_number_words"] is False
+    assert settings["blank_detect"] is True
+
+
+def test_load_settings_passes_through_a_real_bool():
+    settings = load_settings({"settings": {"dry_run": False}})
+    assert settings["dry_run"] is False
+
+
 def test_load_settings_parses_the_token_lists():
     settings = load_settings({"settings": {
         "strip_tokens": "hd, 4k ,uhd",
