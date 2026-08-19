@@ -192,14 +192,19 @@ def apply_channel_plan(resolved, channel, ordered_ids, detach_ids, dry_run):
         return summary
 
     with transaction.atomic():
-        # Distinct placeholder orders (offset + index) so 2+ creates in this
-        # loop can never collide under a unique (channel, order) constraint.
-        # The order pass right after overwrites all of these unconditionally.
+        # Placeholder orders for new rows must be disjoint from every value
+        # the order pass below might use, including rewrite_plan's bump
+        # range (existing_order + ORDER_OFFSET, up to high_water +
+        # ORDER_OFFSET). Starting past that — ORDER_OFFSET + high_water + 1 —
+        # guarantees no collision with a bump target regardless of how many
+        # rows currently exist or what their current orders are. The order
+        # pass right after overwrites all of these unconditionally.
+        high_water = max(current.values(), default=-1)
         for index, stream_id in enumerate(plan["attach"]):
             link_model.objects.create(
                 channel=channel,
                 stream_id=stream_id,
-                **{order_field: ORDER_OFFSET + index},
+                **{order_field: ORDER_OFFSET + high_water + 1 + index},
             )
         for stream_id, new_order in plan["orders"]:
             link_model.objects.filter(
