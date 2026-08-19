@@ -141,6 +141,18 @@ def test_inconclusive_streams_that_are_not_attached_are_not_added(tmp_path):
     assert 2 not in ordered
 
 
+def test_never_probed_attached_streams_are_kept(tmp_path):
+    """No verdict at all (not even inconclusive) must not read as dead.
+
+    Happens on a first run, or whenever the probe budget runs out before
+    every attached candidate is (re-)probed.
+    """
+    state = make_state(tmp_path, {1: (VALID, 1)})  # stream 2 never probed
+    ordered, detach = plan(state, attached=(1, 2))
+    assert 2 in ordered
+    assert detach == []
+
+
 def test_truncation_detaches_the_excess(tmp_path):
     state = make_state(tmp_path, {1: (VALID, 1), 2: (VALID, 1), 3: (VALID, 1)})
     ordered, detach = plan(state, attached=(1, 2, 3), max_streams=2)

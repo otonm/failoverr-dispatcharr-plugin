@@ -61,6 +61,10 @@ def plan_channel(  # noqa: PLR0913, PLR0917 - interface fixed by the task spec
     Rules, all from spec §12:
       - only confirmed-valid streams are ever newly attached;
       - an attached stream whose probe was inconclusive keeps its place;
+      - an attached stream that was never probed at all also keeps its
+        place, but only once something else about this channel is known —
+        if literally nothing has ever been probed, the channel is left
+        completely alone rather than being rewritten into its own order;
       - an attached stream that failed, but not `threshold` times in a row,
         is demoted to the bottom rather than removed;
       - a channel whose plan comes out empty is left completely alone.
@@ -69,6 +73,7 @@ def plan_channel(  # noqa: PLR0913, PLR0917 - interface fixed by the task spec
     detach = []
     promotable = []
     demoted = []
+    never_probed = []
 
     for candidate in candidates:
         verdict = state.last_verdict(candidate.stream_id)
@@ -82,6 +87,8 @@ def plan_channel(  # noqa: PLR0913, PLR0917 - interface fixed by the task spec
             promotable.append(candidate)
         elif is_attached and verdict == INVALID:
             demoted.append(candidate)
+        elif is_attached and verdict is None:
+            never_probed.append(candidate)
         # Unattached and not confirmed valid: never attach it.
 
     def ranked(items):
@@ -98,8 +105,12 @@ def plan_channel(  # noqa: PLR0913, PLR0917 - interface fixed by the task spec
     ordered += [c.stream_id for c in ranked(demoted)]
 
     if not ordered:
-        # Never clear a channel on an empty result.
+        # Nothing has ever been learned about this channel: leave it
+        # completely alone, including any never-probed attached streams —
+        # never clear a channel on an empty result.
         return [], []
+
+    ordered += [c.stream_id for c in ranked(never_probed)]
 
     kept = ordered[: max(1, int(max_streams))]
     truncated = [sid for sid in ordered[len(kept):] if sid in attached_ids]
