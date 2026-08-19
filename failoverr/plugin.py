@@ -4,6 +4,7 @@ Django and Dispatcharr imports are lazy (inside functions) so the pure
 modules stay importable in a bare pytest run.
 """
 
+import collections
 import logging
 
 logger = logging.getLogger("failoverr")
@@ -411,7 +412,73 @@ class Plugin:
             return {"status": "error", "message": str(exc)}
 
     def _diagnose(self, params, context):
-        raise NotImplementedError("Task 3")
+        from . import models_access
+
+        settings = context.get("settings", {})
+        log = context.get("logger", logger)
+
+        resolved = models_access.resolve_models()
+        environment = models_access.environment_report(
+            settings.get("ffprobe_path", "/usr/local/bin/ffprobe"),
+            settings.get("ffmpeg_path", "/usr/local/bin/ffmpeg"),
+        )
+
+        stream_model = resolved.stream_model
+        pool_size = stream_model.objects.count()
+
+        # Sample stream_stats without loading the pool: what keys are really
+        # in use, and what do three real rows look like?
+        key_counts = collections.Counter()
+        samples = []
+        sampled = 0
+        for stats in (
+            stream_model.objects.exclude(stream_stats__isnull=True)
+            .values_list("stream_stats", flat=True)
+            .iterator(chunk_size=500)
+        ):
+            if not isinstance(stats, dict):
+                continue
+            key_counts.update(stats.keys())
+            if len(samples) < 3:
+                samples.append(stats)
+            sampled += 1
+            if sampled >= 2000:
+                break
+
+        channel_model = resolved.channel_model
+        channel_names = list(
+            channel_model.objects.values_list("name", flat=True)[:10]
+        )
+
+        report = {
+            "status": "ok",
+            "models": {
+                "channel_stream_model": str(resolved.channel_stream_model),
+                "order_field": resolved.order_field,
+                "provider_field": resolved.provider_field,
+                "has_unique_order_constraint": resolved.has_unique_order_constraint,
+                "channel_stream_fields": sorted(
+                    f.name for f in resolved.channel_stream_model._meta.get_fields()
+                ),
+                "stream_fields": sorted(
+                    f.name for f in stream_model._meta.get_fields()
+                ),
+            },
+            "environment": environment,
+            "pool": {
+                "stream_count": pool_size,
+                "sampled": sampled,
+                "stream_stats_keys": dict(key_counts.most_common()),
+                "stream_stats_samples": samples,
+            },
+            "channels": {
+                "total": channel_model.objects.count(),
+                "sample_names": channel_names,
+            },
+        }
+        log.info("FAILOVERR diagnose COMPLETED: %s streams, order field %r",
+                 pool_size, resolved.order_field)
+        return report
 
     def stop(self, context=None):
         """Called on disable/delete/reload. Shuts the scheduler down."""
