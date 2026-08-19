@@ -149,7 +149,10 @@ def environment_report(ffprobe_path, ffmpeg_path):
     }
 
 
-def plan_writes(current, ordered_ids, detach_ids, use_offset, offset=100000):
+ORDER_OFFSET = 100000
+
+
+def plan_writes(current, ordered_ids, detach_ids, use_offset, offset=ORDER_OFFSET):
     """Turn a channel plan into concrete write operations.
 
     `current` maps attached stream_id -> current order. Returns attach /
@@ -189,9 +192,14 @@ def apply_channel_plan(resolved, channel, ordered_ids, detach_ids, dry_run):
         return summary
 
     with transaction.atomic():
-        for stream_id in plan["attach"]:
+        # Distinct placeholder orders (offset + index) so 2+ creates in this
+        # loop can never collide under a unique (channel, order) constraint.
+        # The order pass right after overwrites all of these unconditionally.
+        for index, stream_id in enumerate(plan["attach"]):
             link_model.objects.create(
-                channel=channel, stream_id=stream_id, **{order_field: 0}
+                channel=channel,
+                stream_id=stream_id,
+                **{order_field: ORDER_OFFSET + index},
             )
         for stream_id, new_order in plan["orders"]:
             link_model.objects.filter(
