@@ -115,3 +115,23 @@ def order_candidates(candidates, strategy="quality_first", codec_priority=DEFAUL
     if strategy == "provider_first":
         return _provider_first(candidates, codec_priority)
     return _quality_first(candidates, codec_priority)
+
+
+def rewrite_plan(current, desired, use_offset, offset=100000):
+    """Ordered (stream_id, new_order) assignments to reach `desired`.
+
+    When a unique (channel, order) constraint exists, every existing row is
+    first bumped by `offset` — which preserves relative uniqueness — so that
+    final positions 0..n-1 are free to assign in any order.
+
+    An empty `desired` returns an empty plan: a channel that matched nothing
+    is never cleared (spec §12).
+    """
+    if not desired:
+        return []
+    plan = []
+    if use_offset:
+        for stream_id, order in sorted(current.items(), key=lambda kv: kv[1]):
+            plan.append((stream_id, order + offset))
+    plan.extend((stream_id, index) for index, stream_id in enumerate(desired))
+    return plan

@@ -150,3 +150,68 @@ def test_uneven_provider_counts_do_not_drop_entries():
 
 def test_unknown_strategy_falls_back_to_quality_first():
     assert order_candidates(SEVEN, strategy="nonsense") == order_candidates(SEVEN)
+
+
+from failoverr.ordering import rewrite_plan
+
+
+class UniqueOrderStore:
+    """Simulates a unique (channel, order) constraint."""
+
+    def __init__(self, initial):
+        self.rows = dict(initial)
+
+    def apply(self, plan):
+        for stream_id, new_order in plan:
+            for other_id, other_order in self.rows.items():
+                if other_id != stream_id and other_order == new_order:
+                    raise AssertionError(
+                        f"unique constraint violated: order {new_order} "
+                        f"already held by stream {other_id}"
+                    )
+            self.rows[stream_id] = new_order
+
+
+def test_a_naive_swap_would_violate_the_constraint():
+    """Establishes that the offset trick is solving a real problem."""
+    store = UniqueOrderStore({1: 0, 2: 1})
+    with pytest.raises(AssertionError, match="unique constraint"):
+        store.apply([(2, 0), (1, 1)])
+
+
+def test_offset_plan_reverses_order_without_collision():
+    store = UniqueOrderStore({1: 0, 2: 1})
+    store.apply(rewrite_plan({1: 0, 2: 1}, [2, 1], use_offset=True))
+    assert store.rows[2] == 0
+    assert store.rows[1] == 1
+
+
+def test_offset_plan_handles_a_full_reshuffle():
+    current = {10: 0, 11: 1, 12: 2, 13: 3}
+    desired = [13, 11, 10, 12]
+    store = UniqueOrderStore(current)
+    store.apply(rewrite_plan(current, desired, use_offset=True))
+    assert [store.rows[s] for s in desired] == [0, 1, 2, 3]
+
+
+def test_detached_rows_keep_offset_values_and_never_collide():
+    """Stream 12 is being truncated away; it must not block final positions."""
+    current = {10: 0, 11: 1, 12: 2}
+    store = UniqueOrderStore(current)
+    store.apply(rewrite_plan(current, [11, 10], use_offset=True))
+    assert store.rows[11] == 0 and store.rows[10] == 1
+    assert store.rows[12] >= 100000
+
+
+def test_without_offset_the_plan_is_just_final_assignments():
+    assert rewrite_plan({1: 0, 2: 1}, [2, 1], use_offset=False) == [(2, 0), (1, 1)]
+
+
+def test_new_streams_not_in_current_are_assigned():
+    plan = rewrite_plan({1: 0}, [1, 99], use_offset=True)
+    assert (99, 1) in plan
+
+
+def test_empty_desired_produces_no_final_assignments():
+    """A channel that matched nothing is never cleared — spec §12."""
+    assert rewrite_plan({1: 0, 2: 1}, [], use_offset=True) == []
