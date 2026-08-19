@@ -7,6 +7,7 @@ comment before changing anything here.
 
 import json
 import re
+import subprocess
 from typing import NamedTuple
 
 from .state import INCONCLUSIVE, INVALID, VALID
@@ -131,3 +132,64 @@ def classify(returncode, stdout, stderr):  # noqa: PLR0911
 
     stats = _build_stats(videos[0], audios[0], payload.get("format") or {})
     return ProbeResult(VALID, stats, f"ok {stats['resolution']} {stats['video_codec']}")
+
+
+# A blank verdict requires essentially the whole sample to be black.
+BLANK_FRACTION = 0.9
+_BLACK_DURATION = re.compile(r"black_duration:\s*([0-9.]+)")
+
+
+def run_command(argv, timeout):
+    """Default runner.
+
+    Returns (returncode, stdout, stderr); returncode is None on timeout,
+    which classify() reads as inconclusive.
+    """
+    try:
+        proc = subprocess.run(
+            argv, capture_output=True, text=True, timeout=timeout, check=False
+        )
+    except subprocess.TimeoutExpired:
+        return None, "", ""
+    return proc.returncode, proc.stdout or "", proc.stderr or ""
+
+
+def probe(url, ffprobe_path, timeout, runner=run_command):
+    argv = [
+        ffprobe_path,
+        "-v", "error",
+        "-print_format", "json",
+        "-show_streams",
+        "-show_format",
+        "-analyzeduration", "5000000",
+        "-probesize", "5000000",
+        url,
+    ]
+    try:
+        returncode, stdout, stderr = runner(argv, timeout)
+    except Exception as exc:  # noqa: BLE001
+        return ProbeResult(INCONCLUSIVE, {}, f"could not run ffprobe: {exc}")
+    return classify(returncode, stdout, stderr)
+
+
+def is_blank(url, ffmpeg_path, seconds, runner=run_command):
+    """Check if the sampled window is essentially entirely black.
+
+    Fails open: any error at all returns False, leaving the stream valid.
+    """
+    seconds = max(1.0, float(seconds or 1))
+    argv = [
+        ffmpeg_path,
+        "-t", str(seconds),
+        "-i", url,
+        "-vf", "blackdetect=d=0.5:pix_th=0.10",
+        "-an", "-f", "null", "-",
+    ]
+    try:
+        returncode, _stdout, stderr = runner(argv, seconds * 4 + 10)
+    except Exception:  # noqa: BLE001
+        return False
+    if returncode != 0:
+        return False
+    black = sum(float(d) for d in _BLACK_DURATION.findall(stderr or ""))
+    return black >= seconds * BLANK_FRACTION

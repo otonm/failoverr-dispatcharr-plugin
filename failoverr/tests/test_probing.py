@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from failoverr.probing import classify
+from failoverr.probing import classify, is_blank, probe
 from failoverr.state import INCONCLUSIVE, INVALID, VALID
 
 
@@ -125,3 +125,88 @@ def test_every_result_carries_a_reason():
         classify(1, "", "Connection timed out"),
     ):
         assert result.reason
+
+
+# --- Invocation and blank detection -----------------------------------------
+
+
+def fake_runner(returncode, stdout="", stderr="", record=None):
+    def runner(argv, timeout):
+        if record is not None:
+            record.append((argv, timeout))
+        return returncode, stdout, stderr
+    return runner
+
+
+def test_probe_passes_the_url_and_path_to_the_runner():
+    calls = []
+    probe(
+        "http://p.example/1.ts", "/usr/local/bin/ffprobe", 15,
+        runner=fake_runner(0, ffprobe_json([VIDEO, AUDIO]), record=calls),
+    )
+    argv, timeout = calls[0]
+    assert argv[0] == "/usr/local/bin/ffprobe"
+    assert argv[-1] == "http://p.example/1.ts"
+    assert timeout == 15
+
+
+def test_probe_requests_json_output():
+    calls = []
+    probe("http://p.example/1.ts", "ffprobe", 15,
+          runner=fake_runner(0, ffprobe_json([VIDEO, AUDIO]), record=calls))
+    assert "json" in " ".join(calls[0][0])
+
+
+def test_probe_returns_the_classified_result():
+    result = probe("http://p.example/1.ts", "ffprobe", 15,
+                   runner=fake_runner(0, ffprobe_json([VIDEO, AUDIO])))
+    assert result.verdict == VALID
+
+
+def test_probe_reports_a_runner_exception_as_inconclusive():
+    def exploding_runner(_argv, _timeout):
+        raise OSError("ffprobe binary is missing")
+
+    result = probe("http://p.example/1.ts", "ffprobe", 15, runner=exploding_runner)
+    assert result.verdict == INCONCLUSIVE
+    assert "missing" in result.reason
+
+
+# --- Blank detection: opt-in and fail-open ---------------------------------
+
+BLACK_STDERR = (
+    "[blackdetect @ 0x55d] black_start:0 black_end:5 black_duration:5\n"
+)
+PARTIAL_BLACK_STDERR = (
+    "[blackdetect @ 0x55d] black_start:0 black_end:0.6 black_duration:0.6\n"
+)
+
+
+def test_fully_black_sample_is_blank():
+    assert is_blank("http://p.example/1.ts", "ffmpeg", 5,
+                    runner=fake_runner(0, "", BLACK_STDERR)) is True
+
+
+def test_briefly_black_sample_is_not_blank():
+    """A fade or a short black frame must not reject a working stream."""
+    assert is_blank("http://p.example/1.ts", "ffmpeg", 5,
+                    runner=fake_runner(0, "", PARTIAL_BLACK_STDERR)) is False
+
+
+def test_no_blackdetect_output_means_not_blank():
+    assert is_blank("http://p.example/1.ts", "ffmpeg", 5,
+                    runner=fake_runner(0, "", "")) is False
+
+
+def test_ffmpeg_error_fails_open():
+    """Spec §9: any ffmpeg error leaves the stream valid."""
+    assert is_blank("http://p.example/1.ts", "ffmpeg", 5,
+                    runner=fake_runner(1, "", "Connection timed out")) is False
+
+
+def test_ffmpeg_exception_fails_open():
+    def exploding_runner(_argv, _timeout):
+        raise OSError("ffmpeg binary is missing")
+
+    assert is_blank("http://p.example/1.ts", "ffmpeg", 5,
+                    runner=exploding_runner) is False
