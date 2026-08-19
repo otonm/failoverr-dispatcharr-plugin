@@ -1,6 +1,11 @@
 import pytest
 
-from failoverr.models_access import FieldResolutionError, plan_writes, resolve_field
+from failoverr.models_access import (
+    FieldResolutionError,
+    placeholder_orders,
+    plan_writes,
+    resolve_field,
+)
 
 
 class FakeField:
@@ -70,3 +75,35 @@ def test_offset_mode_bumps_existing_rows_first():
 def test_detach_list_never_includes_a_stream_being_kept():
     result = plan_writes({1: 0, 2: 1}, [1, 2], [1], use_offset=False)
     assert result["detach"] == []
+
+
+def test_duplicate_ordered_ids_do_not_produce_a_duplicate_attach_entry():
+    """Regression: duplicates used to create two rows with contradictory orders."""
+    result = plan_writes({1: 0}, [2, 2, 1], [], use_offset=True)
+    assert result["attach"] == [2]
+    ordered_stream_ids = [sid for sid, _order in result["orders"]]
+    assert ordered_stream_ids.count(2) == 1
+
+
+# --- placeholder_orders ------------------------------------------------------
+
+
+def test_placeholder_orders_are_disjoint_from_the_bump_range():
+    """The invariant that broke twice during task review.
+
+    New-row placeholder orders must never collide with rewrite_plan's bump
+    range.
+    """
+    current = {10: 0, 11: 1, 12: 2}
+    bump_targets = {v + 100000 for v in current.values()}
+    placeholders = placeholder_orders(current, attach=[20, 21])
+    assert not (set(placeholders) & bump_targets)
+
+
+def test_placeholder_orders_are_mutually_distinct():
+    placeholders = placeholder_orders({1: 0}, attach=[2, 3, 4])
+    assert len(placeholders) == len(set(placeholders))
+
+
+def test_placeholder_orders_with_no_existing_rows():
+    assert placeholder_orders({}, attach=[1, 2]) == [100000, 100001]

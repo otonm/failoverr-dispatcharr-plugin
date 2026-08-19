@@ -158,7 +158,17 @@ def plan_writes(current, ordered_ids, detach_ids, use_offset, offset=ORDER_OFFSE
     `current` maps attached stream_id -> current order. Returns attach /
     detach / order operations. An empty `ordered_ids` produces nothing at
     all: a channel that matched nothing is never cleared (spec §12).
+
+    Caller contract: `ordered_ids` must include every stream_id the caller
+    wants to remain attached, not just newly matched ones — a currently
+    attached stream that is kept but merely omitted from `ordered_ids` is
+    neither detached nor given a final order; its order keeps escalating by
+    `offset` on every run that omits it, since it is never assigned a
+    position by the pass below. The Phase 5 candidate-assembly step
+    ("newly matched streams + streams already attached", CLAUDE.md §6) is
+    what is meant to guarantee this in practice.
     """
+    ordered_ids = list(dict.fromkeys(ordered_ids))
     if not ordered_ids:
         return {"attach": [], "detach": [], "orders": []}
     keep = set(ordered_ids)
@@ -167,6 +177,17 @@ def plan_writes(current, ordered_ids, detach_ids, use_offset, offset=ORDER_OFFSE
         "detach": [sid for sid in detach_ids if sid not in keep],
         "orders": rewrite_plan(current, ordered_ids, use_offset, offset),
     }
+
+
+def placeholder_orders(current, attach, offset=ORDER_OFFSET):
+    """Distinct create-time orders for newly attached rows.
+
+    Provably disjoint from rewrite_plan's bump range (v + offset for v in
+    current.values()) regardless of how many rows exist or their values,
+    since it starts past the highest possible bump target.
+    """
+    high_water = max(current.values(), default=-1)
+    return [offset + high_water + 1 + index for index in range(len(attach))]
 
 
 def apply_channel_plan(resolved, channel, ordered_ids, detach_ids, dry_run):
@@ -194,17 +215,13 @@ def apply_channel_plan(resolved, channel, ordered_ids, detach_ids, dry_run):
     with transaction.atomic():
         # Placeholder orders for new rows must be disjoint from every value
         # the order pass below might use, including rewrite_plan's bump
-        # range (existing_order + ORDER_OFFSET, up to high_water +
-        # ORDER_OFFSET). Starting past that — ORDER_OFFSET + high_water + 1 —
-        # guarantees no collision with a bump target regardless of how many
-        # rows currently exist or what their current orders are. The order
-        # pass right after overwrites all of these unconditionally.
-        high_water = max(current.values(), default=-1)
-        for index, stream_id in enumerate(plan["attach"]):
+        # range — see placeholder_orders(). The order pass right after
+        # overwrites all of these unconditionally.
+        for stream_id, order in zip(
+            plan["attach"], placeholder_orders(current, plan["attach"]), strict=True
+        ):
             link_model.objects.create(
-                channel=channel,
-                stream_id=stream_id,
-                **{order_field: ORDER_OFFSET + high_water + 1 + index},
+                channel=channel, stream_id=stream_id, **{order_field: order}
             )
         for stream_id, new_order in plan["orders"]:
             link_model.objects.filter(
@@ -220,10 +237,17 @@ def apply_channel_plan(resolved, channel, ordered_ids, detach_ids, dry_run):
 def save_stream_stats(resolved, stream_id, stats):
     """Write probe results using the key names Dispatcharr already uses.
 
-    Plugin-private bookkeeping never goes here — it lives in the sidecar.
+    Merges onto the existing stream_stats dict rather than replacing it, so
+    keys Dispatcharr or another plugin populated (width, height, ...) survive
+    a Failoverr probe. Plugin-private bookkeeping never goes here — it lives
+    in the sidecar.
     """
     from django.utils import timezone
 
+    stream = resolved.stream_model.objects.filter(id=stream_id).first()
+    if stream is None:
+        return
+    existing = stream.stream_stats if isinstance(stream.stream_stats, dict) else {}
     resolved.stream_model.objects.filter(id=stream_id).update(
-        stream_stats=stats, stream_stats_updated_at=timezone.now()
+        stream_stats={**existing, **stats}, stream_stats_updated_at=timezone.now()
     )
