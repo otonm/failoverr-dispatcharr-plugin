@@ -739,6 +739,7 @@ def _select_probe_batch(  # noqa: PLR0913, PLR0917 - mirrors _probe_candidates' 
 
 def _probe_candidates(  # noqa: PLR0913, PLR0917 - interface fixed by the task spec
     candidates, state, settings, prober, budget, resolved, log, probed_so_far=0,
+    progress_cb=None,
 ):
     """Probe what is stale, record verdicts, write stats. Returns count.
 
@@ -797,6 +798,8 @@ def _probe_candidates(  # noqa: PLR0913, PLR0917 - interface fixed by the task s
             if verdict == VALID and stats:
                 models_access_save(resolved, candidate_row.stream_id, stats)
             probed += 1
+            if progress_cb is not None:
+                progress_cb(candidate_row, verdict, probed_so_far + probed)
             if (probed_so_far + probed) % 25 == 0:
                 refresh_lock()
                 state.save()
@@ -813,25 +816,88 @@ def _run_outcome(budget):
     return "ok", "COMPLETED"
 
 
-def _record_new_finds_and_report_progress(  # noqa: PLR0913, PLR0917 - one call site, run_pipeline's loop
-    mode, totals, channel_index, channels_total, channel, matched, attached_ids, state,
-):
-    """Count newly matched, now-valid candidates and publish live progress.
+def _channel_candidates(mode, channel, index, resolved, settings):
+    """Build the matched + already-attached candidate set for one channel.
 
-    Extracted out of run_pipeline's channel loop only to keep that function
-    under ruff's statement-count limit - still one call per channel, same
-    spot. "Found" means matched-but-not-yet-attached and confirmed VALID
-    this run, independent of dry_run (which controls attaching, not
-    discovery).
+    The candidate set requirements 3 and 5 share (CLAUDE.md §6 step 5) -
+    shared by run_pipeline's main loop and _count_stale_candidates' pre-pass
+    so the two can never drift apart on what counts as a candidate.
     """
-    new_ids = {row.stream_id for row in matched} - attached_ids
-    totals["new_found"] += sum(1 for sid in new_ids if state.last_verdict(sid) == VALID)
+    tokens = normalize(
+        channel.name or "", strip_tokens=settings["strip_tokens"],
+        map_number_words=settings["map_number_words"],
+    )
+    matched = (
+        [] if mode != "run"
+        else find_matches(tokens, index, settings["match_mode"],
+                          settings["fuzzy_threshold"])
+    )
+    current = attached_rows(resolved, channel)
+    attached_ids = {stream_id for stream_id, _ in current}
+    by_id = {row.stream_id: row for row in matched}
+    for row in iter_attached_rows(resolved, channel, settings):
+        by_id.setdefault(row.stream_id, row)
+    return matched, attached_ids, list(by_id.values())
+
+
+def _count_stale_candidates(  # noqa: PLR0913, PLR0917 - one call site, run_pipeline
+    mode, channels, index, resolved, settings, state,
+):
+    """How many candidates this run would actually probe, computed up front.
+
+    An estimate, not a promise: it can't know which providers will abort
+    mid-run (Prober.aborted_providers only grows as probing happens), or
+    whether the probe/time budget will cut the run short first - either can
+    make the real count come in under this. It exists purely to give Show
+    Status an honest "stream N of <this>" denominator instead of none.
+    reorder_only never probes anything, so it's always 0 there.
+    """
+    if mode == "reorder_only":
+        return 0
+    total = 0
+    for channel in channels:
+        _, _, candidates = _channel_candidates(mode, channel, index, resolved, settings)
+        total += sum(
+            1 for c in candidates
+            if not state.is_fresh(c.stream_id, c.url, settings["probe_ttl_hours"])
+        )
+    return total
+
+
+def _start_channel_progress(  # noqa: PLR0913, PLR0917 - one call site, run_pipeline's loop
+    mode, totals, channel_index, channels_total, channel, streams_total,
+    matched, attached_ids,
+):
+    """Ping progress at channel start; return this channel's per-probe callback.
+
+    Bundles two responsibilities into one call so run_pipeline's channel
+    loop only pays one statement for both (ruff's statement-count limit).
+    "Found" means matched-but-not-yet-attached and confirmed VALID this
+    run, independent of dry_run (which controls attaching, not discovery) -
+    tracked live here, one probe at a time, rather than recomputed after
+    the fact.
+    """
+    new_not_attached = {row.stream_id for row in matched} - attached_ids
     update_progress(
-        mode, channel_index=channel_index, channels_total=channels_total,
-        channel_name=channel.name, probed=totals["probed"],
+        mode, stream_index=totals["probed"], streams_total=streams_total,
+        current_stream=None, channel_name=channel.name,
+        channel_index=channel_index, channels_total=channels_total,
         new_found=totals["new_found"], attached=totals["attached"],
         detached=totals["detached"],
     )
+
+    def on_probe(candidate_row, verdict, stream_index):
+        if candidate_row.stream_id in new_not_attached and verdict == VALID:
+            totals["new_found"] += 1
+        update_progress(
+            mode, stream_index=stream_index, streams_total=streams_total,
+            current_stream=candidate_row.name, channel_name=channel.name,
+            channel_index=channel_index, channels_total=channels_total,
+            new_found=totals["new_found"], attached=totals["attached"],
+            detached=totals["detached"],
+        )
+
+    return on_probe
 
 
 def models_access_save(resolved, stream_id, stats):
@@ -889,41 +955,30 @@ def run_pipeline(context, mode="run"):
         settings["account_cooldown_seconds"],
     )
 
+    channels_total = len(channels)
+    streams_total = _count_stale_candidates(
+        mode, channels, index, resolved, settings, state
+    )
+
     rows = []
     totals = {
         "attached": 0, "detached": 0, "probed": 0, "channels": 0, "new_found": 0,
     }
-    channels_total = len(channels)
 
     for channel_index, channel in enumerate(channels, start=1):
-        tokens = normalize(
-            channel.name or "",
-            strip_tokens=settings["strip_tokens"],
-            map_number_words=settings["map_number_words"],
+        matched, attached_ids, candidates = _channel_candidates(
+            mode, channel, index, resolved, settings
         )
-        matched = (
-            [] if mode != "run"
-            else find_matches(tokens, index, settings["match_mode"],
-                              settings["fuzzy_threshold"])
+        on_probe = _start_channel_progress(
+            mode, totals, channel_index, channels_total, channel, streams_total,
+            matched, attached_ids,
         )
-        current = attached_rows(resolved, channel)
-        attached_ids = {stream_id for stream_id, _ in current}
-
-        by_id = {row.stream_id: row for row in matched}
-        for row in iter_attached_rows(resolved, channel, settings):
-            by_id.setdefault(row.stream_id, row)
-        candidates = list(by_id.values())
 
         if mode != "reorder_only":
             totals["probed"] += _probe_candidates(
                 candidates, state, settings, prober, budget, resolved, log,
-                probed_so_far=totals["probed"],
+                probed_so_far=totals["probed"], progress_cb=on_probe,
             )
-
-        _record_new_finds_and_report_progress(
-            mode, totals, channel_index, channels_total, channel, matched,
-            attached_ids, state,
-        )
 
         if mode == "probe_only":
             totals["channels"] += 1

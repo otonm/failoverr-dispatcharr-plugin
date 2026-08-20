@@ -142,18 +142,30 @@ def _log_report(log, action, label, payload):
 
 
 def _status_message(lock, stop_requested, streams_tracked):
-    """Build Show Status's human-readable line from the lock file's progress."""
+    """Build Show Status's human-readable line from the lock file's progress.
+
+    Per-stream progress ("stream N of M") only exists once something has
+    actually been probed this run - reorder_only never probes anything, and
+    a run/probe_only where everything is still cache-fresh has nothing to
+    probe either, so both fall back to per-channel progress instead.
+    """
     if not lock["holder"]:
         return f"Idle. {streams_tracked} streams tracked."
+    holder = lock["holder"]
     progress = lock["progress"]
     if not progress:
-        message = f"Running {lock['holder']}: starting up."
+        message = f"Running {holder}: starting up."
+    elif progress.get("streams_total"):
+        message = (
+            f"Running {holder}. Processing stream "
+            f"{progress.get('stream_index', 0)} of {progress['streams_total']} "
+            f"({progress.get('channel_name', '')}). "
+            f"Found {progress.get('new_found', 0)} new streams."
+        )
     else:
         message = (
-            f"Running {lock['holder']}: channel {progress.get('channel_index')} "
-            f"of {progress.get('channels_total')} ({progress.get('channel_name')}). "
-            f"{progress.get('probed', 0)} probed, "
-            f"{progress.get('new_found', 0)} new streams found."
+            f"Running {holder}: channel {progress.get('channel_index')} of "
+            f"{progress.get('channels_total')} ({progress.get('channel_name')})."
         )
     if stop_requested:
         message += " Stop requested - finishing current probe, then stopping."

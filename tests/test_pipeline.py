@@ -707,6 +707,30 @@ def test_run_pipeline_publishes_per_channel_progress_to_the_lock_file(
     assert progress["channel_name"] == "RAI 1"
 
 
+def test_run_pipeline_publishes_per_stream_progress_while_probing(
+    tmp_path, monkeypatch
+):
+    """The user-visible "stream N of M" figure, tracked one probe at a time.
+
+    Two never-probed candidates give an exact denominator (2) to check
+    against, and the final published progress must reflect the last one
+    actually probed - not some earlier per-channel snapshot.
+    """
+    channel = types.SimpleNamespace(name="RAI 1")
+    attached = [row(1, "IT: RAI 1 HD", "A"), row(2, "IT: Rai 1 4K", "B")]
+    state = _make_state(tmp_path)
+    _patch_common(monkeypatch, tmp_path, channel, attached, state)
+    _stub_probe_one(monkeypatch)
+    acquire_lock("probe_only")
+
+    run_pipeline({"settings": {}}, mode="probe_only")
+
+    progress = lock_status()["progress"]
+    assert progress["streams_total"] == 2
+    assert progress["stream_index"] == 2
+    assert progress["current_stream"] in {"IT: RAI 1 HD", "IT: Rai 1 4K"}
+
+
 def test_run_pipeline_counts_newly_found_valid_streams(tmp_path, monkeypatch):
     """"Found" means matched-but-not-yet-attached and confirmed VALID.
 
