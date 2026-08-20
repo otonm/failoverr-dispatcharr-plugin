@@ -500,6 +500,27 @@ def release_lock():
             fcntl.flock(fh, fcntl.LOCK_UN)
 
 
+def update_progress(holder, **fields):
+    """Publish live progress into the lock file for Show Status to read.
+
+    Cheap, best-effort, and self-correcting: if the lock has since been
+    released or stolen by someone else, this silently does nothing rather
+    than resurrecting a finished/replaced lock with stale progress. Also
+    doubles as a heartbeat (bumps "since"), same as refresh_lock().
+    """
+    with _open_lock_file() as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            data = _read_locked(fh)
+            if data.get("holder") != holder:
+                return
+            data["since"] = time.time()
+            data["progress"] = fields
+            _write_locked(fh, data)
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
 def request_cancel():
     path = pathlib.Path(CANCEL_PATH)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -514,27 +535,51 @@ def _clear_cancel():
     pathlib.Path(CANCEL_PATH).unlink(missing_ok=True)
 
 
-def clear_lock(now=None):
-    """Cancel an active run cooperatively; force-release only a stale one.
+def stop_run():
+    """Ask whichever job holds the lock to stop at its next checkpoint.
 
-    A run past LOCK_TTL_SECONDS since its own last heartbeat is presumed
-    dead (crashed without releasing), so that case still force-releases
-    immediately, as before. Anything more recent is presumed to still be
-    working - releasing its lock here would let a second run start while
-    the first is still probing, so this only raises the cancel flag and
-    lets the running job release its own lock once it notices, at its next
-    Budget.allow() checkpoint.
+    Cooperative only - there is no way to kill the thread/greenlet actually
+    doing the work, so a probe already in flight still finishes. The run
+    exits through its own CANCELED path (Budget.allow(), pipeline.py) and
+    releases its own lock once it next checks in.
+    """
+    status = lock_status()
+    if not status["holder"]:
+        return {"status": "ok", "message": "Nothing is running."}
+    request_cancel()
+    return {
+        "status": "ok",
+        "message": (
+            f"Stop requested for the running {status['holder']} job. It "
+            "will finish its current probe, then stop and release its "
+            "lock - check Show Status to watch it wind down."
+        ),
+    }
+
+
+def clear_lock(now=None):
+    """Force-release a lock left behind by a crashed run.
+
+    Only ever acts on a lock that is stale (past LOCK_TTL_SECONDS since its
+    last heartbeat) - a lock more recent than that is presumed to belong to
+    a run that is genuinely still working, and force-releasing it would let
+    a second run start while the first is still probing: two runs writing
+    state.json/attaching streams at once. Use Stop to interrupt a run that
+    is still active; this is only the escape hatch for one that is not.
     """
     now = time.time() if now is None else now
     status = lock_status()
-    active = status["holder"] and (now - status["since"]) < LOCK_TTL_SECONDS
-    if active:
-        request_cancel()
+    if status["holder"] is None:
+        return {"status": "ok", "message": "Lock already clear."}
+    if (now - status["since"]) < LOCK_TTL_SECONDS:
         return {
-            "status": "ok",
+            "status": "error",
             "message": (
-                f"Cancellation requested for the running {status['holder']} "
-                "job; it will stop at its next checkpoint."
+                f"The {status['holder']} lock is still recent and looks "
+                "like a run that's genuinely active - Clear Lock only "
+                "force-releases a stale lock, to avoid letting a second "
+                "run start while the first is still working. Use Stop to "
+                "interrupt it instead."
             ),
         }
     release_lock()
@@ -549,7 +594,11 @@ def lock_status():
             data = _read_locked(fh)
         finally:
             fcntl.flock(fh, fcntl.LOCK_UN)
-    return {"holder": data.get("holder"), "since": float(data.get("since", 0.0))}
+    return {
+        "holder": data.get("holder"),
+        "since": float(data.get("since", 0.0)),
+        "progress": data.get("progress") or {},
+    }
 
 
 def clear_state():
@@ -568,7 +617,7 @@ def clear_state():
                 f"A {status['holder']} operation is in progress and holds "
                 "the probe cache in memory - clearing it now would be "
                 "silently undone by that run's next save. Wait for it to "
-                "finish, or use Clear Lock to cancel it first."
+                "finish, or use Stop to interrupt it first."
             ),
         }
     State(STATE_PATH).save()
@@ -764,6 +813,27 @@ def _run_outcome(budget):
     return "ok", "COMPLETED"
 
 
+def _record_new_finds_and_report_progress(  # noqa: PLR0913, PLR0917 - one call site, run_pipeline's loop
+    mode, totals, channel_index, channels_total, channel, matched, attached_ids, state,
+):
+    """Count newly matched, now-valid candidates and publish live progress.
+
+    Extracted out of run_pipeline's channel loop only to keep that function
+    under ruff's statement-count limit - still one call per channel, same
+    spot. "Found" means matched-but-not-yet-attached and confirmed VALID
+    this run, independent of dry_run (which controls attaching, not
+    discovery).
+    """
+    new_ids = {row.stream_id for row in matched} - attached_ids
+    totals["new_found"] += sum(1 for sid in new_ids if state.last_verdict(sid) == VALID)
+    update_progress(
+        mode, channel_index=channel_index, channels_total=channels_total,
+        channel_name=channel.name, probed=totals["probed"],
+        new_found=totals["new_found"], attached=totals["attached"],
+        detached=totals["detached"],
+    )
+
+
 def models_access_save(resolved, stream_id, stats):
     from . import models_access
 
@@ -820,9 +890,12 @@ def run_pipeline(context, mode="run"):
     )
 
     rows = []
-    totals = {"attached": 0, "detached": 0, "probed": 0, "channels": 0}
+    totals = {
+        "attached": 0, "detached": 0, "probed": 0, "channels": 0, "new_found": 0,
+    }
+    channels_total = len(channels)
 
-    for channel in channels:
+    for channel_index, channel in enumerate(channels, start=1):
         tokens = normalize(
             channel.name or "",
             strip_tokens=settings["strip_tokens"],
@@ -846,6 +919,11 @@ def run_pipeline(context, mode="run"):
                 candidates, state, settings, prober, budget, resolved, log,
                 probed_so_far=totals["probed"],
             )
+
+        _record_new_finds_and_report_progress(
+            mode, totals, channel_index, channels_total, channel, matched,
+            attached_ids, state,
+        )
 
         if mode == "probe_only":
             totals["channels"] += 1

@@ -345,19 +345,21 @@ def test_clear_lock_releases_a_held_lock():
     assert lock_status()["holder"] is None
 
 
-def test_clear_lock_only_requests_cancellation_for_a_still_active_run():
-    """Pressing Clear Lock on a genuinely running job must not free its lock.
+def test_clear_lock_refuses_a_still_active_run():
+    """Clear Lock must not free the lock out from under a genuinely active run.
 
-    Freeing it immediately would let a second run start while the first is
-    still probing - two runs writing state.json/attaching streams at once.
-    Instead it raises the cancel flag and leaves the lock alone; the running
-    job releases its own lock once it notices, at its next budget check.
+    Freeing it would let a second run start while the first is still
+    probing - two runs writing state.json/attaching streams at once. It
+    must refuse and point at Stop instead, and must not itself set the
+    cancel flag - that would silently turn Clear Lock into a second Stop
+    button with different wording, which is exactly the confusion Stop was
+    added to resolve.
     """
     acquire_lock("run", now=1000.0)
     result = clear_lock(now=1005.0)  # well within LOCK_TTL_SECONDS
-    assert result["status"] == "ok"
+    assert result["status"] == "error"
     assert lock_status()["holder"] == "run"
-    assert pipeline_module.cancel_requested() is True
+    assert pipeline_module.cancel_requested() is False
 
 
 def test_clear_lock_force_releases_a_stale_lock_and_drops_any_cancel_flag():
@@ -365,6 +367,25 @@ def test_clear_lock_force_releases_a_stale_lock_and_drops_any_cancel_flag():
     pipeline_module.request_cancel()
     clear_lock(now=LOCK_TTL_SECONDS + 1)
     assert lock_status()["holder"] is None
+    assert pipeline_module.cancel_requested() is False
+
+
+def test_clear_lock_reports_already_clear_when_nothing_is_running():
+    result = clear_lock()
+    assert result["status"] == "ok"
+
+
+def test_stop_run_requests_cancellation_for_an_active_run():
+    acquire_lock("run", now=time.time())
+    result = pipeline_module.stop_run()
+    assert result["status"] == "ok"
+    assert lock_status()["holder"] == "run", "Stop must not itself release the lock"
+    assert pipeline_module.cancel_requested() is True
+
+
+def test_stop_run_is_a_noop_when_nothing_is_running():
+    result = pipeline_module.stop_run()
+    assert result["status"] == "ok"
     assert pipeline_module.cancel_requested() is False
 
 
@@ -659,6 +680,59 @@ def test_run_pipeline_reports_ok_on_a_normal_finish(tmp_path, monkeypatch):
     assert result["status"] == "ok"
 
 
+# --- Live progress (Show Status) --------------------------------------------
+
+
+def test_run_pipeline_publishes_per_channel_progress_to_the_lock_file(
+    tmp_path, monkeypatch
+):
+    """Show Status reads this back to build its "channel N of M" message.
+
+    update_progress() only writes when it still owns the lock, so the test
+    has to acquire it first, the same way start() would before backgrounding
+    the real run.
+    """
+    channel = types.SimpleNamespace(name="RAI 1")
+    attached = [row(1, "IT: RAI 1 HD", "A")]
+    state = _make_state(tmp_path)
+    state.record(1, attached[0].url, VALID)  # fresh: nothing left to probe
+    _patch_common(monkeypatch, tmp_path, channel, attached, state)
+    acquire_lock("probe_only")
+
+    run_pipeline({"settings": {}}, mode="probe_only")
+
+    progress = lock_status()["progress"]
+    assert progress["channel_index"] == 1
+    assert progress["channels_total"] == 1
+    assert progress["channel_name"] == "RAI 1"
+
+
+def test_run_pipeline_counts_newly_found_valid_streams(tmp_path, monkeypatch):
+    """"Found" means matched-but-not-yet-attached and confirmed VALID.
+
+    This is independent of dry_run, which controls attaching, not discovery.
+    """
+    channel = types.SimpleNamespace(name="RAI 1")
+    state = _make_state(tmp_path)
+    _patch_common(monkeypatch, tmp_path, channel, [], state)  # nothing attached yet
+    new_stream = row(9, "IT: RAI 1 HD", "A")
+    monkeypatch.setattr(
+        pipeline_module, "iter_pool", lambda *_a, **_kw: iter([new_stream])
+    )
+    monkeypatch.setattr(
+        pipeline_module, "find_matches", lambda *_a, **_kw: [new_stream]
+    )
+    _stub_probe_one(monkeypatch)
+    monkeypatch.setattr(
+        models_access_module, "apply_channel_plan",
+        lambda *_a, **_kw: {"attached": 1, "detached": 0},
+    )
+
+    result = run_pipeline({"settings": {}}, mode="run")
+
+    assert result["new_found"] == 1
+
+
 # --- Django DB connection cleanup (Fix 2) -----------------------------------
 #
 # No live Django/DB is available offline, so these tests monkeypatch the
@@ -736,6 +810,46 @@ def test_backgrounded_start_closes_its_django_connection(tmp_path, monkeypatch):
 
     assert result["status"] == "started"
     assert calls, "the backgrounded run must close its connection when done"
+
+
+def test_backgrounded_run_releases_the_lock_once_it_finishes(tmp_path, monkeypatch):
+    """Answers "is the lock released when the plugin is done" directly.
+
+    start()'s success path already releases via a finally: this proves it
+    end to end through the real spawn()->run_pipeline()->release_lock chain
+    (spawn patched to run synchronously so the test doesn't race a thread).
+    """
+    channel = types.SimpleNamespace(name="RAI 1")
+    attached = [row(1, "IT: RAI 1 HD", "A")]
+    state = _make_state(tmp_path)
+    state.record(1, attached[0].url, VALID)  # fresh: no real probing needed
+    _patch_common(monkeypatch, tmp_path, channel, attached, state)
+    monkeypatch.setattr(pipeline_module, "spawn", lambda fn, *args: fn(*args))
+
+    pipeline_module.start({"settings": {}}, mode="probe_only")
+
+    assert lock_status()["holder"] is None
+
+
+def test_backgrounded_run_releases_the_lock_even_if_run_pipeline_crashes(monkeypatch):
+    """start()'s background() finally: must release the lock on a crash too.
+
+    Otherwise one bad run permanently wedges every future run behind a lock
+    nothing will ever clear.
+    """
+    monkeypatch.setattr(pipeline_module, "spawn", lambda fn, *args: fn(*args))
+    monkeypatch.setattr(pipeline_module, "select_channels", lambda *_a, **_kw: [])
+    monkeypatch.setattr(models_access_module, "resolve_models", object)
+    monkeypatch.setattr(pipeline_module, "_close_connection", lambda: None)
+
+    def _boom(*_a, **_kw):
+        raise RuntimeError("simulated crash mid-run")
+
+    monkeypatch.setattr(pipeline_module, "run_pipeline", _boom)
+
+    pipeline_module.start({"settings": {}}, mode="run")
+
+    assert lock_status()["holder"] is None
 
 
 # --- Aborted-provider budget waste (Fix 4) ----------------------------------

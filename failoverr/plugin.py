@@ -141,6 +141,25 @@ def _log_report(log, action, label, payload):
         log.info("FAILOVERR %s %s.%s = %s", action, label, path, shown)
 
 
+def _status_message(lock, stop_requested, streams_tracked):
+    """Build Show Status's human-readable line from the lock file's progress."""
+    if not lock["holder"]:
+        return f"Idle. {streams_tracked} streams tracked."
+    progress = lock["progress"]
+    if not progress:
+        message = f"Running {lock['holder']}: starting up."
+    else:
+        message = (
+            f"Running {lock['holder']}: channel {progress.get('channel_index')} "
+            f"of {progress.get('channels_total')} ({progress.get('channel_name')}). "
+            f"{progress.get('probed', 0)} probed, "
+            f"{progress.get('new_found', 0)} new streams found."
+        )
+    if stop_requested:
+        message += " Stop requested - finishing current probe, then stopping."
+    return message
+
+
 class Plugin:
     name = "Failoverr"
     version = "0.1.0"
@@ -510,11 +529,22 @@ class Plugin:
             },
         },
         {
+            "id": "stop",
+            "label": "Stop",
+            "description": (
+                "Interrupts the run currently in progress. Cooperative, not "
+                "instant: the probe already in flight finishes, then the run "
+                "stops and releases its lock. Does nothing if nothing is "
+                "running."
+            ),
+        },
+        {
             "id": "clear_lock",
             "label": "Clear Lock",
             "description": (
-                "Releases a stuck run lock. Use only if a run was interrupted "
-                "and Failoverr still reports one in progress."
+                "Force-releases a stuck run lock left behind by a crashed "
+                "run. Refuses if the lock still looks like a genuinely "
+                "active run - use Stop for that instead."
             ),
         },
         {
@@ -559,6 +589,7 @@ class Plugin:
             "run": lambda _, c: self._start(c, "run"),
             "reorder_only": lambda _, c: self._start(c, "reorder_only"),
             "probe_only": lambda _, c: self._start(c, "probe_only"),
+            "stop": self._stop,
             "clear_lock": self._clear_lock,
             "clear_state": self._clear_state,
             "show_status": self._show_status,
@@ -672,6 +703,12 @@ class Plugin:
         _ensure_scheduler(context)
         return result
 
+    def _stop(self, params, context):
+        from . import pipeline
+
+        context.get("logger", logger).info("FAILOVERR stop requested by user")
+        return pipeline.stop_run()
+
     def _clear_lock(self, params, context):
         from . import pipeline
 
@@ -694,15 +731,15 @@ class Plugin:
         return {
             "status": "ok",
             "running": lock["holder"],
+            "progress": lock["progress"],
             "execution_model": pipeline.execution_model(),
             "streams_tracked": len(state.streams),
             "last_run": meta.get("last_run"),
             "last_mode": meta.get("last_mode"),
             "degraded_providers": meta.get("degraded_providers") or [],
             "budget_stop": meta.get("budget_stop"),
-            "message": (
-                f"{'Running: ' + lock['holder'] if lock['holder'] else 'Idle'}. "
-                f"{len(state.streams)} streams tracked."
+            "message": _status_message(
+                lock, pipeline.cancel_requested(), len(state.streams)
             ),
         }
 
