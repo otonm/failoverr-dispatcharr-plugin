@@ -179,18 +179,19 @@ Follow this order. Do not skip steps or turn `dry_run` off early.
 
 ## How long it takes
 
-Probing is currently **sequential — one probe at a time** — regardless of
-the "Concurrent probes per provider" and "Global concurrent probes"
-settings; the per-provider/global concurrency machinery exists internally
-but nothing dispatches probes from more than one thread yet, so those
-settings have no effect on run time in this version (parallel probing is
-planned, not active). Real run time scales roughly as (candidates to probe)
-× (probe timeout). For a lineup around 20 channels with roughly 10
-candidate streams each, expect **10 to 20 minutes** for a full Run. Turning
-on blank detection roughly doubles that. Larger catalogs take longer — a run
-over thousands of candidates can take hours; the plugin is designed to stop
-cleanly on its time/probe budget and resume from where it left off on the
-next run rather than starting over.
+Different providers are probed in parallel, bounded by "Global concurrent
+probes" (`global_concurrency`); each provider is still serialized
+internally by "Concurrent probes per provider" (`per_account_concurrency`).
+Probing is dispatched one channel at a time, so effective parallelism on
+any single channel is bounded by how many distinct providers its
+candidates span — often fewer than `global_concurrency`. Real run time
+scales roughly as (candidates to probe) × (probe timeout) ÷ (effective
+parallelism). For a lineup around 20 channels with roughly 10 candidate
+streams each, expect **10 to 20 minutes** for a full Run. Turning on
+blank detection roughly doubles that. Larger catalogs take longer — a run
+over thousands of candidates can take hours; the plugin is designed to
+stop cleanly on its time/probe budget and resume from where it left off on
+the next run rather than starting over.
 
 Run and Probe Only execute in the background — pressing the button returns
 immediately, and the Dispatcharr UI stays responsive while it works. Use
