@@ -278,6 +278,27 @@ def test_probe_returns_the_classified_result():
     assert result.verdict == VALID
 
 
+def test_probe_attaches_response_time_on_a_valid_result():
+    result = probe("http://p.example/1.ts", "ffprobe", 15,
+                   runner=fake_runner(0, ffprobe_json([VIDEO, AUDIO])))
+    assert isinstance(result.response_time_ms, int)
+    assert result.response_time_ms >= 0
+
+
+def test_probe_does_not_attach_response_time_on_an_invalid_result():
+    result = probe(
+        "http://p.example/1.ts", "ffprobe", 15,
+        runner=fake_runner(1, "", "Invalid data found when processing input"),
+    )
+    assert result.response_time_ms is None
+
+
+def test_probe_does_not_attach_response_time_on_an_inconclusive_result():
+    result = probe("http://p.example/1.ts", "ffprobe", 15,
+                   runner=fake_runner(1, "", "Connection timed out"))
+    assert result.response_time_ms is None
+
+
 def test_probe_reports_a_runner_exception_as_inconclusive():
     def exploding_runner(_argv, _timeout):
         raise OSError("ffprobe binary is missing")

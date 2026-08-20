@@ -66,6 +66,7 @@ class ProbeResult(NamedTuple):
     verdict: str
     stats: dict
     reason: str
+    response_time_ms: int = None
 
 
 def _fraction(value):
@@ -209,11 +210,16 @@ def probe(url, ffprobe_path, timeout, runner=run_command):
         "-probesize", "5000000",
         url,
     ]
+    started = time.monotonic()
     try:
         returncode, stdout, stderr = runner(argv, timeout)
     except Exception as exc:  # noqa: BLE001
         return ProbeResult(INCONCLUSIVE, {}, f"could not run ffprobe: {exc}")
-    return classify(returncode, stdout, stderr)
+    elapsed_ms = round((time.monotonic() - started) * 1000)
+    result = classify(returncode, stdout, stderr)
+    if result.verdict != VALID:
+        return result
+    return result._replace(response_time_ms=elapsed_ms)
 
 
 def is_blank(url, ffmpeg_path, seconds, runner=run_command):
