@@ -341,11 +341,14 @@ class Plugin:
             "type": "boolean",
             "default": True,
             "help_text": (
-                "Ranks by how quickly each stream responded on its last "
-                "successful probe. Second priority after resolution, ahead "
-                "of codec, fps, and bitrate. Streams never probed, or only "
-                "probed as invalid or inconclusive, sort last on this "
-                "factor."
+                "Ranks by how long the last successful probe took to "
+                "complete - this includes connecting, several seconds of "
+                "downloading stream data, and parsing, not just initial "
+                "connection time, so it is influenced by stream bitrate "
+                "as well as server responsiveness. Second priority after "
+                "resolution, ahead of codec, fps, and bitrate. Streams "
+                "never probed, or only probed as invalid or "
+                "inconclusive, sort last on this factor."
             ),
         },
         {
@@ -376,7 +379,14 @@ class Plugin:
             "help_text": (
                 "Uses measured video bitrate as a ranking factor. Lowest "
                 "priority of the five - only breaks ties left over after "
-                "resolution, response time, codec, and fps."
+                "resolution, response time, codec, and fps. Bitrate is "
+                "measured per-probe and rarely comes out identical "
+                "between streams, so leaving this on usually prevents an "
+                "exact tie from ever reaching this point - which means "
+                "quality_first's provider interleaving rarely triggers "
+                "even when everything above matches. Turn this off if "
+                "you want similar-quality streams from different "
+                "providers to actually interleave."
             ),
         },
         {
@@ -386,12 +396,16 @@ class Plugin:
             "default": 250,
             "help_text": (
                 "Response times are rounded to this granularity before "
-                "ranking. Too fine and near-identical latencies from "
-                "different providers stop tying, which silently defeats "
-                "provider interleaving (CLAUDE.md §8) since streams "
-                "then almost never rank as exact ties. Too coarse and "
-                "response time stops meaningfully differentiating similar "
-                "streams. Only used when 'Rank by response time' is on."
+                "ranking, so streams with similar-but-not-identical "
+                "latency can still tie on this factor. Too fine and "
+                "near-identical latencies stop tying at all. Too coarse "
+                "and response time stops meaningfully differentiating "
+                "similar streams. Note: bitrate and height rank below "
+                "response time and are rarely identical between real "
+                "streams, so even a well-tuned bucket does not guarantee "
+                "provider interleaving on its own - turning off 'Rank by "
+                "bitrate' removes the factor most likely to break that "
+                "tie again. Only used when 'Rank by response time' is on."
             ),
         },
         {

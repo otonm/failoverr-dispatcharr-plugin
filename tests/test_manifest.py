@@ -71,3 +71,12 @@ def test_response_time_bucket_ms_field_exists_with_a_sane_default():
     field = next(f for f in Plugin.fields if f["id"] == "response_time_bucket_ms")
     assert field["type"] == "number"
     assert field["default"] == 250
+
+
+def test_every_settings_field_id_is_consumed_by_load_settings():
+    from failoverr.pipeline import load_settings
+    from failoverr.plugin import Plugin
+
+    field_ids = {f["id"] for f in Plugin.fields if f["type"] != "info"}
+    setting_keys = set(load_settings({"settings": {}}))
+    assert field_ids == setting_keys

@@ -393,7 +393,9 @@ def run_preview(context):
                 "verdict": state.last_verdict(stream_id) or "unprobed",
                 "resolution": (row.stats or {}).get("resolution", "") if row else "",
                 "codec": (row.stats or {}).get("video_codec", "") if row else "",
-                "response_time_ms": state.response_time_ms(stream_id) or "",
+                "response_time_ms": (
+                    rt if (rt := state.response_time_ms(stream_id)) is not None else ""
+                ),
                 "action": "keep" if stream_id in attached_ids else "attach",
             })
         for stream_id in detach:
@@ -423,7 +425,11 @@ def run_preview(context):
                 "verdict": state.last_verdict(row.stream_id) or "unprobed",
                 "resolution": (row.stats or {}).get("resolution", ""),
                 "codec": (row.stats or {}).get("video_codec", ""),
-                "response_time_ms": state.response_time_ms(row.stream_id) or "",
+                "response_time_ms": (
+                    rt if (
+                        rt := state.response_time_ms(row.stream_id)
+                    ) is not None else ""
+                ),
                 "action": "matched - would be probed"
                 if row.stream_id in matched_ids else "attached - not matched",
             })
@@ -1088,7 +1094,9 @@ def run_pipeline(context, mode="run"):
                 "verdict": state.last_verdict(stream_id) or "unprobed",
                 "resolution": (row.stats or {}).get("resolution", "") if row else "",
                 "codec": (row.stats or {}).get("video_codec", "") if row else "",
-                "response_time_ms": state.response_time_ms(stream_id) or "",
+                "response_time_ms": (
+                    rt if (rt := state.response_time_ms(stream_id)) is not None else ""
+                ),
                 "action": "keep" if stream_id in attached_ids else "attach",
             })
         rows.extend({
