@@ -503,20 +503,13 @@ class Plugin:
         return result
 
     def _diagnose(self, params, context):
-        from . import models_access, naming
+        from . import models_access, naming, pipeline
 
-        settings = context.get("settings", {})
-
-        strip_tokens = tuple(
-            t.strip().lower()
-            for t in str(settings.get("strip_tokens", "")).split(",")
-            if t.strip()
-        ) or naming.DEFAULT_STRIP_TOKENS
+        settings = pipeline.load_settings(context)
 
         resolved = models_access.resolve_models()
         environment = models_access.environment_report(
-            settings.get("ffprobe_path", "/usr/local/bin/ffprobe"),
-            settings.get("ffmpeg_path", "/usr/local/bin/ffmpeg"),
+            settings["ffprobe_path"], settings["ffmpeg_path"],
         )
 
         stream_model = resolved.stream_model
@@ -572,8 +565,8 @@ class Plugin:
                 "normalization_examples": [
                     {"name": n, "tokens": list(naming.normalize(
                         n,
-                        strip_tokens=strip_tokens,
-                        map_number_words=bool(settings.get("map_number_words", True)),
+                        strip_tokens=settings["strip_tokens"],
+                        map_number_words=settings["map_number_words"],
                     ))}
                     for n in channel_names
                 ],

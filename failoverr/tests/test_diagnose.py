@@ -109,3 +109,32 @@ def test_every_declared_action_has_a_handler(action_id, monkeypatch):
 
     result = Plugin().run(action_id, {}, {})
     assert "Unknown action" not in result.get("message", "")
+
+
+def test_diagnose_computes_settings_via_pipeline_load_settings(monkeypatch):
+    """Diagnose must reuse pipeline.load_settings rather than re-parsing.
+
+    strip_tokens/map_number_words/paths itself - two copies of those
+    defaults would silently drift (ponytail-audit finding #1).
+    """
+    from failoverr import pipeline
+
+    calls = []
+    real_load_settings = pipeline.load_settings
+
+    def spy(context):
+        calls.append(context)
+        return real_load_settings(context)
+
+    monkeypatch.setattr(pipeline, "load_settings", spy)
+    monkeypatch.setattr(
+        "failoverr.models_access.resolve_models",
+        lambda: (_ for _ in ()).throw(RuntimeError("stop before touching the ORM")),
+    )
+
+    context = {"settings": {"strip_tokens": "xx,yy"}}
+    result = Plugin().run("diagnose", {}, context)
+
+    assert result["status"] == "error"
+    assert len(calls) == 1
+    assert calls[0] is context
