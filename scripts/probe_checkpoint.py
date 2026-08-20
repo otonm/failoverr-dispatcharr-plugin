@@ -32,7 +32,7 @@ except ImportError:
     sys.path.insert(0, os.environ.get("DISPATCHARR_PLUGINS_DIR", "/data/plugins"))
     from failoverr import models_access, probing
 
-FFPROBE_PATH = os.environ.get("FFPROBE_PATH", "/usr/local/bin/ffprobe")
+FFPROBE_PATH = os.environ.get("FFPROBE_PATH", "/usr/bin/ffprobe")
 PROBE_TIMEOUT = float(os.environ.get("PROBE_TIMEOUT", "20"))
 CAP_TEST_COUNT = int(os.environ.get("CAP_TEST_COUNT", "8"))
 
