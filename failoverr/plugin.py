@@ -289,10 +289,10 @@ class Plugin:
             "type": "number",
             "default": 4,
             "help_text": (
-                "Ceiling across all providers combined, reserved for a "
-                "planned parallel-probing mode. Probing is currently "
-                "sequential - one probe at a time - regardless of this "
-                "setting, so it has no effect on run time yet."
+                "Ceiling on how many probes run at once across all "
+                "providers combined. Different providers are probed in "
+                "parallel up to this limit; each provider is still capped "
+                "separately by 'Concurrent probes per provider'."
             ),
         },
         {

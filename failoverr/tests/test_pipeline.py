@@ -1,6 +1,8 @@
 import csv
 import pathlib
 import re
+import threading
+import time
 import types
 
 import pytest
@@ -601,6 +603,62 @@ def test_probe_candidates_skips_candidates_on_an_already_aborted_provider():
 
     assert probed == 0
     assert budget.probes == 0, "an aborted provider's candidates must not spend budget"
+
+
+def test_probe_candidates_probes_different_providers_concurrently(monkeypatch):
+    """Different providers must be probed in parallel (CLAUDE.md §7).
+
+    Prober.probe_one already enforces the per-account/global caps (see
+    test_probing.py); this proves _probe_candidates actually dispatches
+    concurrently instead of one candidate at a time.
+    """
+    settings = load_settings({"settings": {"global_concurrency": 4}})
+    state = State(path=pathlib.Path("/nonexistent/does-not-matter.json"))
+    budget = Budget(max_probes=10, max_minutes=60, now_fn=lambda: 0.0)
+
+    live = {"n": 0}
+    peak = {"n": 0}
+    lock = threading.Lock()
+    release = threading.Event()
+
+    class SlowProber:
+        aborted_providers = set()
+
+        def probe_one(self, _provider_id, _url):
+            with lock:
+                live["n"] += 1
+                peak["n"] = max(peak["n"], live["n"])
+            release.wait(timeout=2)
+            with lock:
+                live["n"] -= 1
+            return ProbeResult(VALID, {}, "ok")
+
+    candidates = [
+        row(i, f"IT: RAI {i} HD", provider)
+        for i, provider in enumerate(["A", "B", "C", "D"], start=1)
+    ]
+
+    monkeypatch.setattr(pipeline_module, "models_access_save", lambda *_a, **_kw: None)
+    log = types.SimpleNamespace(info=lambda *_a, **_kw: None)
+
+    result = {}
+
+    def run():
+        result["probed"] = pipeline_module._probe_candidates(
+            candidates, state, settings, SlowProber(), budget,
+            resolved=None, log=log,
+        )
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    time.sleep(0.2)  # let the pool reach steady-state concurrency
+    release.set()
+    thread.join(timeout=2)
+
+    assert result["probed"] == 4
+    assert peak["n"] > 1, (
+        "candidates on different providers must be probed concurrently"
+    )
 
 
 # --- Lock heartbeat + periodic state.save() cadence (Fixes 1 & 3) ----------

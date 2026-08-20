@@ -4,6 +4,7 @@ Django imports are lazy (inside functions). The functions in this first
 section touch nothing but plain data so they can be tested offline.
 """
 
+import concurrent.futures
 import csv
 import datetime
 import logging
@@ -527,21 +528,35 @@ def _notify(payload):
         pass
 
 
-def _probe_candidates(  # noqa: PLR0913, PLR0917 - interface fixed by the task spec
+def _probe_candidates(  # noqa: C901, PLR0913, PLR0917 - interface fixed by the task spec
     candidates, state, settings, prober, budget, resolved, log, probed_so_far=0,
 ):
     """Probe what is stale, record verdicts, write stats. Returns count.
 
+    Probes run in parallel across a ThreadPoolExecutor bounded by
+    global_concurrency (CLAUDE.md §7: different providers may be probed in
+    parallel while staying serialized within each - Prober.probe_one
+    already enforces the per-account and global caps internally, so this
+    only has to run several of its calls concurrently).
+
+    Which candidates to probe and the budget-spend decision are both made
+    sequentially, by this dispatching thread, before any future is
+    submitted - so neither Budget nor State needs a lock. Only
+    prober.probe_one() (already thread-safe) and is_blank() (stateless)
+    run inside worker threads; state.record(), models_access_save(), and
+    the heartbeat/save cadence all stay on this thread, processed in
+    completion order.
+
     probed_so_far is the run-wide probe count before this call, so the
-    25-probe heartbeat/save cadence accumulates across the whole run rather
-    than resetting every time run_pipeline calls this once per channel -
-    real channels rarely have 25 candidates each, so a per-call-local
-    counter would almost never fire.
+    25-probe heartbeat/save cadence accumulates across the whole run
+    rather than resetting every time run_pipeline calls this once per
+    channel - real channels rarely have 25 candidates each, so a
+    per-call-local counter would almost never fire.
     """
     from .probing import is_blank
     from .state import INVALID, VALID
 
-    probed = 0
+    to_probe = []
     for row in candidates:
         if state.is_fresh(row.stream_id, row.url, settings["probe_ttl_hours"]):
             continue
@@ -553,24 +568,35 @@ def _probe_candidates(  # noqa: PLR0913, PLR0917 - interface fixed by the task s
         if not budget.allow():
             log.info("FAILOVERR run stopping early: %s", budget.reason)
             break
-
-        result = prober.probe_one(row.provider_id, row.url)
         budget.spend()
-        probed += 1
+        to_probe.append(row)
 
+    if not to_probe:
+        return 0
+
+    def work(candidate_row):
+        result = prober.probe_one(candidate_row.provider_id, candidate_row.url)
         verdict, stats = result.verdict, result.stats
         if verdict == VALID and settings["blank_detect"] and is_blank(
-            row.url, settings["ffmpeg_path"], settings["blank_detect_seconds"]
+            candidate_row.url, settings["ffmpeg_path"], settings["blank_detect_seconds"]
         ):
             verdict, stats = INVALID, {}
+        return candidate_row, verdict, stats
 
-        state.record(row.stream_id, row.url, verdict)
-        if verdict == VALID and stats:
-            models_access_save(resolved, row.stream_id, stats)
-        if (probed_so_far + probed) % 25 == 0:
-            refresh_lock()
-            state.save()
-            _notify({"type": "failoverr", "probed": probed_so_far + probed})
+    probed = 0
+    workers = max(1, int(settings["global_concurrency"]))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(work, candidate_row) for candidate_row in to_probe]
+        for future in concurrent.futures.as_completed(futures):
+            candidate_row, verdict, stats = future.result()
+            state.record(candidate_row.stream_id, candidate_row.url, verdict)
+            if verdict == VALID and stats:
+                models_access_save(resolved, candidate_row.stream_id, stats)
+            probed += 1
+            if (probed_so_far + probed) % 25 == 0:
+                refresh_lock()
+                state.save()
+                _notify({"type": "failoverr", "probed": probed_so_far + probed})
     return probed
 
 
