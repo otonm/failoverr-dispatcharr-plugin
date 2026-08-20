@@ -485,34 +485,34 @@ class Budget:
         self.probes += 1
 
 
-def spawn(fn, *args):
-    """Run in the background without freezing the Dispatcharr worker.
+def _gevent_patched():
+    """Return whether gevent has monkey-patched subprocess.
 
-    Under gevent, a blocking subprocess wait in a plain thread stalls the
-    whole worker process. Task 3's Diagnose reports which case applies.
+    That is the condition under which a blocking subprocess wait in a
+    plain thread would stall the whole Dispatcharr worker process, so it
+    decides both how work is spawned and what Show Status reports.
     """
     try:
         from gevent import monkey
+
+        return monkey.is_module_patched("subprocess")
+    except ImportError:
+        return False
+
+
+def spawn(fn, *args):
+    """Run in the background without freezing the Dispatcharr worker."""
+    if _gevent_patched():
         from gevent import spawn as gevent_spawn
 
-        if monkey.is_module_patched("subprocess"):
-            return gevent_spawn(fn, *args)
-    except ImportError:
-        pass
+        return gevent_spawn(fn, *args)
     thread = threading.Thread(target=fn, args=args, daemon=True)
     thread.start()
     return thread
 
 
 def execution_model():
-    try:
-        from gevent import monkey
-
-        if monkey.is_module_patched("subprocess"):
-            return "gevent greenlet"
-    except ImportError:
-        pass
-    return "daemon thread"
+    return "gevent greenlet" if _gevent_patched() else "daemon thread"
 
 
 INLINE_CHANNEL_LIMIT = 15

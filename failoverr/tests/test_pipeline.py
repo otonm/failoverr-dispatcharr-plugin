@@ -700,3 +700,18 @@ def test_probe_candidates_accumulates_the_heartbeat_cadence_across_channels(
     assert probed_2 == 10
     assert len(saves) == 1, "the run-wide total crossing 25 must fire the cadence"
     assert len(refreshes) == 1
+
+
+# --- Gevent detection (Task 2) --------------------------------------------------
+
+
+def test_gevent_patched_is_false_without_gevent_installed():
+    """Both spawn() and execution_model() must use one shared gevent check.
+
+    The dev/test environment has no gevent installed (only the live
+    Dispatcharr container is guaranteed to, per CLAUDE.md §4), so both
+    functions must fall back to the plain-thread path through the shared
+    _gevent_patched() helper.
+    """
+    assert pipeline_module._gevent_patched() is False
+    assert pipeline_module.execution_model() == "daemon thread"
