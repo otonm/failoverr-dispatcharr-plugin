@@ -8,6 +8,8 @@ import csv
 import datetime
 import logging
 import pathlib
+import threading
+import time
 from collections import defaultdict
 from typing import Any, NamedTuple
 
@@ -404,5 +406,311 @@ def run_preview(context):
         "message": (
             f"Previewed {len(channels)} channels. Nothing was changed. "
             f"Report: {path}"
+        ),
+    }
+
+
+# --- Run lock, budgets, background execution --------------------------------
+
+# A stale lock from a killed run must not block the plugin forever.
+LOCK_TTL_SECONDS = 1800
+
+_lock_guard = threading.Lock()
+_lock_holder = {"holder": None, "since": 0.0}
+
+
+def acquire_lock(name, now=None):
+    now = time.time() if now is None else now
+    with _lock_guard:
+        holder = _lock_holder["holder"]
+        if holder is not None and (now - _lock_holder["since"]) < LOCK_TTL_SECONDS:
+            return False
+        _lock_holder.update({"holder": name, "since": now})
+        return True
+
+
+def release_lock():
+    with _lock_guard:
+        _lock_holder.update({"holder": None, "since": 0.0})
+
+
+def clear_lock():
+    release_lock()
+    return {"status": "ok", "message": "Lock cleared."}
+
+
+def lock_status():
+    with _lock_guard:
+        return dict(_lock_holder)
+
+
+class Budget:
+    """Runaway guard, not a normal limit.
+
+    A typical run uses about 200 probes and 15 minutes against defaults
+    of 400 and 60.
+    """
+
+    def __init__(self, max_probes, max_minutes, now_fn=time.time):
+        self.max_probes = max(1, int(max_probes))
+        self.max_seconds = max(1, int(max_minutes)) * 60
+        self.now_fn = now_fn
+        self.started = now_fn()
+        self.probes = 0
+        self.reason = None
+
+    def allow(self):
+        if self.probes >= self.max_probes:
+            self.reason = f"probe budget exhausted ({self.max_probes})"
+            return False
+        if (self.now_fn() - self.started) >= self.max_seconds:
+            self.reason = f"time budget exhausted ({self.max_seconds // 60} min)"
+            return False
+        return True
+
+    def spend(self):
+        self.probes += 1
+
+
+def spawn(fn, *args):
+    """Run in the background without freezing the Dispatcharr worker.
+
+    Under gevent, a blocking subprocess wait in a plain thread stalls the
+    whole worker process. Task 3's Diagnose reports which case applies.
+    """
+    try:
+        from gevent import monkey
+        from gevent import spawn as gevent_spawn
+
+        if monkey.is_module_patched("subprocess"):
+            return gevent_spawn(fn, *args)
+    except ImportError:
+        pass
+    thread = threading.Thread(target=fn, args=args, daemon=True)
+    thread.start()
+    return thread
+
+
+def execution_model():
+    try:
+        from gevent import monkey
+
+        if monkey.is_module_patched("subprocess"):
+            return "gevent greenlet"
+    except ImportError:
+        pass
+    return "daemon thread"
+
+
+INLINE_CHANNEL_LIMIT = 15
+
+
+def _notify(payload):
+    try:
+        from core.utils import send_websocket_update
+
+        send_websocket_update("updates", "update", payload)
+    except Exception:  # noqa: BLE001, S110 - notifications must never break a run
+        pass
+
+
+def _probe_candidates(  # noqa: PLR0913, PLR0917 - interface fixed by the task spec
+    candidates, state, settings, prober, budget, resolved, log,
+):
+    """Probe what is stale, record verdicts, write stats. Returns count."""
+    from .probing import is_blank
+    from .state import INVALID, VALID
+
+    probed = 0
+    for row in candidates:
+        if state.is_fresh(row.stream_id, row.url, settings["probe_ttl_hours"]):
+            continue
+        if not budget.allow():
+            log.info("FAILOVERR run stopping early: %s", budget.reason)
+            break
+
+        result = prober.probe_one(row.provider_id, row.url)
+        budget.spend()
+        probed += 1
+
+        verdict, stats = result.verdict, result.stats
+        if verdict == VALID and settings["blank_detect"] and is_blank(
+            row.url, settings["ffmpeg_path"], settings["blank_detect_seconds"]
+        ):
+            verdict, stats = INVALID, {}
+
+        state.record(row.stream_id, row.url, verdict)
+        if verdict == VALID and stats:
+            models_access_save(resolved, row.stream_id, stats)
+        if probed % 25 == 0:
+            _notify({"type": "failoverr", "probed": probed})
+    return probed
+
+
+def models_access_save(resolved, stream_id, stats):
+    from . import models_access
+
+    models_access.save_stream_stats(resolved, stream_id, stats)
+
+
+def run_pipeline(context, mode="run"):
+    """Single entry point for Run, Reorder Only, and Probe Only."""
+    from . import models_access
+    from .probing import Prober
+
+    log = context.get("logger", logger)
+    settings = load_settings(context)
+    resolved = models_access.resolve_models()
+    state = State.load(STATE_PATH)
+    budget = Budget(settings["max_probes_per_run"], settings["max_run_minutes"])
+
+    channels = select_channels(resolved, settings)
+    index = (
+        {} if mode != "run"
+        else build_index(iter_pool(resolved, settings))
+    )
+    prober = Prober(
+        settings["ffprobe_path"], settings["probe_timeout_seconds"],
+        settings["per_account_concurrency"], settings["global_concurrency"],
+        settings["account_cooldown_seconds"],
+    )
+
+    rows = []
+    totals = {"attached": 0, "detached": 0, "probed": 0, "channels": 0}
+
+    for channel in channels:
+        tokens = normalize(
+            channel.name or "",
+            strip_tokens=settings["strip_tokens"],
+            map_number_words=settings["map_number_words"],
+        )
+        matched = (
+            [] if mode != "run"
+            else find_matches(tokens, index, settings["match_mode"],
+                              settings["fuzzy_threshold"])
+        )
+        current = attached_rows(resolved, channel)
+        attached_ids = {stream_id for stream_id, _ in current}
+
+        by_id = {row.stream_id: row for row in matched}
+        for row in iter_attached_rows(resolved, channel, settings):
+            by_id.setdefault(row.stream_id, row)
+        candidates = list(by_id.values())
+
+        if mode != "reorder_only":
+            totals["probed"] += _probe_candidates(
+                candidates, state, settings, prober, budget, resolved, log
+            )
+
+        if mode == "probe_only":
+            totals["channels"] += 1
+            continue
+
+        ordered, detach = plan_channel(
+            attached_ids, candidates, state,
+            settings["removal_failure_threshold"],
+            settings["max_streams_per_channel"],
+            settings["order_strategy"], settings["codec_priority"],
+        )
+        if not ordered:
+            log.info("FAILOVERR %s: %s matched nothing, left alone",
+                     mode, channel.name)
+            continue
+
+        summary = models_access.apply_channel_plan(
+            resolved, channel, ordered, detach, settings["dry_run"]
+        )
+        totals["attached"] += summary["attached"]
+        totals["detached"] += summary["detached"]
+        totals["channels"] += 1
+
+        lookup = {row.stream_id: row for row in candidates}
+        for position, stream_id in enumerate(ordered):
+            row = lookup.get(stream_id)
+            rows.append({
+                "channel": channel.name, "position": position,
+                "stream": row.name if row else stream_id,
+                "provider": row.provider_id if row else "",
+                "verdict": state.last_verdict(stream_id) or "unprobed",
+                "resolution": (row.stats or {}).get("resolution", "") if row else "",
+                "codec": (row.stats or {}).get("video_codec", "") if row else "",
+                "action": "keep" if stream_id in attached_ids else "attach",
+            })
+        rows.extend({
+            "channel": channel.name, "position": "",
+            "stream": stream_id, "provider": "",
+            "verdict": state.last_verdict(stream_id) or "unprobed",
+            "resolution": "", "codec": "", "action": "detach",
+        } for stream_id in detach)
+
+    state.meta.update({
+        "last_run": time.time(),
+        "last_mode": mode,
+        "degraded_providers": sorted(str(p) for p in prober.aborted_providers),
+        "budget_stop": budget.reason,
+    })
+    state.save()
+
+    path = write_report(rows, report_path(mode))
+    degraded = " DEGRADED" if prober.aborted_providers else ""
+    log.info(
+        "FAILOVERR %s COMPLETED%s: %s channels, %s probed, %s attached, "
+        "%s detached, dry_run=%s, report %s",
+        mode, degraded, totals["channels"], totals["probed"],
+        totals["attached"], totals["detached"], settings["dry_run"], path,
+    )
+    _notify({"type": "failoverr", "status": "completed", **totals})
+    return {"status": "ok", "report": path, "degraded_providers":
+            sorted(str(p) for p in prober.aborted_providers), **totals}
+
+
+def start(context, mode="run"):
+    """Acquire the lock and run, inline for small jobs, backgrounded otherwise."""
+    log = context.get("logger", logger)
+    if not acquire_lock(mode):
+        held = lock_status()["holder"]
+        return {
+            "status": "error",
+            "message": (
+                f"A {held} operation is already running. Wait for it to "
+                f"finish, or use Clear Lock if it is stuck."
+            ),
+        }
+
+    settings = load_settings(context)
+    try:
+        from . import models_access
+
+        resolved = models_access.resolve_models()
+        channel_count = len(select_channels(resolved, settings))
+    except Exception as exc:
+        release_lock()
+        log.exception("FAILOVERR %s FAILED", mode)
+        return {"status": "error", "message": str(exc)}
+
+    if channel_count <= INLINE_CHANNEL_LIMIT and mode == "reorder_only":
+        try:
+            return run_pipeline(context, mode)
+        finally:
+            release_lock()
+
+    def background():
+        try:
+            run_pipeline(context, mode)
+        except Exception:  # a background run must never crash silently
+            log.exception("FAILOVERR %s FAILED", mode)
+        finally:
+            release_lock()
+
+    spawn(background)
+    return {
+        "status": "started",
+        "channels": channel_count,
+        "dry_run": settings["dry_run"],
+        "message": (
+            f"Started {mode} over {channel_count} channels in the background "
+            f"({execution_model()}). dry_run is "
+            f"{'ON - nothing will be changed' if settings['dry_run'] else 'OFF'}. "
+            f"Use Show Status to follow along."
         ),
     }

@@ -2,13 +2,21 @@ import csv
 import pathlib
 import re
 
+import pytest
+
 from failoverr.naming import normalize
 from failoverr.pipeline import (
+    LOCK_TTL_SECONDS,
+    Budget,
     StreamRow,
+    acquire_lock,
     build_index,
+    clear_lock,
     find_matches,
     load_settings,
+    lock_status,
     plan_channel,
+    release_lock,
     report_path,
     write_report,
 )
@@ -283,3 +291,66 @@ def test_load_settings_falls_back_to_default_tokens_when_blank():
 def test_load_settings_parses_the_channel_name_list():
     settings = load_settings({"settings": {"channel_names": "RAI 1\n RAI 2 \n\n"}})
     assert settings["channel_names"] == ["RAI 1", "RAI 2"]
+
+
+@pytest.fixture(autouse=True)
+def _reset_lock():
+    clear_lock()
+    yield
+    clear_lock()
+
+
+def test_lock_is_acquired_when_free():
+    assert acquire_lock("run", now=0.0) is True
+
+
+def test_second_acquisition_is_refused():
+    acquire_lock("run", now=0.0)
+    assert acquire_lock("preview", now=10.0) is False
+
+
+def test_lock_is_reusable_after_release():
+    acquire_lock("run", now=0.0)
+    release_lock()
+    assert acquire_lock("run", now=10.0) is True
+
+
+def test_stale_lock_is_stolen_after_the_ttl():
+    """A run killed mid-flight must not block the plugin forever."""
+    acquire_lock("run", now=0.0)
+    assert acquire_lock("run", now=LOCK_TTL_SECONDS + 1) is True
+
+
+def test_lock_status_reports_the_holder():
+    acquire_lock("probe_only", now=0.0)
+    assert lock_status()["holder"] == "probe_only"
+
+
+def test_clear_lock_releases_a_held_lock():
+    acquire_lock("run", now=0.0)
+    clear_lock()
+    assert lock_status()["holder"] is None
+
+
+# --- Budgets ---------------------------------------------------------------
+
+def test_budget_allows_probes_up_to_the_limit():
+    budget = Budget(max_probes=3, max_minutes=60, now_fn=lambda: 0.0)
+    for _ in range(3):
+        assert budget.allow()
+        budget.spend()
+    assert budget.allow() is False
+    assert "probe" in budget.reason
+
+
+def test_budget_stops_on_wall_clock():
+    clock = {"t": 0.0}
+    budget = Budget(max_probes=1000, max_minutes=10, now_fn=lambda: clock["t"])
+    assert budget.allow()
+    clock["t"] = 11 * 60
+    assert budget.allow() is False
+    assert "time" in budget.reason
+
+
+def test_a_fresh_budget_has_no_reason():
+    assert Budget(10, 10, now_fn=lambda: 0.0).reason is None
