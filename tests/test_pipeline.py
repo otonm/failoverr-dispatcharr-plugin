@@ -368,6 +368,44 @@ def test_clear_lock_force_releases_a_stale_lock_and_drops_any_cancel_flag():
     assert pipeline_module.cancel_requested() is False
 
 
+def test_clear_state_resets_the_probe_cache(tmp_path, monkeypatch):
+    monkeypatch.setattr(pipeline_module, "STATE_PATH", tmp_path / "state.json")
+    state = State(tmp_path / "state.json")
+    state.record(1, "http://a.example/1.ts", VALID)
+    state.meta["last_run"] = 123.0
+    state.save()
+
+    result = pipeline_module.clear_state()
+
+    assert result["status"] == "ok"
+    reloaded = State.load(tmp_path / "state.json")
+    assert reloaded.streams == {}
+    assert reloaded.meta == {}
+
+
+def test_clear_state_refuses_while_a_run_is_genuinely_active(tmp_path, monkeypatch):
+    """Clearing mid-run would be silently undone by that run's next save().
+
+    It holds its own State instance in memory, so it must be refused rather
+    than racing - same reasoning as clear_lock's active/stale split.
+    """
+    monkeypatch.setattr(pipeline_module, "STATE_PATH", tmp_path / "state.json")
+    acquire_lock("run", now=time.time())
+
+    result = pipeline_module.clear_state()
+
+    assert result["status"] == "error"
+
+
+def test_clear_state_succeeds_when_the_lock_is_only_stale(tmp_path, monkeypatch):
+    monkeypatch.setattr(pipeline_module, "STATE_PATH", tmp_path / "state.json")
+    acquire_lock("run", now=0.0)  # far enough in the past to read as stale
+
+    result = pipeline_module.clear_state()
+
+    assert result["status"] == "ok"
+
+
 def test_refresh_lock_prevents_a_steal_at_the_original_ttl_deadline():
     """Finding: a long run must keep its own lock fresh.
 

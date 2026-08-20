@@ -552,6 +552,36 @@ def lock_status():
     return {"holder": data.get("holder"), "since": float(data.get("since", 0.0))}
 
 
+def clear_state():
+    """Reset the probe cache: cached verdicts, URL hashes, failure counters.
+
+    Refused while a run genuinely holds the lock (not merely a stale one) -
+    that run has its own State instance in memory and would overwrite this
+    reset with its own data on its next periodic save(), silently undoing
+    the clear.
+    """
+    status = lock_status()
+    if status["holder"] and (time.time() - status["since"]) < LOCK_TTL_SECONDS:
+        return {
+            "status": "error",
+            "message": (
+                f"A {status['holder']} operation is in progress and holds "
+                "the probe cache in memory - clearing it now would be "
+                "silently undone by that run's next save. Wait for it to "
+                "finish, or use Clear Lock to cancel it first."
+            ),
+        }
+    State(STATE_PATH).save()
+    return {
+        "status": "ok",
+        "message": (
+            "Probe cache cleared. Every stream - matched and already "
+            "attached - will be treated as unprobed and re-checked from "
+            "scratch on the next run."
+        ),
+    }
+
+
 class Budget:
     """Runaway guard, not a normal limit.
 

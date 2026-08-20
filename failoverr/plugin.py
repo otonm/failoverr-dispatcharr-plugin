@@ -518,6 +518,27 @@ class Plugin:
             ),
         },
         {
+            "id": "clear_state",
+            "label": "Clear State",
+            "description": (
+                "Wipes the probe cache: cached verdicts, URL hashes, and "
+                "failure counters. Every stream is treated as unprobed and "
+                "fully re-checked on the next run, at full probe cost. "
+                "Attached streams are not touched until then."
+            ),
+            "confirm": {
+                "required": True,
+                "title": "Clear the probe cache?",
+                "message": (
+                    "This discards every cached probe result and failure "
+                    "counter - it does not touch Dispatcharr's database or "
+                    "any attached stream. The next run re-probes everything "
+                    "from scratch, which at this lineup size can take a "
+                    "while and consumes provider connections."
+                ),
+            },
+        },
+        {
             "id": "show_status",
             "label": "Show Status",
             "description": (
@@ -539,6 +560,7 @@ class Plugin:
             "reorder_only": lambda _, c: self._start(c, "reorder_only"),
             "probe_only": lambda _, c: self._start(c, "probe_only"),
             "clear_lock": self._clear_lock,
+            "clear_state": self._clear_state,
             "show_status": self._show_status,
         }
         handler = handlers.get(action)
@@ -655,6 +677,12 @@ class Plugin:
 
         context.get("logger", logger).info("FAILOVERR lock cleared by user")
         return pipeline.clear_lock()
+
+    def _clear_state(self, params, context):
+        from . import pipeline
+
+        context.get("logger", logger).info("FAILOVERR state cleared by user")
+        return pipeline.clear_state()
 
     def _show_status(self, params, context):
         from . import pipeline
