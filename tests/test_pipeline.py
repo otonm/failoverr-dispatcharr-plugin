@@ -263,6 +263,24 @@ def test_load_settings_applies_defaults_for_missing_keys():
     assert settings["removal_failure_threshold"] == 3
 
 
+def test_load_settings_defaults_the_ranking_toggles_to_true():
+    settings = load_settings({"settings": {}})
+    assert settings["rank_by_resolution"] is True
+    assert settings["rank_by_response_time"] is True
+    assert settings["rank_by_codec"] is True
+    assert settings["rank_by_fps"] is True
+    assert settings["rank_by_bitrate"] is True
+    assert settings["response_time_bucket_ms"] == 250
+
+
+def test_load_settings_coerces_the_ranking_toggles():
+    settings = load_settings({"settings": {
+        "rank_by_fps": "false", "response_time_bucket_ms": "500",
+    }})
+    assert settings["rank_by_fps"] is False
+    assert settings["response_time_bucket_ms"] == 500
+
+
 def test_load_settings_coerces_numeric_strings():
     """Dispatcharr may hand back numbers as strings."""
     settings = load_settings({"settings": {"max_streams_per_channel": "5",

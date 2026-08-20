@@ -19,7 +19,12 @@ from typing import Any, NamedTuple
 
 from .naming import DEFAULT_STRIP_TOKENS, normalize
 from .naming import matches as name_matches
-from .ordering import DEFAULT_CODEC_PRIORITY, Candidate, order_candidates
+from .ordering import (
+    DEFAULT_CODEC_PRIORITY,
+    DEFAULT_RESPONSE_TIME_BUCKET_MS,
+    Candidate,
+    order_candidates,
+)
 from .state import DEFAULT_PATH as STATE_PATH
 from .state import INCONCLUSIVE, INVALID, VALID, State
 
@@ -41,6 +46,12 @@ _DEFAULTS = {
     "fuzzy_threshold": 85,
     "map_number_words": True,
     "order_strategy": "quality_first",
+    "rank_by_resolution": True,
+    "rank_by_response_time": True,
+    "rank_by_codec": True,
+    "rank_by_fps": True,
+    "rank_by_bitrate": True,
+    "response_time_bucket_ms": DEFAULT_RESPONSE_TIME_BUCKET_MS,
     "max_streams_per_channel": 10,
     "probe_ttl_hours": 24,
     "per_account_concurrency": 1,
@@ -60,10 +71,14 @@ _INT_KEYS = (
     "probe_timeout_seconds", "fuzzy_threshold", "max_streams_per_channel",
     "probe_ttl_hours", "per_account_concurrency", "account_cooldown_seconds",
     "global_concurrency", "removal_failure_threshold", "blank_detect_seconds",
-    "max_probes_per_run", "max_run_minutes",
+    "max_probes_per_run", "max_run_minutes", "response_time_bucket_ms",
 )
 
-_BOOL_KEYS = ("dry_run", "map_number_words", "blank_detect", "schedule_enabled")
+_BOOL_KEYS = (
+    "dry_run", "map_number_words", "blank_detect", "schedule_enabled",
+    "rank_by_resolution", "rank_by_response_time", "rank_by_codec",
+    "rank_by_fps", "rank_by_bitrate",
+)
 _FALSE_STRINGS = ("false", "0", "no", "off")
 
 
