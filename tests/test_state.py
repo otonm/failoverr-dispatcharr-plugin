@@ -112,3 +112,28 @@ def test_load_of_a_corrupt_file_gives_empty_state_without_raising(tmp_path):
 def test_url_hash_is_stable_and_distinguishing():
     assert url_hash(URL) == url_hash(URL)
     assert url_hash(URL) != url_hash(URL + "?token=2")
+
+
+def test_record_stores_response_time_on_a_valid_verdict(tmp_path):
+    state = State(tmp_path / "state.json")
+    state.record(1, "http://a.example/1.ts", VALID, response_time_ms=350)
+    assert state.response_time_ms(1) == 350
+
+
+def test_response_time_defaults_to_none_when_never_recorded(tmp_path):
+    state = State(tmp_path / "state.json")
+    assert state.response_time_ms(1) is None
+
+
+def test_inconclusive_preserves_prior_response_time(tmp_path):
+    state = State(tmp_path / "state.json")
+    state.record(1, "http://a.example/1.ts", VALID, response_time_ms=350)
+    state.record(1, "http://a.example/1.ts", INCONCLUSIVE)
+    assert state.response_time_ms(1) == 350
+
+
+def test_a_fresh_valid_probe_updates_the_response_time(tmp_path):
+    state = State(tmp_path / "state.json")
+    state.record(1, "http://a.example/1.ts", VALID, response_time_ms=350)
+    state.record(1, "http://a.example/1.ts", VALID, response_time_ms=120)
+    assert state.response_time_ms(1) == 120

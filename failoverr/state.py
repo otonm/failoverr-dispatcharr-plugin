@@ -65,7 +65,7 @@ class State:
         now = time.time() if now is None else now
         return (now - float(entry.get("last_probe", 0))) < ttl_hours * 3600
 
-    def record(self, stream_id, url, verdict, now=None):
+    def record(self, stream_id, url, verdict, now=None, response_time_ms=None):
         now = time.time() if now is None else now
         entry = dict(self._entry(stream_id))
         failures = int(entry.get("failures", 0))
@@ -82,6 +82,8 @@ class State:
                 "failures": failures,
             }
         )
+        if verdict == VALID and response_time_ms is not None:
+            entry["response_time_ms"] = response_time_ms
         self.streams[str(stream_id)] = entry
 
     def failure_count(self, stream_id):
@@ -89,6 +91,9 @@ class State:
 
     def last_verdict(self, stream_id):
         return self._entry(stream_id).get("verdict")
+
+    def response_time_ms(self, stream_id):
+        return self._entry(stream_id).get("response_time_ms")
 
     def should_remove(self, stream_id, threshold):
         return self.failure_count(stream_id) >= max(1, int(threshold))
