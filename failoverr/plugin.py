@@ -551,8 +551,17 @@ class Plugin:
             log.exception("FAILOVERR %s FAILED", action)
             return {"status": "error", "message": str(exc)}
         _log_report(log, action, "result", result)
-        failed = isinstance(result, dict) and result.get("status") == "error"
-        log.info("FAILOVERR %s %s", action, "FAILED" if failed else "COMPLETED")
+        status = result.get("status") if isinstance(result, dict) else None
+        # "started" means a background thread/greenlet just launched, not that
+        # the work is done - the actual pipeline run logs its own COMPLETED /
+        # CANCELED / INTERRUPTED line (pipeline.run_pipeline) once it's real.
+        verb = {
+            "error": "FAILED",
+            "started": "STARTED",
+            "canceled": "CANCELED",
+            "interrupted": "INTERRUPTED",
+        }.get(status, "COMPLETED")
+        log.info("FAILOVERR %s %s", action, verb)
         return result
 
     def _diagnose(self, params, context):

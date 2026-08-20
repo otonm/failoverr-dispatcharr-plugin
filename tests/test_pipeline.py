@@ -11,6 +11,7 @@ import pytest
 
 from failoverr import models_access as models_access_module
 from failoverr import pipeline as pipeline_module
+from failoverr import probing as probing_module
 from failoverr.naming import normalize
 from failoverr.pipeline import (
     LOCK_TTL_SECONDS,
@@ -306,6 +307,7 @@ def test_load_settings_parses_the_channel_name_list():
 @pytest.fixture(autouse=True)
 def _reset_lock(tmp_path, monkeypatch):
     monkeypatch.setattr(pipeline_module, "LOCK_PATH", str(tmp_path / "run.lock"))
+    monkeypatch.setattr(pipeline_module, "CANCEL_PATH", str(tmp_path / "cancel.flag"))
     clear_lock()
     yield
     clear_lock()
@@ -341,6 +343,29 @@ def test_clear_lock_releases_a_held_lock():
     acquire_lock("run", now=0.0)
     clear_lock()
     assert lock_status()["holder"] is None
+
+
+def test_clear_lock_only_requests_cancellation_for_a_still_active_run():
+    """Pressing Clear Lock on a genuinely running job must not free its lock.
+
+    Freeing it immediately would let a second run start while the first is
+    still probing - two runs writing state.json/attaching streams at once.
+    Instead it raises the cancel flag and leaves the lock alone; the running
+    job releases its own lock once it notices, at its next budget check.
+    """
+    acquire_lock("run", now=1000.0)
+    result = clear_lock(now=1005.0)  # well within LOCK_TTL_SECONDS
+    assert result["status"] == "ok"
+    assert lock_status()["holder"] == "run"
+    assert pipeline_module.cancel_requested() is True
+
+
+def test_clear_lock_force_releases_a_stale_lock_and_drops_any_cancel_flag():
+    acquire_lock("run", now=0.0)
+    pipeline_module.request_cancel()
+    clear_lock(now=LOCK_TTL_SECONDS + 1)
+    assert lock_status()["holder"] is None
+    assert pipeline_module.cancel_requested() is False
 
 
 def test_refresh_lock_prevents_a_steal_at_the_original_ttl_deadline():
@@ -407,6 +432,13 @@ def test_budget_stops_on_wall_clock():
 
 def test_a_fresh_budget_has_no_reason():
     assert Budget(10, 10, now_fn=lambda: 0.0).reason is None
+
+
+def test_budget_stops_and_flags_canceled_when_cancel_fn_fires():
+    budget = Budget(1000, 60, now_fn=lambda: 0.0, cancel_fn=lambda: True)
+    assert budget.allow() is False
+    assert budget.canceled is True
+    assert "cancel" in budget.reason
 
 
 # --- run_pipeline mode-routing ----------------------------------------------
@@ -518,6 +550,75 @@ def test_non_run_modes_never_index_the_pool_or_match_by_name(
         assert apply_calls == [([1], [])]
     else:
         assert apply_calls == [], "probe_only must never call apply_channel_plan"
+
+
+# --- Run-ending status: completed / canceled / interrupted -----------------
+
+
+def _stub_probe_one(monkeypatch):
+    """Skip the real ffprobe subprocess.
+
+    These tests care about run-ending status, not probe mechanics (already
+    covered by test_probing.py).
+    """
+    monkeypatch.setattr(
+        probing_module.Prober, "probe_one",
+        lambda self, provider_id, url: ProbeResult(VALID, {}, "ok"),  # noqa: ARG005
+    )
+
+
+def test_run_pipeline_reports_canceled_when_the_cancel_flag_is_set(
+    tmp_path, monkeypatch
+):
+    channel = types.SimpleNamespace(name="RAI 1")
+    attached = [row(1, "IT: RAI 1 HD", "A")]  # never probed -> not fresh
+    state = _make_state(tmp_path)
+    _patch_common(monkeypatch, tmp_path, channel, attached, state)
+    _stub_probe_one(monkeypatch)
+    monkeypatch.setattr(pipeline_module, "cancel_requested", lambda: True)
+
+    result = run_pipeline({"settings": {}}, mode="probe_only")
+
+    assert result["status"] == "canceled"
+    assert result["probed"] == 0, "canceled before the first probe was spent"
+
+
+def test_run_pipeline_reports_interrupted_when_a_budget_is_exhausted(
+    tmp_path, monkeypatch
+):
+    """Covers both budgets: probe and wall-clock.
+
+    Both count as INTERRUPTED, not CANCELED (nobody asked for this one to
+    stop) and not a clean finish.
+    """
+    channel = types.SimpleNamespace(name="RAI 1")
+    # Two never-probed candidates against a budget of 1: the first is spent,
+    # the second is what trips budget.allow() into False.
+    attached = [row(1, "IT: RAI 1 HD", "A"), row(2, "IT: Rai 1 4K", "B")]
+    state = _make_state(tmp_path)
+    _patch_common(monkeypatch, tmp_path, channel, attached, state)
+    _stub_probe_one(monkeypatch)
+    monkeypatch.setattr(
+        pipeline_module, "load_settings",
+        lambda _c: {**load_settings({"settings": {}}), "max_probes_per_run": 1},
+    )
+
+    result = run_pipeline({"settings": {}}, mode="probe_only")
+
+    assert result["status"] == "interrupted"
+    assert result["probed"] == 1
+
+
+def test_run_pipeline_reports_ok_on_a_normal_finish(tmp_path, monkeypatch):
+    channel = types.SimpleNamespace(name="RAI 1")
+    attached = [row(1, "IT: RAI 1 HD", "A")]
+    state = _make_state(tmp_path)
+    state.record(1, attached[0].url, VALID)  # fresh: nothing left to probe
+    _patch_common(monkeypatch, tmp_path, channel, attached, state)
+
+    result = run_pipeline({"settings": {}}, mode="probe_only")
+
+    assert result["status"] == "ok"
 
 
 # --- Django DB connection cleanup (Fix 2) -----------------------------------

@@ -426,6 +426,13 @@ LOCK_TTL_SECONDS = 1800
 # each other; the file's content is just {"holder": ..., "since": ...}.
 LOCK_PATH = "/data/failoverr/run.lock"
 
+# Presence-only flag, checked by the running job itself at its next
+# checkpoint (Budget.allow(), the same spot the probe/time budgets are
+# checked). A separate process (Clear Lock, pressed from the UI) can only
+# ask the run to stop cooperatively - it has no way to kill the thread or
+# greenlet actually doing the work.
+CANCEL_PATH = "/data/failoverr/cancel.flag"
+
 
 def _open_lock_file():
     path = pathlib.Path(LOCK_PATH)
@@ -493,8 +500,45 @@ def release_lock():
             fcntl.flock(fh, fcntl.LOCK_UN)
 
 
-def clear_lock():
+def request_cancel():
+    path = pathlib.Path(CANCEL_PATH)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.touch()
+
+
+def cancel_requested():
+    return pathlib.Path(CANCEL_PATH).exists()
+
+
+def _clear_cancel():
+    pathlib.Path(CANCEL_PATH).unlink(missing_ok=True)
+
+
+def clear_lock(now=None):
+    """Cancel an active run cooperatively; force-release only a stale one.
+
+    A run past LOCK_TTL_SECONDS since its own last heartbeat is presumed
+    dead (crashed without releasing), so that case still force-releases
+    immediately, as before. Anything more recent is presumed to still be
+    working - releasing its lock here would let a second run start while
+    the first is still probing, so this only raises the cancel flag and
+    lets the running job release its own lock once it notices, at its next
+    Budget.allow() checkpoint.
+    """
+    now = time.time() if now is None else now
+    status = lock_status()
+    active = status["holder"] and (now - status["since"]) < LOCK_TTL_SECONDS
+    if active:
+        request_cancel()
+        return {
+            "status": "ok",
+            "message": (
+                f"Cancellation requested for the running {status['holder']} "
+                "job; it will stop at its next checkpoint."
+            ),
+        }
     release_lock()
+    _clear_cancel()
     return {"status": "ok", "message": "Lock cleared."}
 
 
@@ -515,15 +559,21 @@ class Budget:
     of 400 and 60.
     """
 
-    def __init__(self, max_probes, max_minutes, now_fn=time.time):
+    def __init__(self, max_probes, max_minutes, now_fn=time.time, cancel_fn=None):
         self.max_probes = max(1, int(max_probes))
         self.max_seconds = max(1, int(max_minutes)) * 60
         self.now_fn = now_fn
+        self.cancel_fn = cancel_fn or (lambda: False)
         self.started = now_fn()
         self.probes = 0
         self.reason = None
+        self.canceled = False
 
     def allow(self):
+        if self.cancel_fn():
+            self.canceled = True
+            self.reason = "canceled by user"
+            return False
         if self.probes >= self.max_probes:
             self.reason = f"probe budget exhausted ({self.max_probes})"
             return False
@@ -660,6 +710,11 @@ def _probe_candidates(  # noqa: PLR0913, PLR0917 - interface fixed by the task s
                 log.exception("FAILOVERR probe worker raised unexpectedly")
                 continue
             state.record(candidate_row.stream_id, candidate_row.url, verdict)
+            log.info(
+                "FAILOVERR probe stream=%s name=%r provider=%s verdict=%s",
+                candidate_row.stream_id, candidate_row.name,
+                candidate_row.provider_id, verdict,
+            )
             if verdict == VALID and stats:
                 models_access_save(resolved, candidate_row.stream_id, stats)
             probed += 1
@@ -668,6 +723,15 @@ def _probe_candidates(  # noqa: PLR0913, PLR0917 - interface fixed by the task s
                 state.save()
                 _notify({"type": "failoverr", "probed": probed_so_far + probed})
     return probed
+
+
+def _run_outcome(budget):
+    """Decide the run's final verdict: CANCELED beats INTERRUPTED beats COMPLETED."""
+    if budget.canceled:
+        return "canceled", "CANCELED"
+    if budget.reason:
+        return "interrupted", "INTERRUPTED"
+    return "ok", "COMPLETED"
 
 
 def models_access_save(resolved, stream_id, stats):
@@ -709,7 +773,10 @@ def run_pipeline(context, mode="run"):
     _close_old_connections()
     resolved = models_access.resolve_models()
     state = State.load(STATE_PATH)
-    budget = Budget(settings["max_probes_per_run"], settings["max_run_minutes"])
+    budget = Budget(
+        settings["max_probes_per_run"], settings["max_run_minutes"],
+        cancel_fn=cancel_requested,
+    )
 
     channels = select_channels(resolved, settings)
     index = (
@@ -806,15 +873,16 @@ def run_pipeline(context, mode="run"):
     state.save()
 
     path = write_report(rows, report_path(mode))
+    status, verb = _run_outcome(budget)
     degraded = " DEGRADED" if prober.aborted_providers else ""
     log.info(
-        "FAILOVERR %s COMPLETED%s: %s channels, %s probed, %s attached, "
+        "FAILOVERR %s %s%s: %s channels, %s probed, %s attached, "
         "%s detached, dry_run=%s, report %s",
-        mode, degraded, totals["channels"], totals["probed"],
+        mode, verb, degraded, totals["channels"], totals["probed"],
         totals["attached"], totals["detached"], settings["dry_run"], path,
     )
-    _notify({"type": "failoverr", "status": "completed", **totals})
-    return {"status": "ok", "report": path, "degraded_providers":
+    _notify({"type": "failoverr", "status": status, **totals})
+    return {"status": status, "report": path, "degraded_providers":
             sorted(str(p) for p in prober.aborted_providers), **totals}
 
 
@@ -830,6 +898,7 @@ def start(context, mode="run"):
                 f"finish, or use Clear Lock if it is stuck."
             ),
         }
+    _clear_cancel()  # a previous run's leftover cancel flag must not preempt this one
 
     settings = load_settings(context)
     try:
