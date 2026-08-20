@@ -966,6 +966,68 @@ def test_probe_candidates_probes_different_providers_concurrently(monkeypatch):
     )
 
 
+def test_probe_candidates_stops_launching_new_probes_once_stopped_mid_batch(
+    monkeypatch,
+):
+    """Stop must not wait for a whole channel's batch to finish.
+
+    With global_concurrency=2 and 4 candidates, 2 start immediately and 2
+    sit queued behind them. Once Stop is pressed while the first 2 are
+    in-flight, those 2 must still be allowed to finish (there is no way to
+    kill a subprocess mid-probe), but the still-queued 2 must never launch
+    at all - "wait for the current probe, then stop."
+    """
+    settings = load_settings({"settings": {"global_concurrency": 2}})
+    state = State(path=pathlib.Path("/nonexistent/does-not-matter.json"))
+    budget = Budget(max_probes=10, max_minutes=60, now_fn=lambda: 0.0)
+
+    started = threading.Event()
+    release = threading.Event()
+    live = {"n": 0}
+    calls = []
+    lock = threading.Lock()
+
+    class SlowProber:
+        aborted_providers = set()
+
+        def probe_one(self, _provider_id, url):
+            with lock:
+                calls.append(url)
+                live["n"] += 1
+                if live["n"] == 2:
+                    started.set()
+            release.wait(timeout=2)
+            return ProbeResult(VALID, {}, "ok")
+
+    candidates = [
+        row(i, f"IT: RAI {i} HD", provider)
+        for i, provider in enumerate(["A", "B", "C", "D"], start=1)
+    ]
+
+    monkeypatch.setattr(pipeline_module, "models_access_save", lambda *_a, **_kw: None)
+    canceled = {"flag": False}
+    monkeypatch.setattr(pipeline_module, "cancel_requested", lambda: canceled["flag"])
+    log = types.SimpleNamespace(info=lambda *_a, **_kw: None)
+
+    result = {}
+
+    def run():
+        result["probed"] = pipeline_module._probe_candidates(
+            candidates, state, settings, SlowProber(), budget,
+            resolved=None, log=log,
+        )
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    assert started.wait(timeout=2), "the first 2 (global_concurrency=2) must start"
+    canceled["flag"] = True  # Stop pressed while 2 are in flight, 2 still queued
+    release.set()
+    thread.join(timeout=2)
+
+    assert result["probed"] == 2, "only the 2 already in flight should complete"
+    assert len(calls) == 2, "the 2 queued-but-not-started candidates must never probe"
+
+
 # --- Lock heartbeat + periodic state.save() cadence (Fixes 1 & 3) ----------
 
 

@@ -762,6 +762,16 @@ def _probe_candidates(  # noqa: PLR0913, PLR0917 - interface fixed by the task s
     rather than resetting every time run_pipeline calls this once per
     channel - real channels rarely have 25 candidates each, so a
     per-call-local counter would almost never fire.
+
+    Stop (cancel_requested()) can only take effect between batches at the
+    _select_probe_batch level - a whole channel's candidates are submitted
+    to the pool in one go, up to global_concurrency of them run truly
+    concurrently, and there is no way to kill a subprocess already
+    mid-probe. So work() re-checks cancel_requested() right before it would
+    start a *new* probe: anything still queued behind a busy worker thread
+    when Stop was pressed short-circuits instead of launching, while
+    whatever already started keeps running to completion - "wait for the
+    current probe, then stop," not "wait for this whole channel."
     """
     from .probing import is_blank
     from .state import INVALID, VALID
@@ -771,6 +781,8 @@ def _probe_candidates(  # noqa: PLR0913, PLR0917 - interface fixed by the task s
         return 0
 
     def work(candidate_row):
+        if cancel_requested():
+            return candidate_row, None, None
         result = prober.probe_one(candidate_row.provider_id, candidate_row.url)
         verdict, stats = result.verdict, result.stats
         if verdict == VALID and settings["blank_detect"] and is_blank(
@@ -789,22 +801,41 @@ def _probe_candidates(  # noqa: PLR0913, PLR0917 - interface fixed by the task s
             except Exception:
                 log.exception("FAILOVERR probe worker raised unexpectedly")
                 continue
-            state.record(candidate_row.stream_id, candidate_row.url, verdict)
-            log.info(
-                "FAILOVERR probe stream=%s name=%r provider=%s verdict=%s",
-                candidate_row.stream_id, candidate_row.name,
-                candidate_row.provider_id, verdict,
-            )
-            if verdict == VALID and stats:
-                models_access_save(resolved, candidate_row.stream_id, stats)
-            probed += 1
-            if progress_cb is not None:
-                progress_cb(candidate_row, verdict, probed_so_far + probed)
-            if (probed_so_far + probed) % 25 == 0:
-                refresh_lock()
-                state.save()
-                _notify({"type": "failoverr", "probed": probed_so_far + probed})
+            if _handle_probe_result(
+                candidate_row, verdict, stats, resolved, state, log,
+                progress_cb, probed_so_far + probed,
+            ):
+                probed += 1
     return probed
+
+
+def _handle_probe_result(  # noqa: PLR0913, PLR0917 - one call site, _probe_candidates
+    candidate_row, verdict, stats, resolved, state, log, progress_cb, probed_before,
+):
+    """Record one probe's verdict, save stats, and report progress.
+
+    Returns whether it actually counted as a probe. A None verdict means
+    work() short-circuited because Stop was pressed before this candidate's
+    probe started - nothing to record, same as it never having been picked.
+    """
+    if verdict is None:
+        return False
+    state.record(candidate_row.stream_id, candidate_row.url, verdict)
+    log.info(
+        "FAILOVERR probe stream=%s name=%r provider=%s verdict=%s",
+        candidate_row.stream_id, candidate_row.name,
+        candidate_row.provider_id, verdict,
+    )
+    if verdict == VALID and stats:
+        models_access_save(resolved, candidate_row.stream_id, stats)
+    probed_total = probed_before + 1
+    if progress_cb is not None:
+        progress_cb(candidate_row, verdict, probed_total)
+    if probed_total % 25 == 0:
+        refresh_lock()
+        state.save()
+        _notify({"type": "failoverr", "probed": probed_total})
+    return True
 
 
 def _run_outcome(budget):
