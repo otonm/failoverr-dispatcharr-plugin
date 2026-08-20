@@ -88,12 +88,41 @@ def _int(value, default=0):
         return default
 
 
-def _build_stats(video, audio, container):
-    bitrate = _int(container.get("bit_rate")) or _int(video.get("bit_rate"))
+# Below this many sampled packets, a packet-based bitrate estimate is
+# noise-dominated rather than measured — a 2-packet sample was observed to
+# spike to 22924 kbps. Leave video_bitrate at 0 rather than persist a
+# misleading number; the next probe gets a fresh shot.
+MIN_PACKETS_FOR_BITRATE_CALC = 30
+
+# Seconds of real packet data ffprobe reads for the bitrate fallback, via
+# -read_intervals. Live MPEG-TS/HLS almost never declares bit_rate in its
+# stream or format metadata (that requires a known total duration), so this
+# is the only way to get a real number for it.
+BITRATE_SAMPLE_SECONDS = 5
+
+
+def _packet_video_bitrate_kbps(packets, video_index):
+    """Average bitrate over sampled packets for one stream, in kbps."""
+    video_packets = [p for p in packets if p.get("stream_index") == video_index]
+    if len(video_packets) < MIN_PACKETS_FOR_BITRATE_CALC:
+        return None
+    total_size = sum(_int(p.get("size")) for p in video_packets)
+    total_duration = sum(_fraction(p.get("duration_time")) for p in video_packets)
+    if total_duration <= 0:
+        return None
+    return round((total_size * 8) / (total_duration * 1000))
+
+
+def _build_stats(video, audio, container, packets):
+    declared = _int(container.get("bit_rate")) or _int(video.get("bit_rate"))
+    video_bitrate = (
+        declared // 1000 if declared
+        else _packet_video_bitrate_kbps(packets, video.get("index")) or 0
+    )
     return {
         "video_codec": video.get("codec_name") or "",
         "resolution": f"{_int(video.get('width'))}x{_int(video.get('height'))}",
-        "video_bitrate": bitrate // 1000,
+        "video_bitrate": video_bitrate,
         "source_fps": _fraction(video.get("avg_frame_rate")),
         "audio_codec": audio.get("codec_name") or "",
         "audio_channels": _int(audio.get("channels")),
@@ -141,7 +170,9 @@ def classify(returncode, stdout, stderr):  # noqa: PLR0911
     if not audios:
         return ProbeResult(INVALID, {}, "no audio stream")
 
-    stats = _build_stats(videos[0], audios[0], payload.get("format") or {})
+    stats = _build_stats(
+        videos[0], audios[0], payload.get("format") or {}, payload.get("packets") or []
+    )
     return ProbeResult(VALID, stats, f"ok {stats['resolution']} {stats['video_codec']}")
 
 
@@ -172,6 +203,8 @@ def probe(url, ffprobe_path, timeout, runner=run_command):
         "-print_format", "json",
         "-show_streams",
         "-show_format",
+        "-show_packets",
+        "-read_intervals", f"%+{BITRATE_SAMPLE_SECONDS}",
         "-analyzeduration", "5000000",
         "-probesize", "5000000",
         url,

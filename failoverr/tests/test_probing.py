@@ -14,12 +14,28 @@ from failoverr.probing import (
 from failoverr.state import INCONCLUSIVE, INVALID, VALID
 
 
-def ffprobe_json(streams):
-    return json.dumps({"streams": streams, "format": {"bit_rate": "5000000"}})
+def ffprobe_json(streams, packets=None, format_bitrate="5000000"):
+    payload = {"streams": streams, "format": {}}
+    if format_bitrate is not None:
+        payload["format"]["bit_rate"] = format_bitrate
+    if packets is not None:
+        payload["packets"] = packets
+    return json.dumps(payload)
+
+
+def video_packets(count, size=25000, duration_time=0.025, stream_index=0):
+    return [
+        {
+            "stream_index": stream_index,
+            "size": str(size),
+            "duration_time": str(duration_time),
+        }
+        for _ in range(count)
+    ]
 
 
 VIDEO = {
-    "codec_type": "video", "codec_name": "hevc",
+    "index": 0, "codec_type": "video", "codec_name": "hevc",
     "width": 1920, "height": 1080, "avg_frame_rate": "25/1",
 }
 AUDIO = {"codec_type": "audio", "codec_name": "aac", "channels": 2}
@@ -40,6 +56,58 @@ def test_valid_result_populates_the_stats_keys_dispatcharr_uses():
     assert result.stats["video_bitrate"] == 5000
     assert result.stats["audio_codec"] == "aac"
     assert result.stats["audio_channels"] == 2
+
+
+def test_declared_bitrate_takes_priority_over_packet_calc():
+    """Prefer a declared bit_rate over the packet-based estimate.
+
+    Live MPEG-TS rarely declares bit_rate, but when it does, trust it over
+    the noisier packet-based estimate.
+    """
+    packets = video_packets(40, size=99999)  # would compute a very different value
+    result = classify(0, ffprobe_json([VIDEO, AUDIO], packets=packets), "")
+    assert result.stats["video_bitrate"] == 5000
+
+
+def test_packet_based_bitrate_fills_in_when_no_declared_bitrate():
+    """Fall back to a packet-based estimate when nothing declares bit_rate.
+
+    Live streams almost never declare bit_rate. Sum packet size over
+    packet duration for the video stream as a fallback estimate.
+    """
+    packets = video_packets(40, size=25000, duration_time=0.025)  # 8000 kbps
+    result = classify(
+        0, ffprobe_json([VIDEO, AUDIO], packets=packets, format_bitrate=None), ""
+    )
+    assert result.stats["video_bitrate"] == 8000
+
+
+def test_packet_based_bitrate_ignores_other_streams():
+    """Audio packets must not dilute the video bitrate estimate."""
+    video_pkts = video_packets(40, size=25000, duration_time=0.025, stream_index=0)
+    audio_pkts = video_packets(100, size=999999, duration_time=0.01, stream_index=1)
+    result = classify(
+        0,
+        ffprobe_json(
+            [VIDEO, AUDIO], packets=video_pkts + audio_pkts, format_bitrate=None
+        ),
+        "",
+    )
+    assert result.stats["video_bitrate"] == 8000
+
+
+def test_packet_based_bitrate_needs_a_minimum_sample():
+    """Leave the estimate unset below the reliability floor.
+
+    Too few packets makes the estimate noise-dominated (observed: a
+    2-packet sample once spiked to 22924 kbps). Below the floor, leave it
+    unset rather than persist a misleading number.
+    """
+    packets = video_packets(29, size=25000, duration_time=0.025)
+    result = classify(
+        0, ffprobe_json([VIDEO, AUDIO], packets=packets, format_bitrate=None), ""
+    )
+    assert result.stats["video_bitrate"] == 0
 
 
 # --- Invalid ---------------------------------------------------------------
@@ -193,6 +261,15 @@ def test_probe_requests_json_output():
     probe("http://p.example/1.ts", "ffprobe", 15,
           runner=fake_runner(0, ffprobe_json([VIDEO, AUDIO]), record=calls))
     assert "json" in " ".join(calls[0][0])
+
+
+def test_probe_requests_packets_for_the_bitrate_fallback():
+    calls = []
+    probe("http://p.example/1.ts", "ffprobe", 15,
+          runner=fake_runner(0, ffprobe_json([VIDEO, AUDIO]), record=calls))
+    argv = calls[0][0]
+    assert "-show_packets" in argv
+    assert "-read_intervals" in argv
 
 
 def test_probe_returns_the_classified_result():
