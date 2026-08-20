@@ -20,6 +20,28 @@ BACKUP_WARNING = (
 # Substrings that mark a setting whose value must never reach the log.
 _REDACT = ("password", "secret", "api_key")
 
+_scheduler = None
+
+
+def _ensure_scheduler(context):
+    """Start or restart the scheduler to match current settings."""
+    global _scheduler  # noqa: PLW0603 - module-level handle so stop() can reach it too
+    from . import pipeline, scheduling
+
+    settings = pipeline.load_settings(context)
+    if _scheduler is not None:
+        _scheduler.stop()
+        _scheduler = None
+    if not settings["schedule_enabled"]:
+        return None
+    _scheduler = scheduling.Scheduler(
+        settings["cron_expression"],
+        settings["timezone"],
+        lambda: pipeline.start(context, "run"),
+    )
+    _scheduler.start()
+    return _scheduler
+
 
 def _flatten(value, path=""):
     """Yield (dotted.path, leaf) pairs. Empty containers are leaves."""
@@ -501,7 +523,7 @@ class Plugin:
             channel_model.objects.values_list("name", flat=True)[:10]
         )
 
-        return {
+        result = {
             "status": "ok",
             "models": {
                 "channel_stream_model": str(resolved.channel_stream_model),
@@ -534,6 +556,8 @@ class Plugin:
                 ],
             },
         }
+        _ensure_scheduler(context)
+        return result
 
     def _preview(self, params, context):
         from . import pipeline
@@ -543,7 +567,9 @@ class Plugin:
     def _start(self, context, mode):
         from . import pipeline
 
-        return pipeline.start(context, mode)
+        result = pipeline.start(context, mode)
+        _ensure_scheduler(context)
+        return result
 
     def _clear_lock(self, params, context):
         from . import pipeline
@@ -574,5 +600,8 @@ class Plugin:
         }
 
     def stop(self, context=None):
-        """Shut the scheduler down. Called on disable/delete/reload."""
-        return
+        """Stop the scheduler. Called on disable/delete/reload."""
+        global _scheduler  # noqa: PLW0603 - module-level handle set by _ensure_scheduler
+        if _scheduler is not None:
+            _scheduler.stop()
+            _scheduler = None
