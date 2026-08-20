@@ -72,6 +72,7 @@ account_id = busy[provider_field]
 sample = list(
     Stream.objects.filter(**{provider_field: account_id})
     .exclude(url="")
+    .order_by("?")
     .values_list("id", "url", "name")[:CAP_TEST_COUNT]
 )
 print(f"account={account_id} sample_size={len(sample)}")
