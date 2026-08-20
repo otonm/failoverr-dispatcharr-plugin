@@ -50,3 +50,24 @@ def test_dry_run_defaults_to_on():
 
     field = next(f for f in Plugin.fields if f["id"] == "dry_run")
     assert field["default"] is True
+
+
+def test_ranking_toggles_default_to_true():
+    from failoverr.plugin import Plugin
+
+    toggle_ids = (
+        "rank_by_resolution", "rank_by_response_time", "rank_by_codec",
+        "rank_by_fps", "rank_by_bitrate",
+    )
+    for field_id in toggle_ids:
+        field = next(f for f in Plugin.fields if f["id"] == field_id)
+        assert field["type"] == "boolean"
+        assert field["default"] is True
+
+
+def test_response_time_bucket_ms_field_exists_with_a_sane_default():
+    from failoverr.plugin import Plugin
+
+    field = next(f for f in Plugin.fields if f["id"] == "response_time_bucket_ms")
+    assert field["type"] == "number"
+    assert field["default"] == 250

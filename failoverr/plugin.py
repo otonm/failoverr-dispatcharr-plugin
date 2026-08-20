@@ -323,6 +323,78 @@ class Plugin:
             ),
         },
         {
+            "id": "rank_by_resolution",
+            "label": "Rank by resolution",
+            "type": "boolean",
+            "default": True,
+            "help_text": (
+                "Highest priority ranking factor when on. Turning it off "
+                "does not stop resolution from ever mattering - the raw "
+                "height is still used as the final tiebreaker below - it "
+                "just stops resolution tier from taking priority over "
+                "response time, codec, fps, and bitrate."
+            ),
+        },
+        {
+            "id": "rank_by_response_time",
+            "label": "Rank by response time",
+            "type": "boolean",
+            "default": True,
+            "help_text": (
+                "Ranks by how quickly each stream responded on its last "
+                "successful probe. Second priority after resolution, ahead "
+                "of codec, fps, and bitrate. Streams never probed, or only "
+                "probed as invalid or inconclusive, sort last on this "
+                "factor."
+            ),
+        },
+        {
+            "id": "rank_by_codec",
+            "label": "Rank by codec",
+            "type": "boolean",
+            "default": True,
+            "help_text": (
+                "Uses the codec priority list below as a ranking factor. "
+                "Third priority, after resolution and response time."
+            ),
+        },
+        {
+            "id": "rank_by_fps",
+            "label": "Rank by frame rate",
+            "type": "boolean",
+            "default": True,
+            "help_text": (
+                "Uses measured frame rate as a ranking factor. Fourth "
+                "priority, after resolution, response time, and codec."
+            ),
+        },
+        {
+            "id": "rank_by_bitrate",
+            "label": "Rank by bitrate",
+            "type": "boolean",
+            "default": True,
+            "help_text": (
+                "Uses measured video bitrate as a ranking factor. Lowest "
+                "priority of the five - only breaks ties left over after "
+                "resolution, response time, codec, and fps."
+            ),
+        },
+        {
+            "id": "response_time_bucket_ms",
+            "label": "Response time bucket size (ms)",
+            "type": "number",
+            "default": 250,
+            "help_text": (
+                "Response times are rounded to this granularity before "
+                "ranking. Too fine and near-identical latencies from "
+                "different providers stop tying, which silently defeats "
+                "provider interleaving (CLAUDE.md §8) since streams "
+                "then almost never rank as exact ties. Too coarse and "
+                "response time stops meaningfully differentiating similar "
+                "streams. Only used when 'Rank by response time' is on."
+            ),
+        },
+        {
             "id": "max_streams_per_channel",
             "label": "Max streams per channel",
             "type": "number",
