@@ -1,3 +1,5 @@
+import pytest
+
 from failoverr.models_access import FieldResolutionError
 from failoverr.plugin import Plugin, _flatten
 
@@ -91,3 +93,19 @@ def test_secret_settings_are_not_logged():
     )
     assert "hunter2" not in "\n".join(log.lines)
     assert "FAILOVERR no_such_action settings.password = ***" in log.lines
+
+
+@pytest.mark.parametrize("action_id", [
+    a["id"] for a in Plugin.actions
+])
+def test_every_declared_action_has_a_handler(action_id, monkeypatch):
+    """A declared action with no handler is a button that reports an error."""
+    def fail(*_, **__):
+        raise RuntimeError("reached the handler")
+
+    monkeypatch.setattr("failoverr.models_access.resolve_models", fail)
+    monkeypatch.setattr("failoverr.pipeline.start", fail)
+    monkeypatch.setattr("failoverr.pipeline.run_preview", fail)
+
+    result = Plugin().run(action_id, {}, {})
+    assert "Unknown action" not in result.get("message", "")

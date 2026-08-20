@@ -437,6 +437,11 @@ class Plugin:
         handlers = {
             "diagnose": self._diagnose,
             "preview": self._preview,
+            "run": lambda _, c: self._start(c, "run"),
+            "reorder_only": lambda _, c: self._start(c, "reorder_only"),
+            "probe_only": lambda _, c: self._start(c, "probe_only"),
+            "clear_lock": self._clear_lock,
+            "show_status": self._show_status,
         }
         handler = handlers.get(action)
         if handler is None:
@@ -534,6 +539,39 @@ class Plugin:
         from . import pipeline
 
         return pipeline.run_preview(context)
+
+    def _start(self, context, mode):
+        from . import pipeline
+
+        return pipeline.start(context, mode)
+
+    def _clear_lock(self, params, context):
+        from . import pipeline
+
+        context.get("logger", logger).info("FAILOVERR lock cleared by user")
+        return pipeline.clear_lock()
+
+    def _show_status(self, params, context):
+        from . import pipeline
+        from .state import DEFAULT_PATH, State
+
+        state = State.load(DEFAULT_PATH)
+        lock = pipeline.lock_status()
+        meta = state.meta
+        return {
+            "status": "ok",
+            "running": lock["holder"],
+            "execution_model": pipeline.execution_model(),
+            "streams_tracked": len(state.streams),
+            "last_run": meta.get("last_run"),
+            "last_mode": meta.get("last_mode"),
+            "degraded_providers": meta.get("degraded_providers") or [],
+            "budget_stop": meta.get("budget_stop"),
+            "message": (
+                f"{'Running: ' + lock['holder'] if lock['holder'] else 'Idle'}. "
+                f"{len(state.streams)} streams tracked."
+            ),
+        }
 
     def stop(self, context=None):
         """Shut the scheduler down. Called on disable/delete/reload."""
