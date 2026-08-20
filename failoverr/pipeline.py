@@ -33,7 +33,7 @@ logger = logging.getLogger("failoverr")
 EXPORT_DIR = "/data/exports"
 REPORT_COLUMNS = [
     "channel", "position", "stream", "provider", "verdict",
-    "resolution", "codec", "action",
+    "resolution", "codec", "response_time_ms", "action",
 ]
 
 _DEFAULTS = {
@@ -122,7 +122,9 @@ def find_matches(channel_tokens, index, mode="strict", threshold=85):
 
 def plan_channel(  # noqa: PLR0913, PLR0917 - interface fixed by the task spec
     attached_ids, candidates, state, threshold, max_streams,
-    strategy, codec_priority,
+    strategy, codec_priority, response_time_bucket_ms=DEFAULT_RESPONSE_TIME_BUCKET_MS,
+    rank_by_resolution=True, rank_by_response_time=True, rank_by_codec=True,
+    rank_by_fps=True, rank_by_bitrate=True,
 ):
     """Decide this channel's final stream list.
 
@@ -164,11 +166,18 @@ def plan_channel(  # noqa: PLR0913, PLR0917 - interface fixed by the task spec
     def ranked(items):
         return order_candidates(
             [
-                Candidate(c.stream_id, c.name, c.provider_id, c.stats)
+                Candidate(c.stream_id, c.name, c.provider_id, c.stats,
+                          state.response_time_ms(c.stream_id))
                 for c in items
             ],
             strategy=strategy,
             codec_priority=codec_priority,
+            response_time_bucket_ms=response_time_bucket_ms,
+            rank_by_resolution=rank_by_resolution,
+            rank_by_response_time=rank_by_response_time,
+            rank_by_codec=rank_by_codec,
+            rank_by_fps=rank_by_fps,
+            rank_by_bitrate=rank_by_bitrate,
         )
 
     ranked_ids = [c.stream_id for c in ranked(promotable)]
@@ -366,8 +375,11 @@ def run_preview(context):
             attached_ids, candidates, state,
             settings["removal_failure_threshold"],
             settings["max_streams_per_channel"],
-            settings["order_strategy"],
-            settings["codec_priority"],
+            settings["order_strategy"], settings["codec_priority"],
+            settings["response_time_bucket_ms"],
+            settings["rank_by_resolution"], settings["rank_by_response_time"],
+            settings["rank_by_codec"], settings["rank_by_fps"],
+            settings["rank_by_bitrate"],
         )
 
         lookup = {row.stream_id: row for row in candidates}
@@ -381,6 +393,7 @@ def run_preview(context):
                 "verdict": state.last_verdict(stream_id) or "unprobed",
                 "resolution": (row.stats or {}).get("resolution", "") if row else "",
                 "codec": (row.stats or {}).get("video_codec", "") if row else "",
+                "response_time_ms": state.response_time_ms(stream_id) or "",
                 "action": "keep" if stream_id in attached_ids else "attach",
             })
         for stream_id in detach:
@@ -391,7 +404,8 @@ def run_preview(context):
                 "stream": row.name if row else stream_id,
                 "provider": row.provider_id if row else "",
                 "verdict": state.last_verdict(stream_id) or "unprobed",
-                "resolution": "", "codec": "", "action": "detach",
+                "resolution": "", "codec": "", "response_time_ms": "",
+                "action": "detach",
             })
 
         # Everything matched but not acted on. Until probing exists, this is
@@ -409,6 +423,7 @@ def run_preview(context):
                 "verdict": state.last_verdict(row.stream_id) or "unprobed",
                 "resolution": (row.stats or {}).get("resolution", ""),
                 "codec": (row.stats or {}).get("video_codec", ""),
+                "response_time_ms": state.response_time_ms(row.stream_id) or "",
                 "action": "matched - would be probed"
                 if row.stream_id in matched_ids else "attached - not matched",
             })
@@ -1040,6 +1055,10 @@ def run_pipeline(context, mode="run"):
             settings["removal_failure_threshold"],
             settings["max_streams_per_channel"],
             settings["order_strategy"], settings["codec_priority"],
+            settings["response_time_bucket_ms"],
+            settings["rank_by_resolution"], settings["rank_by_response_time"],
+            settings["rank_by_codec"], settings["rank_by_fps"],
+            settings["rank_by_bitrate"],
         )
         if mode == "reorder_only":
             # Reorder Only never detaches. plan_channel's removal branch
@@ -1069,13 +1088,15 @@ def run_pipeline(context, mode="run"):
                 "verdict": state.last_verdict(stream_id) or "unprobed",
                 "resolution": (row.stats or {}).get("resolution", "") if row else "",
                 "codec": (row.stats or {}).get("video_codec", "") if row else "",
+                "response_time_ms": state.response_time_ms(stream_id) or "",
                 "action": "keep" if stream_id in attached_ids else "attach",
             })
         rows.extend({
             "channel": channel.name, "position": "",
             "stream": stream_id, "provider": "",
             "verdict": state.last_verdict(stream_id) or "unprobed",
-            "resolution": "", "codec": "", "action": "detach",
+            "resolution": "", "codec": "", "response_time_ms": "",
+            "action": "detach",
         } for stream_id in detach)
 
     state.meta.update({

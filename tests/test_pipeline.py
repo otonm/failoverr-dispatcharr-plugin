@@ -122,6 +122,27 @@ def plan(state, attached=(), candidates=POOL[:3], max_streams=10):
     )
 
 
+def test_plan_channel_ranks_by_response_time_from_state(tmp_path):
+    # slow is listed *before* fast in candidates, so a pre-fix ranked() that
+    # never consults state.response_time_ms() would tie on every factor
+    # (both rows share identical stats) and fall back to insertion order,
+    # i.e. [1, 2] - producing ordered[0] == 1 instead of 2. That makes this
+    # assertion fail unambiguously before the fix and pass only once
+    # ranked() actually reads response time from state.
+    state = State(tmp_path / "state.json")
+    slow = row(1, "IT: RAI 1 HD", "A", codec="hevc")
+    fast = row(2, "IT: RAI 1 HD", "A", codec="hevc")
+    state.record(1, slow.url, VALID, now=0.0, response_time_ms=5000)
+    state.record(2, fast.url, VALID, now=0.0, response_time_ms=100)
+
+    ordered, _detach = plan_channel(
+        attached_ids=set(), candidates=[slow, fast], state=state, threshold=3,
+        max_streams=10, strategy="quality_first", codec_priority=("hevc",),
+    )
+
+    assert ordered[0] == 2
+
+
 def test_valid_streams_are_attached(tmp_path):
     state = make_state(tmp_path, {1: (VALID, 1), 2: (VALID, 1), 3: (VALID, 1)})
     ordered, detach = plan(state)
@@ -589,6 +610,24 @@ def test_reorder_only_never_detaches_via_a_stale_cross_run_failure_counter(
         "stream 2 has 3 consecutive failures and would normally be "
         "detached by plan_channel, but Reorder Only must discard that"
     )
+
+
+def test_reorder_only_report_includes_the_response_time_column(tmp_path, monkeypatch):
+    channel = types.SimpleNamespace(name="RAI 1")
+    attached = [row(1, "IT: RAI 1 HD", "A")]
+    state = _make_state(tmp_path)
+    state.record(1, attached[0].url, VALID, response_time_ms=180)
+    _patch_common(monkeypatch, tmp_path, channel, attached, state)
+    monkeypatch.setattr(
+        models_access_module, "apply_channel_plan",
+        lambda *_a, **_kw: {"attached": 0, "detached": 0},
+    )
+
+    result = run_pipeline({"settings": {}}, mode="reorder_only")
+
+    with pathlib.Path(result["report"]).open(newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert rows[0]["response_time_ms"] == "180"
 
 
 @pytest.mark.parametrize("mode", ["reorder_only", "probe_only"])
