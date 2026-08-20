@@ -797,14 +797,15 @@ def _probe_candidates(  # noqa: PLR0913, PLR0917 - interface fixed by the task s
 
     def work(candidate_row):
         if cancel_requested():
-            return candidate_row, None, None
+            return candidate_row, None, None, None
         result = prober.probe_one(candidate_row.provider_id, candidate_row.url)
         verdict, stats = result.verdict, result.stats
+        response_time_ms = result.response_time_ms
         if verdict == VALID and settings["blank_detect"] and is_blank(
             candidate_row.url, settings["ffmpeg_path"], settings["blank_detect_seconds"]
         ):
-            verdict, stats = INVALID, {}
-        return candidate_row, verdict, stats
+            verdict, stats, response_time_ms = INVALID, {}, None
+        return candidate_row, verdict, stats, response_time_ms
 
     probed = 0
     workers = max(1, int(settings["global_concurrency"]))
@@ -812,12 +813,12 @@ def _probe_candidates(  # noqa: PLR0913, PLR0917 - interface fixed by the task s
         futures = [pool.submit(work, candidate_row) for candidate_row in to_probe]
         for future in concurrent.futures.as_completed(futures):
             try:
-                candidate_row, verdict, stats = future.result()
+                candidate_row, verdict, stats, response_time_ms = future.result()
             except Exception:
                 log.exception("FAILOVERR probe worker raised unexpectedly")
                 continue
             if _handle_probe_result(
-                candidate_row, verdict, stats, resolved, state, log,
+                candidate_row, verdict, stats, response_time_ms, resolved, state, log,
                 progress_cb, probed_so_far + probed,
             ):
                 probed += 1
@@ -825,7 +826,8 @@ def _probe_candidates(  # noqa: PLR0913, PLR0917 - interface fixed by the task s
 
 
 def _handle_probe_result(  # noqa: PLR0913, PLR0917 - one call site, _probe_candidates
-    candidate_row, verdict, stats, resolved, state, log, progress_cb, probed_before,
+    candidate_row, verdict, stats, response_time_ms, resolved, state, log,
+    progress_cb, probed_before,
 ):
     """Record one probe's verdict, save stats, and report progress.
 
@@ -835,7 +837,10 @@ def _handle_probe_result(  # noqa: PLR0913, PLR0917 - one call site, _probe_cand
     """
     if verdict is None:
         return False
-    state.record(candidate_row.stream_id, candidate_row.url, verdict)
+    state.record(
+        candidate_row.stream_id, candidate_row.url, verdict,
+        response_time_ms=response_time_ms,
+    )
     log.info(
         "FAILOVERR probe stream=%s name=%r provider=%s verdict=%s",
         candidate_row.stream_id, candidate_row.name,

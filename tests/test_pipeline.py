@@ -1145,6 +1145,61 @@ def test_probe_candidates_accumulates_the_heartbeat_cadence_across_channels(
     assert len(refreshes) == 1
 
 
+def test_probe_candidates_records_the_measured_response_time(tmp_path, monkeypatch):
+    settings = load_settings({"settings": {}})
+    state = State(path=tmp_path / "state.json")
+    budget = Budget(max_probes=10, max_minutes=60, now_fn=lambda: 0.0)
+    candidates = [row(1, "IT: RAI 1 HD", "A")]
+
+    valid_stats = {
+        "video_codec": "hevc", "resolution": "1920x1080", "video_bitrate": 5000,
+        "source_fps": 25, "audio_codec": "aac", "audio_channels": 2,
+    }
+
+    class StubProber:
+        aborted_providers = set()
+
+        def probe_one(self, *_args, **_kwargs):
+            return ProbeResult(VALID, valid_stats, "ok", 275)
+
+    monkeypatch.setattr(pipeline_module, "models_access_save", lambda *_a, **_kw: None)
+    log = types.SimpleNamespace(info=lambda *_a, **_kw: None)
+
+    pipeline_module._probe_candidates(
+        candidates, state, settings, StubProber(), budget, resolved=None, log=log,
+    )
+
+    assert state.response_time_ms(1) == 275
+
+
+def test_blank_detected_stream_does_not_record_a_response_time(tmp_path, monkeypatch):
+    settings = load_settings({"settings": {"blank_detect": True}})
+    state = State(path=tmp_path / "state.json")
+    budget = Budget(max_probes=10, max_minutes=60, now_fn=lambda: 0.0)
+    candidates = [row(1, "IT: RAI 1 HD", "A")]
+
+    valid_stats = {
+        "video_codec": "hevc", "resolution": "1920x1080", "video_bitrate": 5000,
+        "source_fps": 25, "audio_codec": "aac", "audio_channels": 2,
+    }
+
+    class StubProber:
+        aborted_providers = set()
+
+        def probe_one(self, *_args, **_kwargs):
+            return ProbeResult(VALID, valid_stats, "ok", 275)
+
+    monkeypatch.setattr(pipeline_module, "models_access_save", lambda *_a, **_kw: None)
+    monkeypatch.setattr(probing_module, "is_blank", lambda *_a, **_kw: True)
+    log = types.SimpleNamespace(info=lambda *_a, **_kw: None)
+
+    pipeline_module._probe_candidates(
+        candidates, state, settings, StubProber(), budget, resolved=None, log=log,
+    )
+
+    assert state.response_time_ms(1) is None
+
+
 # --- Gevent detection (Task 2) --------------------------------------------------
 
 
