@@ -377,7 +377,7 @@ def test_lock_is_visible_across_separate_processes():
         "pipeline.LOCK_PATH = sys.argv[2]; "
         "print(pipeline.acquire_lock('scheduled_run', now=10.0))"
     )
-    repo_root = str(pathlib.Path(__file__).resolve().parents[2])
+    repo_root = str(pathlib.Path(__file__).resolve().parents[1])
     result = subprocess.run(
         [sys.executable, "-c", script, repo_root, lock_path],
         capture_output=True, text=True, check=True,

@@ -1,7 +1,7 @@
 import json
 import pathlib
 
-PLUGIN_DIR = pathlib.Path(__file__).resolve().parent.parent
+PLUGIN_DIR = pathlib.Path(__file__).resolve().parent.parent / "failoverr"
 
 
 def test_plugin_json_parses_and_has_required_metadata():

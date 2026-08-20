@@ -22,5 +22,5 @@ ignore = [
 ]
 
 [lint.per-file-ignores]
-"failoverr/tests/*" = ["S101", "PLR2004", "PT018"]
+"tests/*" = ["S101", "PLR2004", "PT018"]
 "scripts/*" = ["T201", "INP001"]  # CLI diagnostic script, not plugin code
