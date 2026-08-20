@@ -107,6 +107,8 @@ class Scheduler:
 
     def stop(self):
         self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=CHECK_INTERVAL_SECONDS + 5)
         logger.info("FAILOVERR scheduler stopped")
 
     def _loop(self):

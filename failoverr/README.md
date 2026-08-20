@@ -48,6 +48,11 @@ plugins in Dispatcharr. No other setup is required — the plugin runs
 inside the Dispatcharr backend process and needs no URL, username, or
 password.
 
+**After a container restart**, if "Run on a schedule" is on, the schedule
+does not arm itself automatically the instant the container comes up — it
+arms the next time any action button is pressed. Press **Diagnose** once
+after a restart (it's read-only) to re-arm it.
+
 ## First run procedure
 
 Follow this order. Do not skip steps or turn `dry_run` off early.
@@ -158,9 +163,13 @@ Follow this order. Do not skip steps or turn `dry_run` off early.
 - **Max run time (minutes)** (`max_run_minutes`, default `60`) — safety
   stop for a provider that hangs every connection. A typical run takes 10
   to 20 minutes. Stopping early is not destructive — progress is saved.
-- **Run on a schedule** (`schedule_enabled`, default **off**) — starts the
-  scheduler when the plugin is enabled and survives container restarts.
-  Turn dry run off first, or the scheduled run will change nothing.
+- **Run on a schedule** (`schedule_enabled`, default **off**) — arms the
+  scheduler the next time any action button is pressed, not automatically
+  the instant the container starts (see "After a container restart" below).
+  The scheduler also captures settings, including `dry_run`, at that moment
+  rather than reading them live at each scheduled fire — see "Known
+  limitations". Turn dry run off first, or the scheduled run will change
+  nothing.
 - **Schedule (cron)** (`cron_expression`, default `0 4 * * *`) — standard
   five-field cron. The default is 04:00 daily. Probing consumes provider
   connections, so pick an hour when nobody is watching.
@@ -170,13 +179,18 @@ Follow this order. Do not skip steps or turn `dry_run` off early.
 
 ## How long it takes
 
-For a lineup around 20 channels with roughly 10 candidate streams each,
-expect **10 to 20 minutes** for a full Run. Turning on blank detection
-roughly doubles that. Larger catalogs take longer — probing is
-single-threaded per provider (respecting each provider's connection cap),
-so a run over thousands of candidates can take hours; the plugin is
-designed to stop cleanly on its time/probe budget and resume from where it
-left off on the next run rather than starting over.
+Probing is currently **sequential — one probe at a time** — regardless of
+the "Concurrent probes per provider" and "Global concurrent probes"
+settings; the per-provider/global concurrency machinery exists internally
+but nothing dispatches probes from more than one thread yet, so those
+settings have no effect on run time in this version (parallel probing is
+planned, not active). Real run time scales roughly as (candidates to probe)
+× (probe timeout). For a lineup around 20 channels with roughly 10
+candidate streams each, expect **10 to 20 minutes** for a full Run. Turning
+on blank detection roughly doubles that. Larger catalogs take longer — a run
+over thousands of candidates can take hours; the plugin is designed to stop
+cleanly on its time/probe budget and resume from where it left off on the
+next run rather than starting over.
 
 Run and Probe Only execute in the background — pressing the button returns
 immediately, and the Dispatcharr UI stays responsive while it works. Use
@@ -201,6 +215,21 @@ provider was aborted this run.
 - Streams are only ever detached from a channel, never deleted from the
   M3U pool. Failoverr does not touch the stream pool itself, channel
   creation, EPG, or logos.
+- **Scheduled runs use a settings snapshot.** The scheduler captures the
+  plugin's settings — including `dry_run` — at the moment it was last armed
+  (the last time an action button was pressed), not live at each scheduled
+  fire. If you change settings after arming the schedule, especially
+  turning `dry_run` back on, press an action once (e.g. Diagnose) to re-arm
+  the schedule with the new settings before the next scheduled fire.
+- **Cron day-of-month and day-of-week are ANDed, not ORed.** When both
+  fields are restricted from `*` at the same time, this plugin requires
+  both to match, unlike some cron implementations that fire when either
+  matches. Leaving one of the two as `*` (the common case) is unaffected.
+- **The run lock and the scheduler's armed state live in this plugin's
+  Python process memory**, not shared across multiple Dispatcharr/uWSGI
+  worker processes. On a multi-worker deployment, each worker has its own
+  independent lock and scheduler — this plugin is designed and tested
+  against a single-worker deployment.
 
 ## Troubleshooting
 

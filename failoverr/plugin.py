@@ -289,10 +289,10 @@ class Plugin:
             "type": "number",
             "default": 4,
             "help_text": (
-                "Ceiling across all providers combined. Different providers "
-                "are probed in parallel, which is most of the available "
-                "speedup, but each is still limited by the per-provider "
-                "setting above."
+                "Ceiling across all providers combined, reserved for a "
+                "planned parallel-probing mode. Probing is currently "
+                "sequential - one probe at a time - regardless of this "
+                "setting, so it has no effect on run time yet."
             ),
         },
         {
@@ -357,9 +357,14 @@ class Plugin:
             "type": "boolean",
             "default": False,
             "help_text": (
-                "Starts the scheduler when the plugin is enabled and survives "
-                "container restarts. Turn dry run off first, or the scheduled "
-                "run will change nothing."
+                "Arms the scheduler the next time any action button is "
+                "pressed - it does not start itself the instant the "
+                "container comes up. After a container restart, press "
+                "Diagnose once (it's read-only) to arm it. Settings, "
+                "including dry run, are captured at that moment - re-press "
+                "an action after changing settings to re-arm with the new "
+                "values. Turn dry run off first, or the scheduled run will "
+                "change nothing."
             ),
         },
         {

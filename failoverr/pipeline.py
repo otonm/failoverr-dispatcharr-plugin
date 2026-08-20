@@ -429,6 +429,19 @@ def acquire_lock(name, now=None):
         return True
 
 
+def refresh_lock(now=None):
+    """Keep a long-running run's lock from going stale mid-run.
+
+    Without this, a run past LOCK_TTL_SECONDS looks abandoned to
+    acquire_lock even though it is still working - a second run can then
+    steal the lock, and the first run's eventual release_lock() would clear
+    the SECOND run's lock too.
+    """
+    now = time.time() if now is None else now
+    with _lock_guard:
+        _lock_holder["since"] = now
+
+
 def release_lock():
     with _lock_guard:
         _lock_holder.update({"holder": None, "since": 0.0})
@@ -525,6 +538,11 @@ def _probe_candidates(  # noqa: PLR0913, PLR0917 - interface fixed by the task s
     for row in candidates:
         if state.is_fresh(row.stream_id, row.url, settings["probe_ttl_hours"]):
             continue
+        if row.provider_id in prober.aborted_providers:
+            # probe_one already no-ops for an aborted provider; skip the
+            # call entirely so its candidates don't burn budget that
+            # healthy providers could otherwise use.
+            continue
         if not budget.allow():
             log.info("FAILOVERR run stopping early: %s", budget.reason)
             break
@@ -543,6 +561,8 @@ def _probe_candidates(  # noqa: PLR0913, PLR0917 - interface fixed by the task s
         if verdict == VALID and stats:
             models_access_save(resolved, row.stream_id, stats)
         if probed % 25 == 0:
+            refresh_lock()
+            state.save()
             _notify({"type": "failoverr", "probed": probed})
     return probed
 
@@ -553,6 +573,29 @@ def models_access_save(resolved, stream_id, stats):
     models_access.save_stream_stats(resolved, stream_id, stats)
 
 
+def _close_old_connections():
+    """Drop Django DB connections past CONN_MAX_AGE.
+
+    run_pipeline runs outside Django's request/response cycle (a background
+    thread/greenlet, or the scheduler thread), so the usual per-request
+    cleanup signal never fires here - do it explicitly instead.
+    """
+    from django.db import close_old_connections
+
+    close_old_connections()
+
+
+def _close_connection():
+    """Release this thread's Django DB connection once a run is done.
+
+    Same reasoning as _close_old_connections: nothing else closes it for a
+    thread/greenlet that never went through a Django request.
+    """
+    from django.db import connection
+
+    connection.close()
+
+
 def run_pipeline(context, mode="run"):
     """Single entry point for Run, Reorder Only, and Probe Only."""
     from . import models_access
@@ -560,6 +603,7 @@ def run_pipeline(context, mode="run"):
 
     log = context.get("logger", logger)
     settings = load_settings(context)
+    _close_old_connections()
     resolved = models_access.resolve_models()
     state = State.load(STATE_PATH)
     budget = Budget(settings["max_probes_per_run"], settings["max_run_minutes"])
@@ -699,6 +743,7 @@ def start(context, mode="run"):
             return run_pipeline(context, mode)
         finally:
             release_lock()
+            _close_connection()
 
     def background():
         try:
@@ -707,6 +752,7 @@ def start(context, mode="run"):
             log.exception("FAILOVERR %s FAILED", mode)
         finally:
             release_lock()
+            _close_connection()
 
     spawn(background)
     return {

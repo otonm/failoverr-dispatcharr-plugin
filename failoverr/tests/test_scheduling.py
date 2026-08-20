@@ -2,7 +2,7 @@ import datetime
 
 import pytest
 
-from failoverr.scheduling import matches_cron, resolve_timezone
+from failoverr.scheduling import Scheduler, matches_cron, resolve_timezone
 
 
 def at(year, month, day, hour, minute):
@@ -62,3 +62,19 @@ def test_unknown_timezone_falls_back_to_utc_without_raising():
 
 def test_known_timezone_resolves():
     assert resolve_timezone("UTC") is not None
+
+
+def test_stop_joins_the_thread_before_returning():
+    """The plan's verification checklist requires stop() to join in bounded time.
+
+    A bare `_stop.set()` doesn't guarantee the thread has actually exited by
+    the time stop() returns - only that it will notice soon. Assert on the
+    thread's real liveness, not just the event.
+    """
+    scheduler = Scheduler("* * * * *", "UTC", callback=lambda: None)
+    scheduler.start()
+    assert scheduler._thread.is_alive()
+
+    scheduler.stop()
+
+    assert scheduler._thread.is_alive() is False

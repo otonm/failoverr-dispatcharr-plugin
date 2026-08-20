@@ -19,11 +19,13 @@ from failoverr.pipeline import (
     load_settings,
     lock_status,
     plan_channel,
+    refresh_lock,
     release_lock,
     report_path,
     run_pipeline,
     write_report,
 )
+from failoverr.probing import ProbeResult
 from failoverr.state import INCONCLUSIVE, INVALID, VALID, State
 
 
@@ -336,6 +338,23 @@ def test_clear_lock_releases_a_held_lock():
     assert lock_status()["holder"] is None
 
 
+def test_refresh_lock_prevents_a_steal_at_the_original_ttl_deadline():
+    """Finding: a long run must keep its own lock fresh.
+
+    Without a heartbeat, a second run could steal the lock once
+    LOCK_TTL_SECONDS has passed since the ORIGINAL acquire.
+    """
+    acquire_lock("run", now=0.0)
+    # Well before the original deadline, the run heartbeats its lock.
+    refresh_lock(now=1000.0)
+    # At the moment the lock would have gone stale relative to the original
+    # acquisition (now=0.0), it must still be held - the refresh worked.
+    assert acquire_lock("preview", now=LOCK_TTL_SECONDS + 1) is False
+    # It does go stale relative to the refreshed timestamp, once enough
+    # time has passed since THAT.
+    assert acquire_lock("preview", now=1000.0 + LOCK_TTL_SECONDS + 1) is True
+
+
 # --- Budgets ---------------------------------------------------------------
 
 def test_budget_allows_probes_up_to_the_limit():
@@ -391,6 +410,11 @@ def _patch_common(monkeypatch, tmp_path, channel, attached, state):
         pipeline_module, "report_path", lambda mode: tmp_path / f"{mode}.csv"
     )
     monkeypatch.setattr(models_access_module, "resolve_models", object)
+    # Real Django isn't installed offline; run_pipeline/start() call these
+    # seams unconditionally now (Fix 2), so give them a harmless default.
+    # Individual tests override one of these to assert it was really called.
+    monkeypatch.setattr(pipeline_module, "_close_old_connections", lambda: None)
+    monkeypatch.setattr(pipeline_module, "_close_connection", lambda: None)
 
 
 def test_reorder_only_never_detaches_via_a_stale_cross_run_failure_counter(
@@ -464,3 +488,156 @@ def test_non_run_modes_never_index_the_pool_or_match_by_name(
         assert apply_calls == [([1], [])]
     else:
         assert apply_calls == [], "probe_only must never call apply_channel_plan"
+
+
+# --- Django DB connection cleanup (Fix 2) -----------------------------------
+#
+# No live Django/DB is available offline, so these tests monkeypatch the
+# seam functions themselves (following the models_access_save pattern
+# already used above) and assert they are actually invoked, rather than
+# integration-testing against a real connection.
+
+
+def test_run_pipeline_closes_old_django_connections_before_touching_the_orm(
+    tmp_path, monkeypatch
+):
+    channel = types.SimpleNamespace(name="RAI 1")
+    attached = [row(1, "IT: RAI 1 HD", "A")]
+    state = _make_state(tmp_path)
+    state.record(1, attached[0].url, VALID)
+    _patch_common(monkeypatch, tmp_path, channel, attached, state)
+    monkeypatch.setattr(
+        models_access_module, "apply_channel_plan",
+        lambda *_a, **_kw: {"attached": 0, "detached": 0},
+    )
+
+    calls = []
+    monkeypatch.setattr(pipeline_module, "_close_old_connections",
+                        lambda: calls.append(True))
+
+    run_pipeline({"settings": {}}, mode="reorder_only")
+
+    assert calls, (
+        "run_pipeline runs outside a Django request cycle and must close "
+        "stale connections itself"
+    )
+
+
+def test_start_inline_branch_closes_its_django_connection(tmp_path, monkeypatch):
+    """Covers the non-backgrounded execution path of start()."""
+    channel = types.SimpleNamespace(name="RAI 1")
+    attached = [row(1, "IT: RAI 1 HD", "A")]
+    state = _make_state(tmp_path)
+    state.record(1, attached[0].url, VALID)
+    _patch_common(monkeypatch, tmp_path, channel, attached, state)
+    monkeypatch.setattr(
+        models_access_module, "apply_channel_plan",
+        lambda *_a, **_kw: {"attached": 0, "detached": 0},
+    )
+
+    calls = []
+    monkeypatch.setattr(pipeline_module, "_close_connection",
+                        lambda: calls.append(True))
+
+    # channel_count (1) <= INLINE_CHANNEL_LIMIT and mode == "reorder_only":
+    # this takes start()'s inline branch, not the backgrounded one.
+    result = pipeline_module.start({"settings": {}}, mode="reorder_only")
+
+    assert result["status"] == "ok"
+    assert calls, "the inline branch must close its connection when done"
+
+
+def test_backgrounded_start_closes_its_django_connection(tmp_path, monkeypatch):
+    """Covers start()'s spawn() path (the scheduler and larger manual runs)."""
+    channel = types.SimpleNamespace(name="RAI 1")
+    attached = [row(1, "IT: RAI 1 HD", "A")]
+    state = _make_state(tmp_path)
+    state.record(1, attached[0].url, VALID)  # fresh: no real probing needed
+    _patch_common(monkeypatch, tmp_path, channel, attached, state)
+
+    # Run the "background" work synchronously so the assertion below doesn't
+    # race a real thread.
+    monkeypatch.setattr(pipeline_module, "spawn", lambda fn, *args: fn(*args))
+
+    calls = []
+    monkeypatch.setattr(pipeline_module, "_close_connection",
+                        lambda: calls.append(True))
+
+    result = pipeline_module.start({"settings": {}}, mode="probe_only")
+
+    assert result["status"] == "started"
+    assert calls, "the backgrounded run must close its connection when done"
+
+
+# --- Aborted-provider budget waste (Fix 4) ----------------------------------
+
+
+def test_probe_candidates_skips_candidates_on_an_already_aborted_provider():
+    """A provider that aborted early must not keep burning probe budget.
+
+    prober.probe_one() already no-ops for an aborted provider, but the old
+    loop still called budget.spend() for that no-op - letting one bad
+    provider with many candidates starve healthy providers of their share.
+    """
+    settings = load_settings({"settings": {}})
+    state = State(path=pathlib.Path("/nonexistent/does-not-matter.json"))
+    budget = Budget(max_probes=10, max_minutes=60, now_fn=lambda: 0.0)
+    candidate = row(1, "IT: RAI 1 HD", "A")
+
+    class AbortedProber:
+        aborted_providers = {"A"}
+
+        def probe_one(self, *_args, **_kwargs):
+            raise AssertionError(
+                "must not probe a candidate on an already-aborted provider"
+            )
+
+    log = types.SimpleNamespace(info=lambda *_a, **_kw: None)
+
+    probed = pipeline_module._probe_candidates(
+        [candidate], state, settings, AbortedProber(), budget,
+        resolved=None, log=log,
+    )
+
+    assert probed == 0
+    assert budget.probes == 0, "an aborted provider's candidates must not spend budget"
+
+
+# --- Lock heartbeat + periodic state.save() cadence (Fixes 1 & 3) ----------
+
+
+def test_probe_candidates_refreshes_the_lock_and_saves_state_every_25_probes(
+    tmp_path, monkeypatch
+):
+    settings = load_settings({"settings": {}})
+    state = State(path=tmp_path / "state.json")
+    budget = Budget(max_probes=100, max_minutes=60, now_fn=lambda: 0.0)
+    candidates = [row(i, f"IT: RAI {i} HD", "A") for i in range(1, 26)]  # 25
+
+    valid_stats = {
+        "video_codec": "hevc", "resolution": "1920x1080", "video_bitrate": 5000,
+        "source_fps": 25, "audio_codec": "aac", "audio_channels": 2,
+    }
+
+    class StubProber:
+        aborted_providers = set()
+
+        def probe_one(self, *_args, **_kwargs):
+            return ProbeResult(VALID, valid_stats, "ok")
+
+    saves = []
+    refreshes = []
+    monkeypatch.setattr(state, "save", lambda: saves.append(True))
+    monkeypatch.setattr(pipeline_module, "refresh_lock", lambda: refreshes.append(True))
+    monkeypatch.setattr(pipeline_module, "models_access_save", lambda *_a, **_kw: None)
+    monkeypatch.setattr(pipeline_module, "_notify", lambda *_a, **_kw: None)
+
+    log = types.SimpleNamespace(info=lambda *_a, **_kw: None)
+
+    probed = pipeline_module._probe_candidates(
+        candidates, state, settings, StubProber(), budget, resolved=None, log=log,
+    )
+
+    assert probed == 25
+    assert len(saves) == 1, "state.save() should fire once at the 25th probe"
+    assert len(refreshes) == 1, "refresh_lock() should fire alongside it"
