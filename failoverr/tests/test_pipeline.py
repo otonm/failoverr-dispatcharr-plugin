@@ -641,3 +641,62 @@ def test_probe_candidates_refreshes_the_lock_and_saves_state_every_25_probes(
     assert probed == 25
     assert len(saves) == 1, "state.save() should fire once at the 25th probe"
     assert len(refreshes) == 1, "refresh_lock() should fire alongside it"
+
+
+def test_probe_candidates_accumulates_the_heartbeat_cadence_across_channels(
+    tmp_path, monkeypatch
+):
+    """The 25-probe cadence must accumulate across the whole run.
+
+    It must not reset every time `_probe_candidates` is called for a new
+    channel. run_pipeline calls _probe_candidates once per channel, and
+    real deployments have far fewer than 25 candidates per channel
+    (CLAUDE.md's own cost model: ~8 candidates/channel;
+    max_streams_per_channel defaults to 10) - so a per-call-local counter
+    would never reach 25, and the heartbeat/save would never fire during a
+    real multi-channel run.
+    """
+    settings = load_settings({"settings": {}})
+    state = State(path=tmp_path / "state.json")
+    budget = Budget(max_probes=100, max_minutes=60, now_fn=lambda: 0.0)
+
+    valid_stats = {
+        "video_codec": "hevc", "resolution": "1920x1080", "video_bitrate": 5000,
+        "source_fps": 25, "audio_codec": "aac", "audio_channels": 2,
+    }
+
+    class StubProber:
+        aborted_providers = set()
+
+        def probe_one(self, *_args, **_kwargs):
+            return ProbeResult(VALID, valid_stats, "ok")
+
+    saves = []
+    refreshes = []
+    monkeypatch.setattr(state, "save", lambda: saves.append(True))
+    monkeypatch.setattr(pipeline_module, "refresh_lock", lambda: refreshes.append(True))
+    monkeypatch.setattr(pipeline_module, "models_access_save", lambda *_a, **_kw: None)
+    monkeypatch.setattr(pipeline_module, "_notify", lambda *_a, **_kw: None)
+
+    log = types.SimpleNamespace(info=lambda *_a, **_kw: None)
+
+    # Channel 1: 20 candidates - under 25, must not trigger the cadence alone.
+    channel_1 = [row(i, f"IT: RAI {i} HD", "A") for i in range(1, 21)]
+    probed_1 = pipeline_module._probe_candidates(
+        channel_1, state, settings, StubProber(), budget,
+        resolved=None, log=log, probed_so_far=0,
+    )
+    assert probed_1 == 20
+    assert len(saves) == 0, "20 probes in one channel must not fire the cadence"
+
+    # Channel 2: 10 more candidates. The run-wide total crosses 25 on this
+    # channel's 5th probe (20 + 5 = 25), even though this channel alone
+    # never reaches 25 candidates.
+    channel_2 = [row(i, f"IT: RAI {i} HD", "A") for i in range(21, 31)]
+    probed_2 = pipeline_module._probe_candidates(
+        channel_2, state, settings, StubProber(), budget,
+        resolved=None, log=log, probed_so_far=probed_1,
+    )
+    assert probed_2 == 10
+    assert len(saves) == 1, "the run-wide total crossing 25 must fire the cadence"
+    assert len(refreshes) == 1

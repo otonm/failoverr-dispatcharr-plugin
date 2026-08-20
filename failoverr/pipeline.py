@@ -528,9 +528,16 @@ def _notify(payload):
 
 
 def _probe_candidates(  # noqa: PLR0913, PLR0917 - interface fixed by the task spec
-    candidates, state, settings, prober, budget, resolved, log,
+    candidates, state, settings, prober, budget, resolved, log, probed_so_far=0,
 ):
-    """Probe what is stale, record verdicts, write stats. Returns count."""
+    """Probe what is stale, record verdicts, write stats. Returns count.
+
+    probed_so_far is the run-wide probe count before this call, so the
+    25-probe heartbeat/save cadence accumulates across the whole run rather
+    than resetting every time run_pipeline calls this once per channel -
+    real channels rarely have 25 candidates each, so a per-call-local
+    counter would almost never fire.
+    """
     from .probing import is_blank
     from .state import INVALID, VALID
 
@@ -560,10 +567,10 @@ def _probe_candidates(  # noqa: PLR0913, PLR0917 - interface fixed by the task s
         state.record(row.stream_id, row.url, verdict)
         if verdict == VALID and stats:
             models_access_save(resolved, row.stream_id, stats)
-        if probed % 25 == 0:
+        if (probed_so_far + probed) % 25 == 0:
             refresh_lock()
             state.save()
-            _notify({"type": "failoverr", "probed": probed})
+            _notify({"type": "failoverr", "probed": probed_so_far + probed})
     return probed
 
 
@@ -643,7 +650,8 @@ def run_pipeline(context, mode="run"):
 
         if mode != "reorder_only":
             totals["probed"] += _probe_candidates(
-                candidates, state, settings, prober, budget, resolved, log
+                candidates, state, settings, prober, budget, resolved, log,
+                probed_so_far=totals["probed"],
             )
 
         if mode == "probe_only":
