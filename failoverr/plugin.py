@@ -6,6 +6,7 @@ modules stay importable in a bare pytest run.
 
 import collections
 import logging
+import threading
 
 logger = logging.getLogger("failoverr")
 
@@ -21,26 +22,43 @@ BACKUP_WARNING = (
 _REDACT = ("password", "secret", "api_key")
 
 _scheduler = None
+_scheduler_guard = threading.Lock()
 
 
 def _ensure_scheduler(context):
-    """Start or restart the scheduler to match current settings."""
+    """Start or restart the scheduler to match current settings.
+
+    Never lets a bad setting (e.g. a malformed cron expression) escape to
+    the caller - Diagnose/Run/etc. must still return their real result even
+    when the schedule can't be armed. Locked, mirroring pipeline.py's
+    _lock_guard, so two near-simultaneous calls can't each start a
+    Scheduler and leak one's thread.
+    """
     global _scheduler  # noqa: PLW0603 - module-level handle so stop() can reach it too
     from . import pipeline, scheduling
 
     settings = pipeline.load_settings(context)
-    if _scheduler is not None:
-        _scheduler.stop()
-        _scheduler = None
-    if not settings["schedule_enabled"]:
-        return None
-    _scheduler = scheduling.Scheduler(
-        settings["cron_expression"],
-        settings["timezone"],
-        lambda: pipeline.start(context, "run"),
-    )
-    _scheduler.start()
-    return _scheduler
+    with _scheduler_guard:
+        if _scheduler is not None:
+            _scheduler.stop()
+            _scheduler = None
+        if not settings["schedule_enabled"]:
+            return None
+        try:
+            new_scheduler = scheduling.Scheduler(
+                settings["cron_expression"],
+                settings["timezone"],
+                lambda: pipeline.start(context, "run"),
+            )
+            new_scheduler.start()
+        except Exception:
+            logger.exception(
+                "FAILOVERR scheduler not armed: bad cron_expression %r or timezone %r",
+                settings["cron_expression"], settings["timezone"],
+            )
+            return None
+        _scheduler = new_scheduler
+        return _scheduler
 
 
 def _flatten(value, path=""):
@@ -602,6 +620,7 @@ class Plugin:
     def stop(self, context=None):
         """Stop the scheduler. Called on disable/delete/reload."""
         global _scheduler  # noqa: PLW0603 - module-level handle set by _ensure_scheduler
-        if _scheduler is not None:
-            _scheduler.stop()
-            _scheduler = None
+        with _scheduler_guard:
+            if _scheduler is not None:
+                _scheduler.stop()
+                _scheduler = None
