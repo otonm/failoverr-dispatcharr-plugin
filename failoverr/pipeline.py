@@ -612,6 +612,12 @@ def run_pipeline(context, mode="run"):
             settings["max_streams_per_channel"],
             settings["order_strategy"], settings["codec_priority"],
         )
+        if mode == "reorder_only":
+            # Reorder Only never detaches. plan_channel's removal branch
+            # reads a cross-run failure counter that may have accumulated
+            # over prior Probe Only runs; a truncated/failed attached
+            # stream just keeps its old order and stays attached instead.
+            detach = []
         if not ordered:
             log.info("FAILOVERR %s: %s matched nothing, left alone",
                      mode, channel.name)

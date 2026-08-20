@@ -1,9 +1,12 @@
 import csv
 import pathlib
 import re
+import types
 
 import pytest
 
+from failoverr import models_access as models_access_module
+from failoverr import pipeline as pipeline_module
 from failoverr.naming import normalize
 from failoverr.pipeline import (
     LOCK_TTL_SECONDS,
@@ -18,6 +21,7 @@ from failoverr.pipeline import (
     plan_channel,
     release_lock,
     report_path,
+    run_pipeline,
     write_report,
 )
 from failoverr.state import INCONCLUSIVE, INVALID, VALID, State
@@ -354,3 +358,109 @@ def test_budget_stops_on_wall_clock():
 
 def test_a_fresh_budget_has_no_reason():
     assert Budget(10, 10, now_fn=lambda: 0.0).reason is None
+
+
+# --- run_pipeline mode-routing ----------------------------------------------
+#
+# run_pipeline touches the Django ORM through a handful of module-level
+# helpers (select_channels, attached_rows, iter_attached_rows, iter_pool).
+# These tests stub those helpers, following the monkeypatch-the-seam pattern
+# already used for Django-touching code in test_diagnose.py and
+# test_models_access.py, so the mode-routing logic can run offline.
+
+
+def _make_state(tmp_path):
+    return State(path=tmp_path / "state.json")
+
+
+def _patch_common(monkeypatch, tmp_path, channel, attached, state):
+    orders = [(r.stream_id, i) for i, r in enumerate(attached)]
+    monkeypatch.setattr(
+        pipeline_module, "select_channels", lambda *_a, **_kw: [channel]
+    )
+    monkeypatch.setattr(
+        pipeline_module, "attached_rows", lambda *_a, **_kw: orders
+    )
+    monkeypatch.setattr(
+        pipeline_module, "iter_attached_rows", lambda *_a, **_kw: iter(attached)
+    )
+    monkeypatch.setattr(
+        pipeline_module.State, "load", staticmethod(lambda *_a, **_kw: state)
+    )
+    monkeypatch.setattr(
+        pipeline_module, "report_path", lambda mode: tmp_path / f"{mode}.csv"
+    )
+    monkeypatch.setattr(models_access_module, "resolve_models", object)
+
+
+def test_reorder_only_never_detaches_via_a_stale_cross_run_failure_counter(
+    tmp_path, monkeypatch
+):
+    """Finding 1 regression.
+
+    A stream that racked up 3 consecutive INVALID verdicts under prior
+    Probe Only runs must not be detached by a later Reorder Only run:
+    that action's own description promises "nothing attached or detached".
+    """
+    channel = types.SimpleNamespace(name="RAI 1")
+    healthy = row(1, "IT: RAI 1 HD", "A")
+    failing = row(2, "IT: RAI 1 4K", "B")
+    state = _make_state(tmp_path)
+    state.record(1, healthy.url, VALID)
+    for _ in range(3):
+        state.record(2, failing.url, INVALID)
+    _patch_common(monkeypatch, tmp_path, channel, [healthy, failing], state)
+
+    apply_calls = []
+
+    def fake_apply(resolved, ch, ordered, detach, dry_run):  # noqa: ARG001
+        apply_calls.append((ordered, detach))
+        return {"attached": 0, "detached": len(detach)}
+
+    monkeypatch.setattr(models_access_module, "apply_channel_plan", fake_apply)
+
+    result = run_pipeline({"settings": {}}, mode="reorder_only")
+
+    assert result["detached"] == 0
+    assert apply_calls == [([1], [])], (
+        "stream 2 has 3 consecutive failures and would normally be "
+        "detached by plan_channel, but Reorder Only must discard that"
+    )
+
+
+@pytest.mark.parametrize("mode", ["reorder_only", "probe_only"])
+def test_non_run_modes_never_index_the_pool_or_match_by_name(
+    mode, tmp_path, monkeypatch
+):
+    """Finding 2: reorder_only/probe_only must not discover new streams.
+
+    Also covers probe_only never calling apply_channel_plan: the spy below
+    records zero calls for that mode.
+    """
+    channel = types.SimpleNamespace(name="RAI 1")
+    attached = [row(1, "IT: RAI 1 HD", "A")]
+    state = _make_state(tmp_path)
+    state.record(1, attached[0].url, VALID)  # fresh: probe_only won't re-probe it
+    _patch_common(monkeypatch, tmp_path, channel, attached, state)
+
+    def _forbidden(*_args, **_kwargs):
+        raise AssertionError(f"must not run in {mode} mode")
+
+    monkeypatch.setattr(pipeline_module, "iter_pool", _forbidden)
+    monkeypatch.setattr(pipeline_module, "find_matches", _forbidden)
+
+    apply_calls = []
+
+    def fake_apply(resolved, ch, ordered, detach, dry_run):  # noqa: ARG001
+        apply_calls.append((ordered, detach))
+        return {"attached": 0, "detached": 0}
+
+    monkeypatch.setattr(models_access_module, "apply_channel_plan", fake_apply)
+
+    result = run_pipeline({"settings": {}}, mode=mode)
+
+    assert result["status"] == "ok"
+    if mode == "reorder_only":
+        assert apply_calls == [([1], [])]
+    else:
+        assert apply_calls == [], "probe_only must never call apply_channel_plan"
