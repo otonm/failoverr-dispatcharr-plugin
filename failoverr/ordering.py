@@ -10,6 +10,14 @@ from typing import Any, NamedTuple
 
 DEFAULT_CODEC_PRIORITY = ("hevc", "h265", "h264", "avc")
 
+# Response time is bucketed to this granularity before ranking. Response
+# time is a near-continuous value (network jitter); at raw millisecond
+# precision, quality_first's exact-tie bucketing (see _quality_first) would
+# almost never fire, silently disabling provider interleaving wherever
+# response time is in play. Bucketing restores enough ties for interleaving
+# to still work, the same trick already used for resolution tiers.
+DEFAULT_RESPONSE_TIME_BUCKET_MS = 250
+
 # (minimum height, tier). Higher tier sorts first.
 _TIERS = ((2160, 4), (1440, 3), (1080, 2), (720, 1))
 
@@ -21,6 +29,7 @@ class Candidate(NamedTuple):
     name: str
     provider_id: Any
     stats: dict
+    response_time_ms: float = None
 
 
 def _height(stats):
@@ -56,17 +65,54 @@ def _number(value):
         return 0.0
 
 
-def quality_key(stats, codec_priority=DEFAULT_CODEC_PRIORITY):
-    """Sort key, descending. Derived from probe data only, never from names."""
+def _response_time_component(response_time_ms, bucket_ms):
+    """Bucketed, negated so a lower response time sorts higher.
+
+    Missing/never-measured response time sorts worst, mirroring how an
+    unlisted codec sorts worst in _codec_rank.
+    """
+    if response_time_ms is None:
+        return float("-inf")
+    bucket_ms = max(1, int(bucket_ms))
+    return -((int(response_time_ms) // bucket_ms) * bucket_ms)
+
+
+def quality_key(  # noqa: PLR0913, PLR0917 - one ranking factor per toggle
+    stats,
+    codec_priority=DEFAULT_CODEC_PRIORITY,
+    response_time_ms=None,
+    response_time_bucket_ms=DEFAULT_RESPONSE_TIME_BUCKET_MS,
+    rank_by_resolution=True,
+    rank_by_response_time=True,
+    rank_by_codec=True,
+    rank_by_fps=True,
+    rank_by_bitrate=True,
+):
+    """Sort key, descending. Derived from probe data only, never from names.
+
+    Order is fixed: resolution -> response time -> codec -> fps -> bitrate,
+    with height as an unconditional final tiebreaker that is never itself
+    toggleable — it is a sub-tier tiebreak, not an independent factor. Each
+    factor above can be individually disabled; a disabled factor is omitted
+    from the key entirely rather than zeroed, so it plays no role at all.
+    """
     stats = stats or {}
     height = _height(stats)
-    return (
-        _tier(height),
-        _codec_rank(stats, codec_priority),
-        _number(stats.get("source_fps")),
-        _number(stats.get("video_bitrate")),
-        height,
-    )
+    key = []
+    if rank_by_resolution:
+        key.append(_tier(height))
+    if rank_by_response_time:
+        key.append(
+            _response_time_component(response_time_ms, response_time_bucket_ms)
+        )
+    if rank_by_codec:
+        key.append(_codec_rank(stats, codec_priority))
+    if rank_by_fps:
+        key.append(_number(stats.get("source_fps")))
+    if rank_by_bitrate:
+        key.append(_number(stats.get("video_bitrate")))
+    key.append(height)
+    return tuple(key)
 
 
 def _group_by_provider(candidates):
@@ -86,28 +132,44 @@ def _interleave(groups):
     return [c for row in zip_longest(*groups) for c in row if c is not None]
 
 
-def _quality_first(candidates, codec_priority):
+def _quality_first(candidates, codec_priority, response_time_bucket_ms, toggles):
     buckets = defaultdict(list)
     for candidate in candidates:
-        buckets[quality_key(candidate.stats, codec_priority)].append(candidate)
+        key = quality_key(
+            candidate.stats, codec_priority, candidate.response_time_ms,
+            response_time_bucket_ms, **toggles,
+        )
+        buckets[key].append(candidate)
     ordered = []
     for key in sorted(buckets, reverse=True):
         ordered.extend(_interleave(_group_by_provider(buckets[key])))
     return ordered
 
 
-def _provider_first(candidates, codec_priority):
+def _provider_first(candidates, codec_priority, response_time_bucket_ms, toggles):
+    def _key(candidate):
+        return quality_key(
+            candidate.stats, codec_priority, candidate.response_time_ms,
+            response_time_bucket_ms, **toggles,
+        )
+
     ranked = [
-        sorted(group, key=lambda c: quality_key(c.stats, codec_priority), reverse=True)
+        sorted(group, key=_key, reverse=True)
         for group in _group_by_provider(candidates)
     ]
     return _interleave(ranked)
 
 
-def order_candidates(
+def order_candidates(  # noqa: PLR0913, PLR0917 - one ranking factor per toggle
     candidates,
     strategy="quality_first",
     codec_priority=DEFAULT_CODEC_PRIORITY,
+    response_time_bucket_ms=DEFAULT_RESPONSE_TIME_BUCKET_MS,
+    rank_by_resolution=True,
+    rank_by_response_time=True,
+    rank_by_codec=True,
+    rank_by_fps=True,
+    rank_by_bitrate=True,
 ):
     """Rank candidates and interleave providers.
 
@@ -119,9 +181,20 @@ def order_candidates(
     candidates = list(candidates)
     if not candidates:
         return []
+    toggles = {
+        "rank_by_resolution": rank_by_resolution,
+        "rank_by_response_time": rank_by_response_time,
+        "rank_by_codec": rank_by_codec,
+        "rank_by_fps": rank_by_fps,
+        "rank_by_bitrate": rank_by_bitrate,
+    }
     if strategy == "provider_first":
-        return _provider_first(candidates, codec_priority)
-    return _quality_first(candidates, codec_priority)
+        return _provider_first(
+            candidates, codec_priority, response_time_bucket_ms, toggles
+        )
+    return _quality_first(
+        candidates, codec_priority, response_time_bucket_ms, toggles
+    )
 
 
 def rewrite_plan(current, desired, use_offset, offset=100000):

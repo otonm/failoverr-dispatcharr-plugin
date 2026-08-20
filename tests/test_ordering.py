@@ -89,6 +89,87 @@ def test_default_codec_priority_prefers_hevc():
     assert DEFAULT_CODEC_PRIORITY[0] == "hevc"
 
 
+def test_response_time_bucketing_creates_ties_for_ranking():
+    a, b = stats(1920, 1080, "hevc"), stats(1920, 1080, "hevc")
+    assert quality_key(
+        a, response_time_ms=240, response_time_bucket_ms=250
+    ) == quality_key(b, response_time_ms=10, response_time_bucket_ms=250)
+    assert quality_key(
+        a, response_time_ms=260, response_time_bucket_ms=250
+    ) != quality_key(b, response_time_ms=240, response_time_bucket_ms=250)
+
+
+def test_missing_response_time_sorts_worst():
+    assert quality_key(
+        stats(1920, 1080, "hevc"), response_time_ms=None
+    ) < quality_key(stats(1920, 1080, "hevc"), response_time_ms=5000)
+
+
+def test_response_time_decides_before_codec_when_enabled():
+    fast_bad_codec = stats(1920, 1080, "avc")
+    slow_good_codec = stats(1920, 1080, "hevc")
+    assert quality_key(fast_bad_codec, response_time_ms=100) > quality_key(
+        slow_good_codec, response_time_ms=2000
+    )
+
+
+def test_disabling_response_time_lets_codec_decide_instead():
+    fast_bad_codec = stats(1920, 1080, "avc")
+    slow_good_codec = stats(1920, 1080, "hevc")
+    assert quality_key(
+        slow_good_codec, response_time_ms=2000, rank_by_response_time=False
+    ) > quality_key(fast_bad_codec, response_time_ms=100, rank_by_response_time=False)
+
+
+def test_disabling_resolution_lets_codec_decide_instead():
+    fhd_bad_codec = stats(1920, 1080, "avc")
+    hd_good_codec = stats(1280, 720, "hevc")
+    assert quality_key(fhd_bad_codec) > quality_key(hd_good_codec)
+    assert quality_key(hd_good_codec, rank_by_resolution=False) > quality_key(
+        fhd_bad_codec, rank_by_resolution=False
+    )
+
+
+def test_disabling_codec_lets_fps_decide_instead():
+    good_codec_slow_fps = stats(1920, 1080, "hevc", fps=25)
+    bad_codec_fast_fps = stats(1920, 1080, "avc", fps=50)
+    assert quality_key(good_codec_slow_fps) > quality_key(bad_codec_fast_fps)
+    assert quality_key(bad_codec_fast_fps, rank_by_codec=False) > quality_key(
+        good_codec_slow_fps, rank_by_codec=False
+    )
+
+
+def test_disabling_fps_lets_bitrate_decide_instead():
+    fast_fps_low_bitrate = stats(1920, 1080, "h264", fps=50, bitrate=1000)
+    slow_fps_high_bitrate = stats(1920, 1080, "h264", fps=25, bitrate=9000)
+    assert quality_key(fast_fps_low_bitrate) > quality_key(slow_fps_high_bitrate)
+    assert quality_key(fast_fps_low_bitrate, rank_by_fps=False) < quality_key(
+        slow_fps_high_bitrate, rank_by_fps=False
+    )
+
+
+def test_disabling_bitrate_ties_when_nothing_else_differs():
+    high_bitrate = stats(1920, 1080, "h264", bitrate=9000)
+    low_bitrate = stats(1920, 1080, "h264", bitrate=1000)
+    assert quality_key(high_bitrate) > quality_key(low_bitrate)
+    assert quality_key(high_bitrate, rank_by_bitrate=False) == quality_key(
+        low_bitrate, rank_by_bitrate=False
+    )
+
+
+def test_order_candidates_forwards_toggles_to_quality_key():
+    fast_bad = Candidate(1, "fast bad codec", "A", stats(1920, 1080, "avc"), 100)
+    slow_good = Candidate(2, "slow good codec", "A", stats(1920, 1080, "hevc"), 2000)
+
+    result = order_candidates([fast_bad, slow_good])
+    assert result[0].stream_id == 1
+
+    result_no_response_time = order_candidates(
+        [fast_bad, slow_good], rank_by_response_time=False
+    )
+    assert result_no_response_time[0].stream_id == 2
+
+
 # Spec §16. Note the lies: A's "4K" is really 720p, B's "SD" is really
 # 1080p HEVC. Ranking must follow the stats, not the names.
 A_UHD = Candidate(1, "RAI 1 UHD", "A", stats(3840, 2160, "hevc"))
