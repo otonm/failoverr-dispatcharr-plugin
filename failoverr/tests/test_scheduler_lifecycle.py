@@ -92,3 +92,75 @@ def test_ensure_scheduler_holds_the_lock_for_the_whole_construct_sequence(monkey
     _ensure_scheduler(context)
 
     assert observed["locked_during_construct"] is True
+
+
+# --- django-celery-beat preferred when available ----------------------------
+
+
+def test_celery_beat_is_used_instead_of_the_thread_when_available(monkeypatch):
+    """§10: prefer celery beat over the thread whenever it's importable."""
+    monkeypatch.setattr("failoverr.scheduling.celery_beat_available", lambda: True)
+    calls = []
+    monkeypatch.setattr(
+        "failoverr.scheduling.sync_celery_beat",
+        lambda cron, enabled: calls.append((cron, enabled)),
+    )
+    context = {
+        "settings": {
+            "schedule_enabled": True,
+            "cron_expression": "0 4 * * *",
+            "timezone": "UTC",
+        }
+    }
+
+    result = _ensure_scheduler(context)
+
+    assert calls == [("0 4 * * *", True)]
+    assert result is None
+    assert plugin_module._scheduler is None
+
+
+def test_celery_beat_path_stops_any_live_thread_scheduler(monkeypatch):
+    """Switching backends (or just re-arming) must not leave the old thread running."""
+    settings = {
+        "schedule_enabled": True, "cron_expression": "0 4 * * *", "timezone": "UTC",
+    }
+    monkeypatch.setattr("failoverr.scheduling.celery_beat_available", lambda: False)
+    _ensure_scheduler({"settings": settings})
+    assert plugin_module._scheduler is not None
+    live_thread = plugin_module._scheduler._thread
+
+    monkeypatch.setattr("failoverr.scheduling.celery_beat_available", lambda: True)
+    monkeypatch.setattr("failoverr.scheduling.sync_celery_beat", lambda *_a, **_k: None)
+    _ensure_scheduler({"settings": settings})
+
+    assert plugin_module._scheduler is None
+    assert live_thread.is_alive() is False
+
+
+def test_malformed_cron_does_not_raise_in_the_celery_beat_path(monkeypatch, caplog):
+    monkeypatch.setattr("failoverr.scheduling.celery_beat_available", lambda: True)
+    context = {
+        "settings": {
+            "schedule_enabled": True,
+            "cron_expression": "garbage",
+            "timezone": "UTC",
+        }
+    }
+
+    with caplog.at_level(logging.ERROR, logger="failoverr"):
+        result = _ensure_scheduler(context)
+
+    assert result is None
+    assert any("not armed" in r.message for r in caplog.records), caplog.records
+
+
+def test_stop_disables_celery_beat(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        "failoverr.scheduling.disable_celery_beat", lambda: calls.append(True)
+    )
+
+    Plugin().stop()
+
+    assert calls == [True]

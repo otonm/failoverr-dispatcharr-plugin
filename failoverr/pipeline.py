@@ -7,7 +7,10 @@ section touch nothing but plain data so they can be tested offline.
 import concurrent.futures
 import csv
 import datetime
+import fcntl
+import json
 import logging
+import os
 import pathlib
 import threading
 import time
@@ -416,18 +419,50 @@ def run_preview(context):
 # A stale lock from a killed run must not block the plugin forever.
 LOCK_TTL_SECONDS = 1800
 
-_lock_guard = threading.Lock()
-_lock_holder = {"holder": None, "since": 0.0}
+# A file, not an in-memory dict: a scheduled run fires inside the celery
+# worker process while a manual Run fires inside the uwsgi process - two
+# separate OS processes that share no Python memory. flock() around every
+# read-modify-write below is what actually keeps them from stepping on
+# each other; the file's content is just {"holder": ..., "since": ...}.
+LOCK_PATH = "/data/failoverr/run.lock"
+
+
+def _open_lock_file():
+    path = pathlib.Path(LOCK_PATH)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path.open("a+")
+
+
+def _read_locked(fh):
+    fh.seek(0)
+    raw = fh.read()
+    try:
+        return json.loads(raw) if raw else {}
+    except ValueError:
+        return {}
+
+
+def _write_locked(fh, data):
+    fh.seek(0)
+    fh.truncate()
+    fh.write(json.dumps(data))
+    fh.flush()
+    os.fsync(fh.fileno())
 
 
 def acquire_lock(name, now=None):
     now = time.time() if now is None else now
-    with _lock_guard:
-        holder = _lock_holder["holder"]
-        if holder is not None and (now - _lock_holder["since"]) < LOCK_TTL_SECONDS:
-            return False
-        _lock_holder.update({"holder": name, "since": now})
-        return True
+    with _open_lock_file() as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            data = _read_locked(fh)
+            holder, since = data.get("holder"), float(data.get("since", 0.0))
+            if holder is not None and (now - since) < LOCK_TTL_SECONDS:
+                return False
+            _write_locked(fh, {"holder": name, "since": now})
+            return True
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
 
 
 def refresh_lock(now=None):
@@ -439,13 +474,23 @@ def refresh_lock(now=None):
     the SECOND run's lock too.
     """
     now = time.time() if now is None else now
-    with _lock_guard:
-        _lock_holder["since"] = now
+    with _open_lock_file() as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            data = _read_locked(fh)
+            data["since"] = now
+            _write_locked(fh, data)
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
 
 
 def release_lock():
-    with _lock_guard:
-        _lock_holder.update({"holder": None, "since": 0.0})
+    with _open_lock_file() as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            _write_locked(fh, {"holder": None, "since": 0.0})
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
 
 
 def clear_lock():
@@ -454,8 +499,13 @@ def clear_lock():
 
 
 def lock_status():
-    with _lock_guard:
-        return dict(_lock_holder)
+    with _open_lock_file() as fh:
+        fcntl.flock(fh, fcntl.LOCK_SH)
+        try:
+            data = _read_locked(fh)
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+    return {"holder": data.get("holder"), "since": float(data.get("since", 0.0))}
 
 
 class Budget:

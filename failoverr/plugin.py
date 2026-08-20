@@ -8,6 +8,14 @@ import collections
 import logging
 import threading
 
+from . import tasks  # noqa: F401 - import-time side effect: registers @shared_task.
+
+# Dispatcharr's loader imports THIS file directly (preferring plugin.py over
+# __init__.py when both exist), and its celery worker only ever registers a
+# plugin's @shared_task by importing plugin.py at worker (re)start - so this
+# import has to live here, not in __init__.py, for scheduled_run to exist in
+# the worker's task registry at all.
+
 logger = logging.getLogger("failoverr")
 
 # How many raw stream_stats rows Diagnose shows, and how many it scans.
@@ -26,13 +34,21 @@ _scheduler_guard = threading.Lock()
 
 
 def _ensure_scheduler(context):
-    """Start or restart the scheduler to match current settings.
+    """Arm the schedule to match current settings - celery beat if available.
 
     Never lets a bad setting (e.g. a malformed cron expression) escape to
     the caller - Diagnose/Run/etc. must still return their real result even
-    when the schedule can't be armed. Locked, mirroring pipeline.py's
-    _lock_guard, so two near-simultaneous calls can't each start a
-    Scheduler and leak one's thread.
+    when the schedule can't be armed. Locked so two near-simultaneous calls
+    can't each start a Scheduler and leak one's thread.
+
+    §10: django-celery-beat is more robust than the thread (it survives a
+    celery worker restart without needing this function to be called
+    again, and its schedule fires from a separate process rather than a
+    thread inside whichever uwsgi worker happened to handle the enabling
+    request) - prefer it whenever it's importable, and only fall back to
+    the thread otherwise. A scheduled run fires inside the celery worker
+    process while a manual Run fires inside uwsgi's - pipeline.py's lock
+    file (not an in-memory dict) is what keeps those from overlapping.
     """
     global _scheduler  # noqa: PLW0603 - module-level handle so stop() can reach it too
     from . import pipeline, scheduling
@@ -42,6 +58,20 @@ def _ensure_scheduler(context):
         if _scheduler is not None:
             _scheduler.stop()
             _scheduler = None
+
+        if scheduling.celery_beat_available():
+            try:
+                scheduling.matches_cron(settings["cron_expression"], _now())
+                scheduling.sync_celery_beat(
+                    settings["cron_expression"], settings["schedule_enabled"]
+                )
+            except Exception:
+                logger.exception(
+                    "FAILOVERR celery-beat schedule not armed: bad cron_expression %r",
+                    settings["cron_expression"],
+                )
+            return None
+
         if not settings["schedule_enabled"]:
             return None
         try:
@@ -59,6 +89,29 @@ def _ensure_scheduler(context):
             return None
         _scheduler = new_scheduler
         return _scheduler
+
+
+def _now():
+    import datetime
+
+    return datetime.datetime.now()  # noqa: DTZ005 - matches_cron takes naive datetimes, shape check only
+
+
+def _scheduler_report(scheduling):
+    """Report which scheduler backend is active, and its one gotcha, for Diagnose."""
+    if scheduling.celery_beat_available():
+        return {
+            "backend": "celery_beat",
+            "note": (
+                "Scheduled via django-celery-beat: runs in Dispatcharr's "
+                "system timezone (Settings > General), not the Timezone "
+                "field below. A freshly-enabled or freshly-changed schedule "
+                "won't fire until the celery worker process next restarts "
+                "or forks a new child - it only re-imports plugins at that "
+                "point."
+            ),
+        }
+    return {"backend": "thread", "note": None}
 
 
 def _flatten(value, path=""):
@@ -503,7 +556,7 @@ class Plugin:
         return result
 
     def _diagnose(self, params, context):
-        from . import models_access, naming, pipeline
+        from . import models_access, naming, pipeline, scheduling
 
         settings = pipeline.load_settings(context)
 
@@ -571,6 +624,7 @@ class Plugin:
                     for n in channel_names
                 ],
             },
+            "scheduler": _scheduler_report(scheduling),
         }
         _ensure_scheduler(context)
         return result
@@ -618,7 +672,10 @@ class Plugin:
     def stop(self, context=None):
         """Stop the scheduler. Called on disable/delete/reload."""
         global _scheduler  # noqa: PLW0603 - module-level handle set by _ensure_scheduler
+        from . import scheduling
+
         with _scheduler_guard:
             if _scheduler is not None:
                 _scheduler.stop()
                 _scheduler = None
+        scheduling.disable_celery_beat()

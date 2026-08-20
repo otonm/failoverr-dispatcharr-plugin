@@ -1,6 +1,8 @@
 import csv
 import pathlib
 import re
+import subprocess
+import sys
 import threading
 import time
 import types
@@ -302,7 +304,8 @@ def test_load_settings_parses_the_channel_name_list():
 
 
 @pytest.fixture(autouse=True)
-def _reset_lock():
+def _reset_lock(tmp_path, monkeypatch):
+    monkeypatch.setattr(pipeline_module, "LOCK_PATH", str(tmp_path / "run.lock"))
     clear_lock()
     yield
     clear_lock()
@@ -355,6 +358,31 @@ def test_refresh_lock_prevents_a_steal_at_the_original_ttl_deadline():
     # It does go stale relative to the refreshed timestamp, once enough
     # time has passed since THAT.
     assert acquire_lock("preview", now=1000.0 + LOCK_TTL_SECONDS + 1) is True
+
+
+def test_lock_is_visible_across_separate_processes():
+    """The lock must stop a celery-worker run from overlapping a uwsgi one.
+
+    Those are two separate OS processes with no shared Python memory, so an
+    in-memory dict (the old implementation) could never see across them.
+    Proving it here means actually spawning a second process against the
+    same lock file, not just calling the function twice in this one.
+    """
+    lock_path = pipeline_module.LOCK_PATH
+    acquire_lock("run", now=0.0)
+
+    script = (
+        "import sys; sys.path.insert(0, sys.argv[1]); "
+        "from failoverr import pipeline; "
+        "pipeline.LOCK_PATH = sys.argv[2]; "
+        "print(pipeline.acquire_lock('scheduled_run', now=10.0))"
+    )
+    repo_root = str(pathlib.Path(__file__).resolve().parents[2])
+    result = subprocess.run(
+        [sys.executable, "-c", script, repo_root, lock_path],
+        capture_output=True, text=True, check=True,
+    )
+    assert result.stdout.strip() == "False"
 
 
 # --- Budgets ---------------------------------------------------------------

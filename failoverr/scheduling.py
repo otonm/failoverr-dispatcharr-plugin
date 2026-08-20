@@ -13,6 +13,52 @@ logger = logging.getLogger("failoverr")
 
 CHECK_INTERVAL_SECONDS = 20
 
+# django-celery-beat's PeriodicTask.name - not the celery task name (see
+# tasks.TASK_NAME), just this row's identity in the PeriodicTask table.
+PERIODIC_TASK_NAME = "failoverr-scheduled-run"
+
+
+def celery_beat_available():
+    """Whether django-celery-beat's DB scheduler can drive the schedule.
+
+    §10: prefer this over the thread when available. Both imports are
+    Dispatcharr-only - this repo's own bare pytest run has neither, so it
+    correctly reports False there and the thread scheduler is used.
+    """
+    try:
+        import core.scheduling  # noqa: F401
+        import django_celery_beat.models  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def sync_celery_beat(cron_expression, enabled):
+    """(Re)point celery beat's schedule at our task. Raises on a bad cron_expression."""
+    from core.scheduling import create_or_update_periodic_task
+
+    from .tasks import TASK_NAME
+
+    create_or_update_periodic_task(
+        task_name=PERIODIC_TASK_NAME,
+        celery_task_path=TASK_NAME,
+        cron_expression=cron_expression,
+        enabled=enabled,
+    )
+
+
+def disable_celery_beat():
+    """Silence a previously-registered schedule on stop()/disable/delete.
+
+    Best-effort: if django-celery-beat was never available there is
+    nothing to remove.
+    """
+    try:
+        from core.scheduling import delete_periodic_task
+    except ImportError:
+        return
+    delete_periodic_task(PERIODIC_TASK_NAME)
+
 
 def _field_matches(spec, value, minimum, maximum):
     for part in str(spec).split(","):

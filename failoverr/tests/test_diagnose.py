@@ -1,7 +1,9 @@
+import types
+
 import pytest
 
 from failoverr.models_access import FieldResolutionError
-from failoverr.plugin import Plugin, _flatten
+from failoverr.plugin import Plugin, _flatten, _scheduler_report
 
 
 def test_unknown_action_returns_error_not_exception():
@@ -138,3 +140,20 @@ def test_diagnose_computes_settings_via_pipeline_load_settings(monkeypatch):
     assert result["status"] == "error"
     assert len(calls) == 1
     assert calls[0] is context
+
+
+def test_scheduler_report_names_the_thread_backend_when_celery_beat_is_absent():
+    fake_scheduling = types.SimpleNamespace(celery_beat_available=lambda: False)
+
+    report = _scheduler_report(fake_scheduling)
+
+    assert report == {"backend": "thread", "note": None}
+
+
+def test_scheduler_report_flags_the_worker_restart_caveat_for_celery_beat():
+    fake_scheduling = types.SimpleNamespace(celery_beat_available=lambda: True)
+
+    report = _scheduler_report(fake_scheduling)
+
+    assert report["backend"] == "celery_beat"
+    assert "restart" in report["note"]
