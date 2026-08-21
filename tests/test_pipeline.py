@@ -277,6 +277,70 @@ def test_report_path_is_version_independent_and_well_formed():
     assert re.match(r"^failoverr-preview-\d{8}-\d{6}\.csv$", path.name)
 
 
+def test_report_row_renders_a_zero_response_time_without_blank():
+    """Regression: the 0ms CSV rendering bug (e6f8a30) lives in one place now.
+
+    A measured 0ms is a real value, not "never measured" - it must render as
+    "0", not "". The pre-dedup code hid it behind ``or ""`` (falsy) at three
+    separate sites; the _report_row helper is the single site now, so this
+    locks the ``is not None`` check against drift.
+    """
+    from failoverr.pipeline import _report_row
+
+    state = State(path=pathlib.Path("/nonexistent/does-not-matter.json"))
+    state.record(1, "http://a.example/1.ts", VALID, response_time_ms=0)
+    stream = row(1, "IT: RAI 1 HD", "A")
+
+    rendered = _report_row(
+        types.SimpleNamespace(name="RAI 1"), 0, 1, stream, state, "attach",
+    )
+
+    assert rendered["response_time_ms"] == 0, (
+        "a genuine 0ms must render as 0, not be blanked by a falsy check"
+    )
+    assert rendered["resolution"] == "1920x1080"
+
+
+def test_report_row_blanks_the_stats_columns_on_a_detach():
+    """A detached stream's resolution/codec/response_time are blanked.
+
+    detach is the one action that discards the row's stats even when the row
+    is present - the stream is being removed, so its last resolution/codec
+    must not appear next to an action that says 'detach'.
+    """
+    from failoverr.pipeline import _report_row
+
+    state = State(path=pathlib.Path("/nonexistent/does-not-matter.json"))
+    state.record(1, "http://a.example/1.ts", VALID, response_time_ms=180)
+    stream = row(1, "IT: RAI 1 HD", "A")
+
+    rendered = _report_row(
+        types.SimpleNamespace(name="RAI 1"), "", 1, stream, state, "detach",
+    )
+
+    assert rendered["action"] == "detach"
+    assert rendered["resolution"] == ""
+    assert rendered["codec"] == ""
+    assert rendered["response_time_ms"] == "", (
+        "detach must blank response_time_ms even when state has a value"
+    )
+    assert rendered["stream"] == "IT: RAI 1 HD", "the stream name is still shown"
+
+
+def test_report_row_falls_back_to_the_stream_id_when_the_row_is_missing():
+    """A kept/detach row whose stream isn't in the candidate set shows its id."""
+    from failoverr.pipeline import _report_row
+
+    state = State(path=pathlib.Path("/nonexistent/does-not-matter.json"))
+
+    rendered = _report_row(
+        types.SimpleNamespace(name="RAI 1"), "", 42, None, state, "detach",
+    )
+
+    assert rendered["stream"] == 42
+    assert rendered["provider"] == ""
+
+
 def test_load_settings_applies_defaults_for_missing_keys():
     settings = load_settings({"settings": {}})
     assert settings["dry_run"] is True

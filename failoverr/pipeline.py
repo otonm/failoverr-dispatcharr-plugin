@@ -273,6 +273,31 @@ def report_path(action):
     return pathlib.Path(EXPORT_DIR) / f"failoverr-{action}-{stamp}.csv"
 
 
+def _report_row(channel, position, stream_id, row, state, action):  # noqa: PLR0913, PLR0917
+    """One CSV report row. Resolution/codec/response_time blank on a detach.
+
+    The single source of the report-row shape: run_preview and run_pipeline
+    both build their rows here, so a column rendering fix (e.g. the 0ms
+    ``is not None`` check) applies once instead of drifting across sites.
+    """
+    detach = action == "detach"
+    stats = (row.stats or {}) if row and not detach else {}
+    return {
+        "channel": channel.name,
+        "position": position,
+        "stream": row.name if row else stream_id,
+        "provider": row.provider_id if row else "",
+        "verdict": state.last_verdict(stream_id) or "unprobed",
+        "resolution": stats.get("resolution", ""),
+        "codec": stats.get("video_codec", ""),
+        "response_time_ms": (
+            "" if detach
+            else rt if (rt := state.response_time_ms(stream_id)) is not None else ""
+        ),
+        "action": action,
+    }
+
+
 def iter_pool(resolved, settings):
     """One streaming pass over the whole Stream pool.
 
@@ -390,30 +415,13 @@ def run_preview(context):
         lookup = {row.stream_id: row for row in candidates}
         for position, stream_id in enumerate(ordered):
             row = lookup.get(stream_id)
-            rows.append({
-                "channel": channel.name,
-                "position": position,
-                "stream": row.name if row else stream_id,
-                "provider": row.provider_id if row else "",
-                "verdict": state.last_verdict(stream_id) or "unprobed",
-                "resolution": (row.stats or {}).get("resolution", "") if row else "",
-                "codec": (row.stats or {}).get("video_codec", "") if row else "",
-                "response_time_ms": (
-                    rt if (rt := state.response_time_ms(stream_id)) is not None else ""
-                ),
-                "action": "keep" if stream_id in attached_ids else "attach",
-            })
+            rows.append(_report_row(
+                channel, position, stream_id, row, state,
+                "keep" if stream_id in attached_ids else "attach",
+            ))
         for stream_id in detach:
             row = lookup.get(stream_id)
-            rows.append({
-                "channel": channel.name,
-                "position": "",
-                "stream": row.name if row else stream_id,
-                "provider": row.provider_id if row else "",
-                "verdict": state.last_verdict(stream_id) or "unprobed",
-                "resolution": "", "codec": "", "response_time_ms": "",
-                "action": "detach",
-            })
+            rows.append(_report_row(channel, "", stream_id, row, state, "detach"))
 
         # Everything matched but not acted on. Until probing exists, this is
         # the whole report: it is what lets the user check that matching
@@ -422,22 +430,11 @@ def run_preview(context):
         for row in candidates:
             if row.stream_id in planned:
                 continue
-            rows.append({
-                "channel": channel.name,
-                "position": "",
-                "stream": row.name,
-                "provider": row.provider_id,
-                "verdict": state.last_verdict(row.stream_id) or "unprobed",
-                "resolution": (row.stats or {}).get("resolution", ""),
-                "codec": (row.stats or {}).get("video_codec", ""),
-                "response_time_ms": (
-                    rt if (
-                        rt := state.response_time_ms(row.stream_id)
-                    ) is not None else ""
-                ),
-                "action": "matched - would be probed"
+            rows.append(_report_row(
+                channel, "", row.stream_id, row, state,
+                "matched - would be probed"
                 if row.stream_id in matched_ids else "attached - not matched",
-            })
+            ))
 
         if not candidates:
             log.info("FAILOVERR preview: %s matched nothing", channel.name)
@@ -1141,25 +1138,14 @@ def run_pipeline(context, mode="run"):
         lookup = {row.stream_id: row for row in candidates}
         for position, stream_id in enumerate(ordered):
             row = lookup.get(stream_id)
-            rows.append({
-                "channel": channel.name, "position": position,
-                "stream": row.name if row else stream_id,
-                "provider": row.provider_id if row else "",
-                "verdict": state.last_verdict(stream_id) or "unprobed",
-                "resolution": (row.stats or {}).get("resolution", "") if row else "",
-                "codec": (row.stats or {}).get("video_codec", "") if row else "",
-                "response_time_ms": (
-                    rt if (rt := state.response_time_ms(stream_id)) is not None else ""
-                ),
-                "action": "keep" if stream_id in attached_ids else "attach",
-            })
-        rows.extend({
-            "channel": channel.name, "position": "",
-            "stream": stream_id, "provider": "",
-            "verdict": state.last_verdict(stream_id) or "unprobed",
-            "resolution": "", "codec": "", "response_time_ms": "",
-            "action": "detach",
-        } for stream_id in detach)
+            rows.append(_report_row(
+                channel, position, stream_id, row, state,
+                "keep" if stream_id in attached_ids else "attach",
+            ))
+        rows.extend(
+            _report_row(channel, "", stream_id, None, state, "detach")
+            for stream_id in detach
+        )
 
     state.meta.update({
         "last_run": time.time(),
