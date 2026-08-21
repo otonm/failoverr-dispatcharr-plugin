@@ -13,6 +13,7 @@ import pytest
 
 from failoverr import plugin as plugin_module
 from failoverr.plugin import Plugin, _ensure_scheduler
+from failoverr.scheduling import disable_celery_beat
 
 
 @pytest.fixture(autouse=True)
@@ -164,3 +165,33 @@ def test_stop_disables_celery_beat(monkeypatch):
     Plugin().stop()
 
     assert calls == [True]
+
+
+def test_stop_logs_and_swallows_when_disable_celery_beat_raises(monkeypatch, caplog):
+    """An exception in the lifecycle hook must not crash it with no trace."""
+    def boom():
+        raise RuntimeError("celery-beat delete failed")
+
+    monkeypatch.setattr("failoverr.scheduling.disable_celery_beat", boom)
+
+    with caplog.at_level(logging.ERROR, logger="failoverr"):
+        Plugin().stop()  # must not raise
+
+    assert any("stop FAILED" in r.message for r in caplog.records), caplog.records
+
+
+def test_stop_logs_completion_on_success(monkeypatch, caplog):
+    monkeypatch.setattr("failoverr.scheduling.disable_celery_beat", lambda: None)
+
+    with caplog.at_level(logging.INFO, logger="failoverr"):
+        Plugin().stop()
+
+    assert any("stop COMPLETED" in r.message for r in caplog.records), caplog.records
+
+
+def test_disable_celery_beat_logs_the_noop_branch(caplog):
+    """The ImportError early-return must leave a trace, not vanish silently."""
+    with caplog.at_level(logging.DEBUG, logger="failoverr"):
+        disable_celery_beat()
+
+    assert any("nothing to remove" in r.message for r in caplog.records), caplog.records

@@ -56,8 +56,10 @@ def disable_celery_beat():
     try:
         from core.scheduling import delete_periodic_task
     except ImportError:
+        logger.debug("FAILOVERR celery-beat not available, nothing to remove")
         return
     delete_periodic_task(PERIODIC_TASK_NAME)
+    logger.info("FAILOVERR celery-beat periodic task removed")
 
 
 def _field_matches(spec, value, minimum, maximum):

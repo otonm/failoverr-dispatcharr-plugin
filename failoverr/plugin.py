@@ -845,8 +845,15 @@ class Plugin:
         global _scheduler  # noqa: PLW0603 - module-level handle set by _ensure_scheduler
         from . import scheduling
 
-        with _scheduler_guard:
-            if _scheduler is not None:
-                _scheduler.stop()
-                _scheduler = None
-        scheduling.disable_celery_beat()
+        log = (context or {}).get("logger", logger)
+        log.info("FAILOVERR scheduler stop (disable/delete/reload)")
+        try:
+            with _scheduler_guard:
+                if _scheduler is not None:
+                    _scheduler.stop()
+                    _scheduler = None
+            scheduling.disable_celery_beat()
+        except Exception:
+            log.exception("FAILOVERR scheduler stop FAILED")
+            return
+        log.info("FAILOVERR scheduler stop COMPLETED")
