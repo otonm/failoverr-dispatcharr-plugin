@@ -504,14 +504,14 @@ def _write_locked(fh, data):
     os.fsync(fh.fileno())
 
 
-def acquire_lock(name, now=None):
+def acquire_lock(name, now=None, ttl=LOCK_TTL_SECONDS):
     now = time.time() if now is None else now
     with _open_lock_file() as fh:
         fcntl.flock(fh, fcntl.LOCK_EX)
         try:
             data = _read_locked(fh)
             holder, since = data.get("holder"), float(data.get("since", 0.0))
-            if holder is not None and (now - since) < LOCK_TTL_SECONDS:
+            if holder is not None and (now - since) < ttl:
                 return False
             _write_locked(fh, {"holder": name, "since": now})
             return True
@@ -519,29 +519,47 @@ def acquire_lock(name, now=None):
             fcntl.flock(fh, fcntl.LOCK_UN)
 
 
-def refresh_lock(now=None):
+def refresh_lock(holder=None, now=None):
     """Keep a long-running run's lock from going stale mid-run.
 
-    Without this, a run past LOCK_TTL_SECONDS looks abandoned to
-    acquire_lock even though it is still working - a second run can then
-    steal the lock, and the first run's eventual release_lock() would clear
-    the SECOND run's lock too.
+    Without this, a run past its TTL looks abandoned to acquire_lock even
+    though it is still working - a second run can then steal the lock, and
+    the first run's eventual release_lock() would clear the SECOND run's
+    lock too. Like update_progress(), this checks lock identity first: a
+    run whose lock was force-cleared and re-acquired by another run no-ops
+    rather than resurrecting or bumping the new holder's timestamp.
+
+    ``holder=None`` (the default for tests and the force/clear path) is
+    unconditional - it bumps whichever lock is present.
     """
     now = time.time() if now is None else now
     with _open_lock_file() as fh:
         fcntl.flock(fh, fcntl.LOCK_EX)
         try:
             data = _read_locked(fh)
+            if holder is not None and data.get("holder") != holder:
+                return
             data["since"] = now
             _write_locked(fh, data)
         finally:
             fcntl.flock(fh, fcntl.LOCK_UN)
 
 
-def release_lock():
+def release_lock(holder=None):
+    """Release the run lock.
+
+    ``holder`` (the mode that acquired it) makes the release conditional:
+    if the lock has since been force-cleared and re-acquired by a different
+    run, this no-ops rather than wiping the new run's lock - the same
+    two-runs-writing-state-at-once hazard update_progress guards against.
+    ``holder=None`` (the default, used by clear_lock and tests) is the
+    unconditional force-release path.
+    """
     with _open_lock_file() as fh:
         fcntl.flock(fh, fcntl.LOCK_EX)
         try:
+            if holder is not None and _read_locked(fh).get("holder") != holder:
+                return
             _write_locked(fh, {"holder": None, "since": 0.0})
         finally:
             fcntl.flock(fh, fcntl.LOCK_UN)
@@ -786,7 +804,7 @@ def _select_probe_batch(  # noqa: PLR0913, PLR0917 - mirrors _probe_candidates' 
 
 def _probe_candidates(  # noqa: PLR0913, PLR0917 - interface fixed by the task spec
     candidates, state, settings, prober, budget, resolved, log, probed_so_far=0,
-    progress_cb=None,
+    progress_cb=None, mode=None,
 ):
     """Probe what is stale, record verdicts, write stats. Returns count.
 
@@ -860,7 +878,7 @@ def _probe_candidates(  # noqa: PLR0913, PLR0917 - interface fixed by the task s
                 continue
             if _handle_probe_result(
                 candidate_row, verdict, stats, response_time_ms, resolved, state, log,
-                progress_cb, probed_so_far + probed,
+                progress_cb, probed_so_far + probed, mode,
             ):
                 probed += 1
     return probed
@@ -868,7 +886,7 @@ def _probe_candidates(  # noqa: PLR0913, PLR0917 - interface fixed by the task s
 
 def _handle_probe_result(  # noqa: PLR0913, PLR0917 - one call site, _probe_candidates
     candidate_row, verdict, stats, response_time_ms, resolved, state, log,
-    progress_cb, probed_before,
+    progress_cb, probed_before, mode=None,
 ):
     """Record one probe's verdict, save stats, and report progress.
 
@@ -893,7 +911,7 @@ def _handle_probe_result(  # noqa: PLR0913, PLR0917 - one call site, _probe_cand
     if progress_cb is not None:
         progress_cb(candidate_row, verdict, probed_total)
     if probed_total % 25 == 0:
-        refresh_lock()
+        refresh_lock(mode)
         state.save()
         _notify({"type": "failoverr", "probed": probed_total})
     return True
@@ -1080,6 +1098,11 @@ def run_pipeline(context, mode="run"):
         {} if mode != "run"
         else build_index(iter_pool(resolved, settings))
     )
+    # Heartbeat the lock right after the indexing phase (which scans the whole
+    # pool and otherwise runs without a refresh), so a long indexing pass
+    # can't let the lock go stale before the channel loop ever starts. No-op
+    # when this process doesn't hold the lock (holder mismatch).
+    refresh_lock(mode)
     prober = Prober(
         settings["ffprobe_path"], settings["probe_timeout_seconds"],
         settings["per_account_concurrency"], settings["global_concurrency"],
@@ -1097,6 +1120,11 @@ def run_pipeline(context, mode="run"):
     }
 
     for channel_index, channel in enumerate(channels, start=1):
+        # Heartbeat at every channel boundary, not just every 25 probes: the
+        # 25-probe cadence never fires during a reorder_only run (no probing)
+        # or between channels, so without this the lock could go stale during
+        # a non-probing phase and be force-cleared mid-run.
+        refresh_lock(mode)
         if _check_cancel_between_channels(budget, log, mode, channel):
             break
 
@@ -1111,7 +1139,7 @@ def run_pipeline(context, mode="run"):
         if mode != "reorder_only":
             totals["probed"] += _probe_candidates(
                 candidates, state, settings, prober, budget, resolved, log,
-                probed_so_far=totals["probed"], progress_cb=on_probe,
+                probed_so_far=totals["probed"], progress_cb=on_probe, mode=mode,
             )
 
         if mode == "probe_only":
@@ -1186,7 +1214,14 @@ def run_pipeline(context, mode="run"):
 def start(context, mode="run"):
     """Acquire the lock and run, inline for small jobs, backgrounded otherwise."""
     log = context.get("logger", logger)
-    if not acquire_lock(mode):
+    settings = load_settings(context)
+    # The lock's TTL must outlive a legitimate run, not just the default 30
+    # minutes: max_run_minutes defaults to 60, and a run within its budget
+    # must not have its lock auto-stolen by a second acquire_lock partway
+    # through. The per-channel + after-indexing heartbeat keeps the lock
+    # fresh well inside this TTL, so it only governs the auto-steal window.
+    lock_ttl = max(LOCK_TTL_SECONDS, settings["max_run_minutes"] * 60 + 300)
+    if not acquire_lock(mode, ttl=lock_ttl):
         held = lock_status()["holder"]
         return {
             "status": "error",
@@ -1197,14 +1232,13 @@ def start(context, mode="run"):
         }
     _clear_cancel()  # a previous run's leftover cancel flag must not preempt this one
 
-    settings = load_settings(context)
     try:
         from . import models_access
 
         resolved = models_access.resolve_models()
         channel_count = len(select_channels(resolved, settings))
     except Exception as exc:
-        release_lock()
+        release_lock(mode)
         log.exception("FAILOVERR %s FAILED", mode)
         return {"status": "error", "message": str(exc)}
 
@@ -1212,7 +1246,7 @@ def start(context, mode="run"):
         try:
             return run_pipeline(context, mode)
         finally:
-            release_lock()
+            release_lock(mode)
             _close_connection()
 
     def background():
@@ -1221,7 +1255,7 @@ def start(context, mode="run"):
         except Exception:  # a background run must never crash silently
             log.exception("FAILOVERR %s FAILED", mode)
         finally:
-            release_lock()
+            release_lock(mode)
             _close_connection()
 
     spawn(background)

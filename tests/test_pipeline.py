@@ -753,6 +753,117 @@ def test_refresh_lock_prevents_a_steal_at_the_original_ttl_deadline():
     assert acquire_lock("preview", now=1000.0 + LOCK_TTL_SECONDS + 1) is True
 
 
+def test_release_lock_no_ops_when_it_no_longer_owns_the_lock():
+    """Regression: release_lock wiped any lock, not just its own.
+
+    A run whose lock was force-cleared (Clear Lock) and then re-acquired by
+    a second run would still call release_lock() on its way out, clearing
+    the SECOND run's lock and letting a third start - the two-runs-at-once
+    hazard the lock exists to prevent. release_lock now checks it still
+    owns the lock (holder matches) before clearing.
+    """
+    acquire_lock("run", now=0.0)
+    release_lock()  # force-clear (the Clear Lock path, holder=None)
+    acquire_lock("reorder_only", now=10.0)
+    # Run A's release_lock("run") must NOT clear B's lock.
+    release_lock("run")
+    assert lock_status()["holder"] == "reorder_only"
+
+
+def test_refresh_lock_no_ops_when_it_no_longer_owns_the_lock():
+    """Regression: refresh_lock bumped any lock's since, not just its own.
+
+    A stale run heartbeating after its lock was cleared and re-acquired
+    would bump the NEW run's since, making the new lock look freshly held
+    by the wrong run. refresh_lock now checks it still owns the lock.
+    """
+    acquire_lock("run", now=0.0)
+    release_lock()
+    acquire_lock("reorder_only", now=10.0)
+    # Run A's refresh_lock("run") must NOT touch B's lock timestamp.
+    refresh_lock("run", now=9999.0)
+    assert lock_status()["holder"] == "reorder_only"
+    assert lock_status()["since"] == 10.0
+
+
+def test_acquire_lock_uses_a_ttl_that_outlives_max_run_minutes():
+    """LOCK_TTL_SECONDS (1800) was shorter than max_run_minutes (3600 default).
+
+    A legitimate run still within its own budget could have its lock
+    auto-stolen by a second acquire_lock partway through. acquire_lock now
+    takes a ttl that outlives the run's budget, and start() passes one that
+    does, so a run within budget is not stealable until past that ttl.
+    """
+    big_ttl = LOCK_TTL_SECONDS + 3600  # a longer-than-default run's ttl
+    acquire_lock("run", now=0.0, ttl=big_ttl)
+    # A second run with the same adaptive ttl can't steal within the budget:
+    # past the old default TTL (1801s) but inside this run's budget (big_ttl).
+    assert acquire_lock("preview", now=LOCK_TTL_SECONDS + 1, ttl=big_ttl) is False
+    # Only past the adaptive ttl is it stealable.
+    assert acquire_lock("preview", now=big_ttl + 1, ttl=big_ttl) is True
+
+
+def test_run_pipeline_heartbeats_the_lock_between_channels(
+    tmp_path, monkeypatch,
+):
+    """The lock heartbeat fired only every 25 probes, never during a reorder_only run.
+
+    reorder_only skips probing entirely, and the 25-probe cadence never
+    fires between channels either, so a non-probing run's lock could go
+    stale and be force-cleared mid-run. The lock now refreshes at every
+    channel boundary and after indexing.
+    """
+    channel_a = types.SimpleNamespace(name="RAI 1")
+    channel_b = types.SimpleNamespace(name="RAI 2")
+    attached = {
+        "RAI 1": [row(1, "IT: RAI 1 HD", "A")],
+        "RAI 2": [row(2, "IT: RAI 2 HD", "A")],
+    }
+    state = _make_state(tmp_path)
+    for rows in attached.values():
+        for r in rows:
+            state.record(r.stream_id, r.url, VALID)
+
+    refreshes = []
+    real_refresh = pipeline_module.refresh_lock
+
+    def counting_refresh(*args, **kwargs):
+        refreshes.append(True)
+        return real_refresh(*args, **kwargs)
+
+    monkeypatch.setattr(pipeline_module, "refresh_lock", counting_refresh)
+    monkeypatch.setattr(
+        pipeline_module, "select_channels",
+        lambda *_a, **_kw: [channel_a, channel_b],
+    )
+    monkeypatch.setattr(
+        pipeline_module, "iter_attached_rows",
+        lambda _r, ch, _s: iter(attached[ch.name]),
+    )
+    monkeypatch.setattr(
+        pipeline_module.State, "load", staticmethod(lambda *_a, **_kw: state)
+    )
+    monkeypatch.setattr(
+        pipeline_module, "report_path", lambda *_a, **_kw: tmp_path / "r.csv"
+    )
+    monkeypatch.setattr(models_access_module, "resolve_models", object)
+    monkeypatch.setattr(pipeline_module, "_close_old_connections", lambda: None)
+    monkeypatch.setattr(pipeline_module, "_close_connection", lambda: None)
+    monkeypatch.setattr(
+        models_access_module, "apply_channel_plan",
+        lambda *_a, **_kw: {"attached": 0, "detached": 0},
+    )
+
+    run_pipeline({"settings": {}}, mode="reorder_only")
+
+    # 1 after-index heartbeat + 2 per-channel heartbeats (reorder_only never
+    # probes, so the 25-probe cadence contributes nothing).
+    assert len(refreshes) == 3, (
+        f"expected 3 lock heartbeats (after-index + 2 channels), "
+        f"got {len(refreshes)}"
+    )
+
+
 def test_lock_is_visible_across_separate_processes():
     """The lock must stop a celery-worker run from overlapping a uwsgi one.
 
@@ -1473,7 +1584,9 @@ def test_probe_candidates_refreshes_the_lock_and_saves_state_every_25_probes(
     saves = []
     refreshes = []
     monkeypatch.setattr(state, "save", lambda: saves.append(True))
-    monkeypatch.setattr(pipeline_module, "refresh_lock", lambda: refreshes.append(True))
+    monkeypatch.setattr(
+        pipeline_module, "refresh_lock", lambda *_a, **_kw: refreshes.append(True)
+    )
     monkeypatch.setattr(pipeline_module, "models_access_save", lambda *_a, **_kw: None)
     monkeypatch.setattr(pipeline_module, "_notify", lambda *_a, **_kw: None)
 
@@ -1519,7 +1632,9 @@ def test_probe_candidates_accumulates_the_heartbeat_cadence_across_channels(
     saves = []
     refreshes = []
     monkeypatch.setattr(state, "save", lambda: saves.append(True))
-    monkeypatch.setattr(pipeline_module, "refresh_lock", lambda: refreshes.append(True))
+    monkeypatch.setattr(
+        pipeline_module, "refresh_lock", lambda *_a, **_kw: refreshes.append(True)
+    )
     monkeypatch.setattr(pipeline_module, "models_access_save", lambda *_a, **_kw: None)
     monkeypatch.setattr(pipeline_module, "_notify", lambda *_a, **_kw: None)
 
