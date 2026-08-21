@@ -84,6 +84,8 @@ class State:
         )
         if verdict == VALID and response_time_ms is not None:
             entry["response_time_ms"] = response_time_ms
+        elif verdict == INVALID:
+            entry.pop("response_time_ms", None)
         self.streams[str(stream_id)] = entry
 
     def failure_count(self, stream_id):

@@ -137,3 +137,10 @@ def test_a_fresh_valid_probe_updates_the_response_time(tmp_path):
     state.record(1, "http://a.example/1.ts", VALID, response_time_ms=350)
     state.record(1, "http://a.example/1.ts", VALID, response_time_ms=120)
     assert state.response_time_ms(1) == 120
+
+
+def test_invalid_verdict_clears_the_stale_response_time(tmp_path):
+    state = State(tmp_path / "state.json")
+    state.record(1, "http://a.example/1.ts", VALID, response_time_ms=350)
+    state.record(1, "http://a.example/1.ts", INVALID)
+    assert state.response_time_ms(1) is None
