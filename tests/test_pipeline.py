@@ -1057,6 +1057,49 @@ def test_probe_candidates_skips_candidates_on_an_already_aborted_provider():
     assert budget.probes == 0, "an aborted provider's candidates must not spend budget"
 
 
+def test_probe_candidates_logs_the_offending_stream_when_a_worker_raises(monkeypatch):
+    """Regression: a probe-worker exception logged with no stream identity.
+
+    `futures` was a plain list with no mapping back to its originating
+    candidate, so with concurrent probes there was no way to tell which
+    stream failed from the log line alone.
+    """
+    settings = load_settings({"settings": {}})
+    state = State(path=pathlib.Path("/nonexistent/does-not-matter.json"))
+    budget = Budget(max_probes=10, max_minutes=60, now_fn=lambda: 0.0)
+    candidate = row(7, "IT: RAI 1 HD", "Zeta")
+
+    class RaisingProber:
+        aborted_providers = set()
+
+        def probe_one(self, *_args, **_kwargs):
+            raise RuntimeError("simulated ffprobe crash")
+
+    monkeypatch.setattr(pipeline_module, "models_access_save", lambda *_a, **_kw: None)
+    monkeypatch.setattr(pipeline_module, "_notify", lambda *_a, **_kw: None)
+
+    captured = {}
+
+    class _Log:
+        def info(self, *_a, **_kw):
+            pass
+
+        def exception(self, msg, *args, **_kw):
+            captured["call"] = (msg, args)
+
+    probed = pipeline_module._probe_candidates(
+        [candidate], state, settings, RaisingProber(), budget,
+        resolved=None, log=_Log(),
+    )
+
+    assert probed == 0, "a raised probe must not count toward the total"
+    assert "call" in captured, "the worker exception must be logged"
+    _msg, args = captured["call"]
+    assert 7 in args, "the offending stream_id must be in the log args"
+    assert "IT: RAI 1 HD" in args, "the offending stream name must be in the log args"
+    assert "Zeta" in args, "the offending provider must be in the log args"
+
+
 def test_probe_candidates_probes_different_providers_concurrently(monkeypatch):
     """Different providers must be probed in parallel (CLAUDE.md §7).
 

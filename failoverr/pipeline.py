@@ -836,12 +836,21 @@ def _probe_candidates(  # noqa: PLR0913, PLR0917 - interface fixed by the task s
     probed = 0
     workers = max(1, int(settings["global_concurrency"]))
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = [pool.submit(work, candidate_row) for candidate_row in to_probe]
-        for future in concurrent.futures.as_completed(futures):
+        future_to_row = {
+            pool.submit(work, candidate_row): candidate_row
+            for candidate_row in to_probe
+        }
+        for future in concurrent.futures.as_completed(future_to_row):
             try:
                 candidate_row, verdict, stats, response_time_ms = future.result()
             except Exception:
-                log.exception("FAILOVERR probe worker raised unexpectedly")
+                candidate_row = future_to_row[future]
+                log.exception(
+                    "FAILOVERR probe worker raised unexpectedly "
+                    "stream=%s name=%r provider=%s",
+                    candidate_row.stream_id, candidate_row.name,
+                    candidate_row.provider_id,
+                )
                 continue
             if _handle_probe_result(
                 candidate_row, verdict, stats, response_time_ms, resolved, state, log,
