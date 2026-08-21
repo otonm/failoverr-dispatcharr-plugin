@@ -50,6 +50,17 @@ def test_number_word_mapping_can_be_disabled():
     assert normalize("IT: Rai Uno", map_number_words=False) == ("rai", "uno")
 
 
+def test_custom_strip_tokens_replace_the_defaults():
+    """Custom tokens are stripped; default tokens are not.
+
+    Every other test passes the default tuple, so the _strip_token_pattern
+    recompilation branch (the one a user's "Quality tokens to ignore" setting
+    actually exercises) is never hit. This test exercises it and confirms
+    custom tokens replace rather than extend the defaults.
+    """
+    assert normalize("IT: RAI 1 FOO HD", strip_tokens=("foo",)) == ("rai", "1", "hd")
+
+
 def test_unknown_token_survives():
     """'sport' is not a quality token and must not be stripped."""
     assert "sport" in normalize("IT: RAI Sport 1 HD")
