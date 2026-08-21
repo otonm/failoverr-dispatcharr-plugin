@@ -29,7 +29,7 @@ class Candidate(NamedTuple):
     name: str
     provider_id: Any
     stats: dict
-    response_time_ms: float = None
+    response_time_ms: float | None = None
 
 
 def _height(stats):

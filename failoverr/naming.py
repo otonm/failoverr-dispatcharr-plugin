@@ -59,7 +59,7 @@ def normalize(name, strip_tokens=DEFAULT_STRIP_TOKENS, map_number_words=True):
 
     pattern = (
         _DEFAULT_TOKEN_PATTERN
-        if strip_tokens is DEFAULT_STRIP_TOKENS
+        if strip_tokens == DEFAULT_STRIP_TOKENS
         else _strip_token_pattern(strip_tokens)
     )
     if pattern is not None:

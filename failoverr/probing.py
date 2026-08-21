@@ -69,7 +69,7 @@ class ProbeResult(NamedTuple):
     verdict: str
     stats: dict
     reason: str
-    response_time_ms: int = None
+    response_time_ms: int | None = None
 
 
 def _fraction(value):

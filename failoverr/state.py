@@ -8,6 +8,7 @@ fresh entries behind, and the next run skips them (spec §4.1).
 Plugin-private bookkeeping lives here and never in Stream.stream_stats.
 """
 
+import contextlib
 import hashlib
 import json
 import logging
@@ -54,8 +55,13 @@ class State:
             {"streams": self.streams, "meta": self.meta}, indent=1, sort_keys=True
         )
         tmp = self.path.with_name(self.path.name + f".tmp{os.getpid()}")
-        tmp.write_text(payload)
-        tmp.replace(self.path)  # atomic
+        try:
+            tmp.write_text(payload)
+            tmp.replace(self.path)  # atomic
+        except Exception:
+            with contextlib.suppress(OSError):
+                tmp.unlink(missing_ok=True)
+            raise
 
     def _entry(self, stream_id):
         return self.streams.get(str(stream_id)) or {}

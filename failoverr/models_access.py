@@ -67,11 +67,6 @@ def _detect_unique_order_constraint(model, order_field):
             and constraint.__class__.__name__ == "UniqueConstraint"
         ):
             return True
-    for field in model._meta.get_fields():
-        if getattr(field, "name", None) == order_field and getattr(
-            field, "unique", False
-        ):
-            return True
     return False
 
 
@@ -108,7 +103,7 @@ def _binary_version(path):
             check=False,
         )
     except (OSError, subprocess.SubprocessError) as exc:
-        return {"path": resolved, "present": False, "error": str(exc)}
+        return {"path": resolved, "present": False, "version": "", "error": str(exc)}
     first_line = (proc.stdout or proc.stderr).splitlines()[:1]
     return {
         "path": resolved,
@@ -217,7 +212,6 @@ def apply_channel_plan(resolved, channel, ordered_ids, detach_ids, dry_run):
         summary = {
             "attached": len(plan["attach"]),
             "detached": len(plan["detach"]),
-            "reordered": len(ordered_ids),
         }
         if dry_run or not plan["orders"]:
             return summary

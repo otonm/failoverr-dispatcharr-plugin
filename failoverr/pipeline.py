@@ -395,7 +395,7 @@ def run_preview(context):
     """Read-only. Match and order from cached probe data, write a CSV."""
     from . import models_access
 
-    log = context.get("logger", logger)
+    log = context.get("logger") or logger
     settings = load_settings(context)
     resolved = models_access.resolve_models()
     state = State.load(STATE_PATH)
@@ -1078,12 +1078,12 @@ def _close_connection():
     connection.close()
 
 
-def run_pipeline(context, mode="run"):
+def run_pipeline(context, mode="run"):  # noqa: PLR0915 - the whole pipeline in one function
     """Single entry point for Run, Reorder Only, and Probe Only."""
     from . import models_access
     from .probing import Prober
 
-    log = context.get("logger", logger)
+    log = context.get("logger") or logger
     settings = load_settings(context)
     _close_old_connections()
     resolved = models_access.resolve_models()
@@ -1119,83 +1119,84 @@ def run_pipeline(context, mode="run"):
         "attached": 0, "detached": 0, "probed": 0, "channels": 0, "new_found": 0,
     }
 
-    for channel_index, channel in enumerate(channels, start=1):
-        # Heartbeat at every channel boundary, not just every 25 probes: the
-        # 25-probe cadence never fires during a reorder_only run (no probing)
-        # or between channels, so without this the lock could go stale during
-        # a non-probing phase and be force-cleared mid-run.
-        refresh_lock(mode)
-        if _check_cancel_between_channels(budget, log, mode, channel):
-            break
+    try:
+        for channel_index, channel in enumerate(channels, start=1):
+            # Heartbeat at every channel boundary, not just every 25 probes: the
+            # 25-probe cadence never fires during a reorder_only run (no probing)
+            # or between channels, so without this the lock could go stale during
+            # a non-probing phase and be force-cleared mid-run.
+            refresh_lock(mode)
+            if _check_cancel_between_channels(budget, log, mode, channel):
+                break
 
-        matched, attached_ids, candidates = _channel_candidates(
-            mode, channel, index, resolved, settings
-        )
-        on_probe = _start_channel_progress(
-            mode, totals, channel_index, channels_total, channel, streams_total,
-            matched, attached_ids,
-        )
-
-        if mode != "reorder_only":
-            totals["probed"] += _probe_candidates(
-                candidates, state, settings, prober, budget, resolved, log,
-                probed_so_far=totals["probed"], progress_cb=on_probe, mode=mode,
+            matched, attached_ids, candidates = _channel_candidates(
+                mode, channel, index, resolved, settings
+            )
+            on_probe = _start_channel_progress(
+                mode, totals, channel_index, channels_total, channel, streams_total,
+                matched, attached_ids,
             )
 
-        if mode == "probe_only":
+            if mode != "reorder_only":
+                totals["probed"] += _probe_candidates(
+                    candidates, state, settings, prober, budget, resolved, log,
+                    probed_so_far=totals["probed"], progress_cb=on_probe, mode=mode,
+                )
+
+            if mode == "probe_only":
+                totals["channels"] += 1
+                continue
+
+            if _budget_exhausted_mid_channel(budget, log, mode, channel):
+                break
+
+            ordered, detach = plan_channel(
+                attached_ids, candidates, state,
+                settings["removal_failure_threshold"],
+                settings["max_streams_per_channel"],
+                settings["order_strategy"], settings["codec_priority"],
+                settings["response_time_bucket_ms"],
+                settings["rank_by_resolution"], settings["rank_by_response_time"],
+                settings["rank_by_codec"], settings["rank_by_fps"],
+                settings["rank_by_bitrate"],
+            )
+            if mode == "reorder_only":
+                # Reorder Only never detaches. plan_channel's removal branch
+                # reads a cross-run failure counter that may have accumulated
+                # over prior Probe Only runs; a truncated/failed attached
+                # stream just keeps its old order and stays attached instead.
+                detach = []
+            if not ordered:
+                log.info("FAILOVERR %s: %s matched nothing, left alone",
+                         mode, channel.name)
+                continue
+
+            summary = models_access.apply_channel_plan(
+                resolved, channel, ordered, detach, settings["dry_run"]
+            )
+            totals["attached"] += summary["attached"]
+            totals["detached"] += summary["detached"]
             totals["channels"] += 1
-            continue
 
-        if _budget_exhausted_mid_channel(budget, log, mode, channel):
-            break
-
-        ordered, detach = plan_channel(
-            attached_ids, candidates, state,
-            settings["removal_failure_threshold"],
-            settings["max_streams_per_channel"],
-            settings["order_strategy"], settings["codec_priority"],
-            settings["response_time_bucket_ms"],
-            settings["rank_by_resolution"], settings["rank_by_response_time"],
-            settings["rank_by_codec"], settings["rank_by_fps"],
-            settings["rank_by_bitrate"],
-        )
-        if mode == "reorder_only":
-            # Reorder Only never detaches. plan_channel's removal branch
-            # reads a cross-run failure counter that may have accumulated
-            # over prior Probe Only runs; a truncated/failed attached
-            # stream just keeps its old order and stays attached instead.
-            detach = []
-        if not ordered:
-            log.info("FAILOVERR %s: %s matched nothing, left alone",
-                     mode, channel.name)
-            continue
-
-        summary = models_access.apply_channel_plan(
-            resolved, channel, ordered, detach, settings["dry_run"]
-        )
-        totals["attached"] += summary["attached"]
-        totals["detached"] += summary["detached"]
-        totals["channels"] += 1
-
-        lookup = {row.stream_id: row for row in candidates}
-        for position, stream_id in enumerate(ordered):
-            row = lookup.get(stream_id)
-            rows.append(_report_row(
-                channel, position, stream_id, row, state,
-                "keep" if stream_id in attached_ids else "attach",
-            ))
-        rows.extend(
-            _report_row(channel, "", stream_id, None, state, "detach")
-            for stream_id in detach
-        )
-
-    state.meta.update({
-        "last_run": time.time(),
-        "last_mode": mode,
-        "degraded_providers": sorted(str(p) for p in prober.aborted_providers),
-        "budget_stop": budget.reason,
-    })
-    state.save()
+            lookup = {row.stream_id: row for row in candidates}
+            for position, stream_id in enumerate(ordered):
+                row = lookup.get(stream_id)
+                rows.append(_report_row(
+                    channel, position, stream_id, row, state,
+                    "keep" if stream_id in attached_ids else "attach",
+                ))
+            rows.extend(
+                _report_row(channel, "", stream_id, None, state, "detach")
+                for stream_id in detach
+            )
+    finally:
+        state.meta.update({
+            "last_run": time.time(),
+            "last_mode": mode,
+            "degraded_providers": sorted(str(p) for p in prober.aborted_providers),
+            "budget_stop": budget.reason,
+        })
+        state.save()
 
     path = write_report(rows, report_path(mode))
     status, verb = _run_outcome(budget)
@@ -1213,7 +1214,7 @@ def run_pipeline(context, mode="run"):
 
 def start(context, mode="run"):
     """Acquire the lock and run, inline for small jobs, backgrounded otherwise."""
-    log = context.get("logger", logger)
+    log = context.get("logger") or logger
     settings = load_settings(context)
     # The lock's TTL must outlive a legitimate run, not just the default 30
     # minutes: max_run_minutes defaults to 60, and a run within its budget

@@ -683,7 +683,7 @@ class Plugin:
 
     def run(self, action, params=None, context=None):
         context = context or {}
-        log = context.get("logger", logger)
+        log = context.get("logger") or logger
         log.info("FAILOVERR %s START", action)
         _log_report(log, action, "settings", context.get("settings", {}))
         handlers = {
@@ -808,19 +808,19 @@ class Plugin:
     def _stop(self, params, context):
         from . import pipeline
 
-        context.get("logger", logger).info("FAILOVERR stop requested by user")
+        (context.get("logger") or logger).info("FAILOVERR stop requested by user")
         return pipeline.stop_run()
 
     def _clear_lock(self, params, context):
         from . import pipeline
 
-        context.get("logger", logger).info("FAILOVERR lock cleared by user")
+        (context.get("logger") or logger).info("FAILOVERR lock cleared by user")
         return pipeline.clear_lock()
 
     def _clear_state(self, params, context):
         from . import pipeline
 
-        context.get("logger", logger).info("FAILOVERR state cleared by user")
+        (context.get("logger") or logger).info("FAILOVERR state cleared by user")
         return pipeline.clear_state()
 
     def _show_status(self, params, context):
@@ -850,7 +850,7 @@ class Plugin:
         global _scheduler  # noqa: PLW0603 - module-level handle set by _ensure_scheduler
         from . import scheduling
 
-        log = (context or {}).get("logger", logger)
+        log = (context or {}).get("logger") or logger
         log.info("FAILOVERR scheduler stop (disable/delete/reload)")
         try:
             with _scheduler_guard:
