@@ -84,6 +84,21 @@ def test_out_of_range_field_raises_instead_of_silently_never_matching(expression
         matches_cron(expression, at(2026, 8, 19, 4, 0))
 
 
+def test_zero_step_raises_value_error_not_zero_division():
+    """A zero step must surface as the documented ValueError, not a ZeroDivisionError.
+
+    The ZeroDivisionError leaks past matches_cron's ``except ValueError`` and
+    crashes the caller instead of the documented "invalid cron expression" path.
+    """
+    with pytest.raises(ValueError, match="invalid cron expression"):
+        matches_cron("*/0 4 * * *", at(2026, 8, 19, 4, 0))
+
+
+def test_negative_step_raises_value_error():
+    with pytest.raises(ValueError, match="invalid cron expression"):
+        matches_cron("*/-1 4 * * *", at(2026, 8, 19, 4, 0))
+
+
 def test_unknown_timezone_falls_back_to_utc_without_raising():
     """A missing timezone database must not break the rest of the plugin."""
     assert resolve_timezone("Not/AZone") is not None

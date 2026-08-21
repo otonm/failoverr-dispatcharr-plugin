@@ -70,6 +70,8 @@ def _field_matches(spec, value, minimum, maximum):
         if "/" in part:
             part, _, raw_step = part.partition("/")  # noqa: PLW2901
             step = int(raw_step)
+            if step < 1:
+                raise ValueError(f"cron step {step} in {spec!r} must be at least 1")
             has_step = True
             part = part or "*"  # noqa: PLW2901
         if part == "*":
