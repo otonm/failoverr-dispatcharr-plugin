@@ -167,6 +167,12 @@ class Scheduler:
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=CHECK_INTERVAL_SECONDS + 5)
+            if self._thread.is_alive():
+                logger.warning(
+                    "FAILOVERR scheduler stop timed out; a callback run is "
+                    "still in progress"
+                )
+                return
         logger.info("FAILOVERR scheduler stopped")
 
     def _loop(self):

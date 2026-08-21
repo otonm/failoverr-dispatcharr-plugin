@@ -1,4 +1,5 @@
 import datetime
+import logging
 import sys
 import types
 
@@ -106,6 +107,26 @@ def test_stop_joins_the_thread_before_returning():
     scheduler.stop()
 
     assert scheduler._thread.is_alive() is False
+
+
+def test_stop_warns_instead_of_claiming_success_when_the_join_times_out(caplog):
+    """A stuck callback must not be logged as a clean "scheduler stopped"."""
+    scheduler = Scheduler("* * * * *", "UTC", callback=lambda: None)
+
+    class _StuckThread:
+        def join(self, timeout=None):
+            pass
+
+        def is_alive(self):
+            return True
+
+    scheduler._thread = _StuckThread()
+
+    with caplog.at_level(logging.INFO, logger="failoverr"):
+        scheduler.stop()
+
+    assert "timed out" in caplog.text
+    assert "scheduler stopped" not in caplog.text
 
 
 # --- django-celery-beat integration -----------------------------------------
