@@ -233,6 +233,62 @@ def test_every_result_carries_a_reason():
         assert result.reason
 
 
+# --- URL scheme allow-list (security) ---------------------------------------
+
+
+def test_probe_rejects_a_file_url_before_calling_ffprobe():
+    """A file:// URL must never reach ffprobe's argv (local filesystem access)."""
+    called = []
+    result = probe(
+        "file:///etc/passwd", "ffprobe", 15,
+        runner=fake_runner(0, ffprobe_json([VIDEO, AUDIO]), record=called),
+    )
+    assert result.verdict == INCONCLUSIVE
+    assert not called, "file:// URL must not reach the ffprobe runner"
+
+
+def test_probe_rejects_a_concat_url_before_calling_ffprobe():
+    """concat: is ffmpeg's own protocol — must not reach argv."""
+    called = []
+    result = probe(
+        "concat:1.ts|2.ts", "ffprobe", 15,
+        runner=fake_runner(0, ffprobe_json([VIDEO, AUDIO]), record=called),
+    )
+    assert result.verdict == INCONCLUSIVE
+    assert not called, "concat: URL must not reach the ffprobe runner"
+
+
+def test_probe_rejects_a_leading_dash_url():
+    """A URL starting with - could be read as a flag by ffprobe."""
+    called = []
+    result = probe(
+        "-something", "ffprobe", 15,
+        runner=fake_runner(0, ffprobe_json([VIDEO, AUDIO]), record=called),
+    )
+    assert result.verdict == INCONCLUSIVE
+    assert not called, "leading-dash URL must not reach the ffprobe runner"
+
+
+def test_is_blank_rejects_a_file_url():
+    """file:// must not reach ffmpeg either."""
+    called = []
+    assert is_blank(
+        "file:///etc/passwd", "ffmpeg", 5,
+        runner=fake_runner(0, "", BLACK_STDERR, record=called),
+    ) is False
+    assert not called, "file:// URL must not reach the ffmpeg runner"
+
+
+def test_probe_allows_an_http_url():
+    """A valid http URL must still reach the runner."""
+    calls = []
+    probe(
+        "http://p.example/1.ts", "ffprobe", 15,
+        runner=fake_runner(0, ffprobe_json([VIDEO, AUDIO]), record=calls),
+    )
+    assert len(calls) == 1
+
+
 # --- Invocation and blank detection -----------------------------------------
 
 

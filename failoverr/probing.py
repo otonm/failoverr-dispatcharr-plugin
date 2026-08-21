@@ -200,7 +200,29 @@ def run_command(argv, timeout):
     return proc.returncode, proc.stdout or "", proc.stderr or ""
 
 
+# Stream URLs come verbatim from third-party M3U playlists. Without an
+# allow-list, a compromised entry could point ffprobe/ffmpeg at the local
+# filesystem (file://), internal concat/subfile protocols, or be read as a
+# flag (leading dash). Only network streaming schemes are permitted.
+_ALLOWED_SCHEMES = frozenset({
+    "http", "https", "rtmp", "rtmps", "rtsp", "rtsps",
+    "udp", "rtp", "srt",
+})
+
+
+def _validate_url(url):
+    if not url or url.startswith("-"):
+        return False
+    if "://" not in url:
+        return False
+    return url.split("://", 1)[0].lower() in _ALLOWED_SCHEMES
+
+
 def probe(url, ffprobe_path, timeout, runner=run_command):
+    if not _validate_url(url):
+        return ProbeResult(
+            INCONCLUSIVE, {}, f"url scheme not allowed: {url[:80]}",
+        )
     argv = [
         ffprobe_path,
         "-v", "error",
@@ -230,6 +252,8 @@ def is_blank(url, ffmpeg_path, seconds, runner=run_command):
 
     Fails open: any error at all returns False, leaving the stream valid.
     """
+    if not _validate_url(url):
+        return False
     seconds = max(1.0, float(seconds or 1))
     argv = [
         ffmpeg_path,
