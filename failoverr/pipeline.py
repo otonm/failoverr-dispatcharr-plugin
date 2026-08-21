@@ -232,6 +232,11 @@ def load_settings(context):
         try:
             settings[key] = int(float(raw[key]))
         except (TypeError, ValueError, OverflowError):
+            logger.warning(
+                "FAILOVERR setting %r=%r is not a valid number; "
+                "using default %r",
+                key, raw[key], _DEFAULTS[key],
+            )
             settings[key] = _DEFAULTS[key]
     for key in _BOOL_KEYS:
         settings[key] = _to_bool(raw[key])

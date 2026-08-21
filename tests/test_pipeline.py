@@ -320,6 +320,26 @@ def test_load_settings_falls_back_to_default_on_an_overflowing_number():
     assert settings["max_streams_per_channel"] == 10
 
 
+def test_load_settings_logs_when_a_bad_number_falls_back_to_default(caplog):
+    """Regression: a failed coercion used to fall back to default silently.
+
+    A value that failed coercion used to fall back silently, so a typo was
+    invisible in docker logs - only the raw form value was logged
+    (Plugin.run), not the fact that a default was substituted for it.
+    """
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="failoverr"):
+        settings = load_settings({"settings": {"max_streams_per_channel": "1e400"}})
+
+    assert settings["max_streams_per_channel"] == 10
+    matched = [
+        r for r in caplog.records
+        if "max_streams_per_channel" in r.message and "1e400" in r.message
+    ]
+    assert matched, caplog.records
+
+
 def test_load_settings_coerces_boolean_strings():
     """bool("false") is True in plain Python - this must not leak through."""
     settings = load_settings({"settings": {
