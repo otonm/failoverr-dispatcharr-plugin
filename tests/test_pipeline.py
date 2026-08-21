@@ -310,6 +310,16 @@ def test_load_settings_coerces_numeric_strings():
     assert settings["probe_ttl_hours"] == 12
 
 
+def test_load_settings_falls_back_to_default_on_an_overflowing_number():
+    """Regression: OverflowError.
+
+    A settings-form value like "1e400" raises OverflowError, not
+    TypeError/ValueError - it must fall back, not crash every action.
+    """
+    settings = load_settings({"settings": {"max_streams_per_channel": "1e400"}})
+    assert settings["max_streams_per_channel"] == 10
+
+
 def test_load_settings_coerces_boolean_strings():
     """bool("false") is True in plain Python - this must not leak through."""
     settings = load_settings({"settings": {

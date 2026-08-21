@@ -231,7 +231,7 @@ def load_settings(context):
     for key in _INT_KEYS:
         try:
             settings[key] = int(float(raw[key]))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             settings[key] = _DEFAULTS[key]
     for key in _BOOL_KEYS:
         settings[key] = _to_bool(raw[key])
