@@ -415,23 +415,10 @@ def run_preview(context):
 
     rows = []
     for channel in channels:
-        tokens = normalize(
-            channel.name or "",
-            strip_tokens=settings["strip_tokens"],
-            map_number_words=settings["map_number_words"],
+        matched, attached_ids, candidates = _channel_candidates(
+            "run", channel, index, resolved, settings,
         )
-        matched = find_matches(
-            tokens, index,
-            mode=settings["match_mode"],
-            threshold=settings["fuzzy_threshold"],
-        )
-        current = attached_rows(resolved, channel)
-        attached_ids = {stream_id for stream_id, _ in current}
         matched_ids = {row.stream_id for row in matched}
-        by_id = {row.stream_id: row for row in matched}
-        for row in iter_attached_rows(resolved, channel, settings):
-            by_id.setdefault(row.stream_id, row)
-        candidates = list(by_id.values())
 
         ordered, detach = plan_channel(
             attached_ids, candidates, state,
@@ -969,8 +956,9 @@ def _channel_candidates(mode, channel, index, resolved, settings):
     """Build the matched + already-attached candidate set for one channel.
 
     The candidate set requirements 3 and 5 share (CLAUDE.md §6 step 5) -
-    shared by run_pipeline's main loop and _count_stale_candidates' pre-pass
-    so the two can never drift apart on what counts as a candidate.
+    shared by run_pipeline's main loop, _count_stale_candidates' pre-pass,
+    and run_preview, so the three can never drift apart on what counts as a
+    candidate (preview must show what a run would actually produce).
     """
     tokens = normalize(
         channel.name or "", strip_tokens=settings["strip_tokens"],

@@ -618,6 +618,68 @@ def test_clear_state_succeeds_when_the_lock_is_only_stale(tmp_path, monkeypatch)
     assert result["status"] == "ok"
 
 
+# --- run_preview (Preview action) -------------------------------------------
+
+
+def test_run_preview_assembles_matched_and_attached_candidates_via_the_shared_merge(
+    tmp_path, monkeypatch,
+):
+    """Regression: run_preview hand-copied _channel_candidates' merge logic.
+
+    A future change to the matched+attached candidate assembly could be
+    applied to run_pipeline's copy and missed in run_preview's, so Preview
+    could show a plan Run doesn't actually produce. run_preview now calls
+    _channel_candidates, so the two share one merge. This proves an
+    attached-but-not-matched stream (3) still reaches the candidate set and
+    shows up in the preview - the exact merge rule the duplication risked
+    drifting on.
+    """
+    channel = types.SimpleNamespace(name="RAI 1")
+    pool = [
+        row(1, "IT: RAI 1 HD", "A"),
+        row(2, "IT: RAI 1 4K", "B"),
+        row(4, "IT: RAI 1 FHD", "C"),
+    ]
+    attached_not_matched = row(3, "IT: RAI 3 HD", "A")  # name doesn't reduce to rai/1
+    state = _make_state(tmp_path)
+    state.record(1, pool[0].url, VALID)
+    state.record(2, pool[1].url, VALID)
+    state.record(4, pool[2].url, INVALID)  # matched but not attached: would be probed
+
+    monkeypatch.setattr(models_access_module, "resolve_models", object)
+    monkeypatch.setattr(pipeline_module, "iter_pool", lambda *_a, **_kw: iter(pool))
+    monkeypatch.setattr(
+        pipeline_module, "select_channels", lambda *_a, **_kw: [channel]
+    )
+    monkeypatch.setattr(
+        pipeline_module, "attached_rows", lambda *_a, **_kw: [(3, 0)]
+    )
+    monkeypatch.setattr(
+        pipeline_module, "iter_attached_rows",
+        lambda *_a, **_kw: iter([attached_not_matched]),
+    )
+    monkeypatch.setattr(
+        pipeline_module.State, "load", staticmethod(lambda *_a, **_kw: state)
+    )
+    monkeypatch.setattr(
+        pipeline_module, "report_path", lambda *_a, **_kw: tmp_path / "preview.csv"
+    )
+
+    result = pipeline_module.run_preview({"settings": {}})
+
+    assert result["status"] == "ok"
+    assert result["channels"] == 1
+    with pathlib.Path(result["report"]).open(newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    actions = {r["stream"]: r["action"] for r in rows}
+    # The attached-but-not-matched stream 3 reached the candidate set via the
+    # shared merge and is kept - the rule the duplicated copy risked dropping.
+    assert actions.get("IT: RAI 3 HD") == "keep"
+    # Matched-but-invalid stream 4 is labelled "would be probed", not attached.
+    assert actions.get("IT: RAI 1 FHD") == "matched - would be probed"
+    assert actions.get("IT: RAI 1 HD") == "attach"
+
+
 def test_refresh_lock_prevents_a_steal_at_the_original_ttl_deadline():
     """Finding: a long run must keep its own lock fresh.
 
