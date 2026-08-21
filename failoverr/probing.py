@@ -254,11 +254,14 @@ PROVIDER_ABORT_MINIMUM = 5
 def should_abort_provider(verdicts):
     """Determine if a provider should be aborted based on its probing verdicts.
 
-    Returns True when a provider has produced enough verdicts, all of them bad.
+    Returns True when a provider's most recent PROVIDER_ABORT_MINIMUM verdicts
+    are all bad. Windowed to the tail rather than the whole run's history, so
+    one early success can't permanently disable the breaker against later
+    degradation (e.g. rate-limiting after hundreds of prior successes).
     """
     if len(verdicts) < PROVIDER_ABORT_MINIMUM:
         return False
-    return all(v != VALID for v in verdicts)
+    return all(v != VALID for v in verdicts[-PROVIDER_ABORT_MINIMUM:])
 
 
 class Prober:

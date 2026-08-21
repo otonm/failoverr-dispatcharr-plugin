@@ -373,6 +373,12 @@ def test_a_single_success_prevents_abort():
     assert should_abort_provider([INCONCLUSIVE] * 9 + [VALID]) is False
 
 
+def test_an_early_success_does_not_permanently_disable_the_breaker():
+    """A provider degrading later (rate-limited after early hits) must still trip."""
+    verdicts = [VALID] + [INVALID] * 20
+    assert should_abort_provider(verdicts) is True
+
+
 def test_per_provider_concurrency_is_never_exceeded():
     live = {"A": 0}
     peak = {"A": 0}
