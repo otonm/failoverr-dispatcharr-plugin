@@ -1456,6 +1456,7 @@ def test_probe_candidates_probes_different_providers_concurrently(monkeypatch):
     peak = {"n": 0}
     lock = threading.Lock()
     release = threading.Event()
+    started = threading.Event()
 
     class SlowProber:
         aborted_providers = set()
@@ -1464,6 +1465,8 @@ def test_probe_candidates_probes_different_providers_concurrently(monkeypatch):
             with lock:
                 live["n"] += 1
                 peak["n"] = max(peak["n"], live["n"])
+                if peak["n"] >= 2:
+                    started.set()
             release.wait(timeout=2)
             with lock:
                 live["n"] -= 1
@@ -1487,7 +1490,7 @@ def test_probe_candidates_probes_different_providers_concurrently(monkeypatch):
 
     thread = threading.Thread(target=run)
     thread.start()
-    time.sleep(0.2)  # let the pool reach steady-state concurrency
+    assert started.wait(timeout=2), "the pool must reach concurrent execution"
     release.set()
     thread.join(timeout=2)
 

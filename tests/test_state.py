@@ -159,3 +159,17 @@ def test_invalid_verdict_clears_the_stale_response_time(tmp_path):
     state.record(1, "http://a.example/1.ts", VALID, response_time_ms=350)
     state.record(1, "http://a.example/1.ts", INVALID)
     assert state.response_time_ms(1) is None
+
+
+def test_a_zero_response_time_is_stored_not_treated_as_missing(tmp_path):
+    """Regression: 0 is falsy but not None - it must not be discarded.
+
+    The e6f8a30 bug one layer up (pipeline._report_row) rendered 0ms as
+    blank because ``if response_time_ms:`` is falsy for 0. The state layer
+    uses ``is not None``, so 0 is stored correctly - but this test pins
+    that contract at the state layer too.
+    """
+    state = State(tmp_path / "state.json")
+    state.record(1, "http://a.example/1.ts", VALID, response_time_ms=0)
+    assert state.response_time_ms(1) == 0
+    assert state.response_time_ms(1) is not None

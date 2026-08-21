@@ -88,13 +88,14 @@ def test_error_result_logs_failed_not_completed(monkeypatch):
     assert "FAILOVERR diagnose COMPLETED" not in log.lines
 
 
-def test_secret_settings_are_not_logged():
+@pytest.mark.parametrize("key", ["password", "secret", "api_key"])
+def test_secret_settings_are_not_logged(key):
     log = FakeLogger()
     Plugin().run(
-        "no_such_action", {}, {"logger": log, "settings": {"password": "hunter2"}}
+        "no_such_action", {}, {"logger": log, "settings": {key: "hunter2"}}
     )
     assert "hunter2" not in "\n".join(log.lines)
-    assert "FAILOVERR no_such_action settings.password = ***" in log.lines
+    assert f"FAILOVERR no_such_action settings.{key} = ***" in log.lines
 
 
 @pytest.mark.parametrize("action_id", [

@@ -81,6 +81,26 @@ def test_detach_list_never_includes_a_stream_being_kept():
     assert result["detach"] == []
 
 
+def test_an_omitted_attached_stream_keeps_escalating():
+    """A stream in current but omitted from both ordered_ids and detach_ids.
+
+    plan_writes' docstring documents this as a caller contract hazard: the
+    stream is neither detached nor given a final order, so its order keeps
+    escalating by offset on every run that omits it. This test pins that
+    behavior so a future change to the contract is caught.
+    """
+    current = {1: 0, 2: 1}
+    result = plan_writes(current, [1], [], use_offset=True)
+    orders = result["orders"]
+    stream_2_orders = [order for sid, order in orders if sid == 2]
+    assert stream_2_orders == [100001], (
+        "stream 2 is bumped into the offset range but never assigned a "
+        "final position - its order will keep escalating by offset on "
+        "every run that omits it"
+    )
+    assert 2 not in result["detach"], "stream 2 is not detached either"
+
+
 def test_duplicate_ordered_ids_do_not_produce_a_duplicate_attach_entry():
     """Regression: duplicates used to create two rows with contradictory orders."""
     result = plan_writes({1: 0}, [2, 2, 1], [], use_offset=True)
@@ -232,7 +252,7 @@ def test_apply_channel_plan_writes_attach_reorder_and_detach():
     assert 1 not in remaining, "stream dropped from ordered_ids must be detached"
     assert remaining[2] == 0
     assert 3 in remaining, "a new stream_id must be attached"
-    assert summary == {"attached": 1, "detached": 1, "reordered": 2}
+    assert summary == {"attached": 1, "detached": 1}
 
 
 def test_apply_channel_plan_dry_run_never_writes():

@@ -71,8 +71,8 @@ def test_garbage_values_do_not_raise():
     assert quality_key(
         {
             "resolution": "unknown",
-            "fps": "n/a",
-            "bitrate_kbps": None,
+            "source_fps": "n/a",
+            "video_bitrate": None,
             "video_codec": None,
         }
     ) == quality_key({})
