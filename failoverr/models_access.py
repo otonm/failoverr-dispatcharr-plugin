@@ -1,8 +1,10 @@
 """All ORM access and runtime field-name resolution.
 
-Dispatcharr's model field names vary between versions. Nothing here
-hardcodes one; every name is resolved at runtime and failure names what
-IS available so a mismatch is diagnosable from the error alone.
+Dispatcharr's model field names vary between versions. The order and
+provider-link fields are resolved at runtime via resolve_field(), and
+failure names what IS available so a mismatch is diagnosable from the
+error alone. The through-model's own channel/stream FK names are NOT
+resolved this way - they're assumed to be `channel`/`stream_id`.
 """
 
 import dataclasses
