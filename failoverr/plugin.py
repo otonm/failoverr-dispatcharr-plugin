@@ -738,12 +738,11 @@ class Plugin:
             .values_list("stream_stats", flat=True)
             .iterator(chunk_size=500)
         ):
-            if not isinstance(stats, dict):
-                continue
-            key_counts.update(stats.keys())
-            if len(samples) < _STATS_SAMPLES:
-                samples.append(stats)
             sampled += 1
+            if isinstance(stats, dict):
+                key_counts.update(stats.keys())
+                if len(samples) < _STATS_SAMPLES:
+                    samples.append(stats)
             if sampled >= _STATS_SCAN_LIMIT:
                 break
 
