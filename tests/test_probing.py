@@ -437,3 +437,33 @@ def test_cooldown_is_applied_between_probes_on_one_provider():
     prober.probe_one("A", "u1")
     prober.probe_one("A", "u2")
     assert slept == [2, 2]
+
+
+def test_aborting_a_provider_logs_the_breaker_trip(caplog):
+    """Regression: the provider-abort decision fired with no log line.
+
+    The highest-impact decision in the module (stop probing a provider
+    mid-run) used to fire with no log line at all - the provider showed up
+    only in the run's final 'DEGRADED' marker, not in docker logs per-trip,
+    and without naming which provider went bad.
+    """
+    import logging
+
+    def always_bad(_url, _ffprobe, _timeout):
+        return ProbeResult(INVALID, {}, "dead")
+
+    prober = Prober(
+        "ffprobe", 15, per_account=1, global_limit=4, cooldown=0,
+        probe_fn=always_bad, sleep_fn=lambda _s: None,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="failoverr"):
+        for i in range(5):
+            prober.probe_one("Acme", f"u{i}")
+
+    assert "Acme" in prober.aborted_providers
+    matched = [
+        r for r in caplog.records
+        if "Acme" in r.message and "aborted" in r.message
+    ]
+    assert matched, caplog.records

@@ -6,6 +6,7 @@ comment before changing anything here.
 """
 
 import json
+import logging
 import re
 import subprocess
 import threading
@@ -14,6 +15,8 @@ from collections import defaultdict
 from typing import NamedTuple
 
 from .state import INCONCLUSIVE, INVALID, VALID
+
+_log = logging.getLogger("failoverr")
 
 # Checked FIRST. A provider returning a 403 error page also makes ffprobe
 # report "Invalid data found", so an invalid-first check would classify a
@@ -309,4 +312,8 @@ class Prober:
             verdicts.append(result.verdict)
             if should_abort_provider(verdicts):
                 self.aborted_providers.add(provider_id)
+                _log.warning(
+                    "FAILOVERR provider %s aborted: last %d probes all bad",
+                    provider_id, PROVIDER_ABORT_MINIMUM,
+                )
         return result
