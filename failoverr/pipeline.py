@@ -879,6 +879,40 @@ def _handle_probe_result(  # noqa: PLR0913, PLR0917 - one call site, _probe_cand
     return True
 
 
+def _check_cancel_between_channels(budget, log, mode, channel):
+    """Stop check run before any work starts on the next channel.
+
+    Catches Stop pressed between channels - including for reorder_only,
+    which never calls _probe_candidates and so never touches budget.allow()
+    on its own.
+    """
+    if not cancel_requested():
+        return False
+    budget.canceled = True
+    budget.reason = budget.reason or "canceled by user"
+    log.info(
+        "FAILOVERR %s stopping early before channel %r: %s",
+        mode, channel.name, budget.reason,
+    )
+    return True
+
+
+def _budget_exhausted_mid_channel(budget, log, mode, channel):
+    """Stop/budget check run after probing, before this channel's writes.
+
+    Catches Stop pressed (or the probe/time budget running out) partway
+    through this channel's own probe batch, so a truncated probe pass
+    never gets committed via apply_channel_plan.
+    """
+    if not budget.reason:
+        return False
+    log.info(
+        "FAILOVERR %s stopping early before writing channel %r: %s",
+        mode, channel.name, budget.reason,
+    )
+    return True
+
+
 def _run_outcome(budget):
     """Decide the run's final verdict: CANCELED beats INTERRUPTED beats COMPLETED."""
     if budget.canceled:
@@ -1038,6 +1072,9 @@ def run_pipeline(context, mode="run"):
     }
 
     for channel_index, channel in enumerate(channels, start=1):
+        if _check_cancel_between_channels(budget, log, mode, channel):
+            break
+
         matched, attached_ids, candidates = _channel_candidates(
             mode, channel, index, resolved, settings
         )
@@ -1055,6 +1092,9 @@ def run_pipeline(context, mode="run"):
         if mode == "probe_only":
             totals["channels"] += 1
             continue
+
+        if _budget_exhausted_mid_channel(budget, log, mode, channel):
+            break
 
         ordered, detach = plan_channel(
             attached_ids, candidates, state,

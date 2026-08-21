@@ -699,6 +699,66 @@ def test_run_pipeline_reports_canceled_when_the_cancel_flag_is_set(
     assert result["probed"] == 0, "canceled before the first probe was spent"
 
 
+def test_cancel_mid_run_stops_writes_for_remaining_channels(tmp_path, monkeypatch):
+    """Blocker regression: Stop must halt attach/detach/reorder, not just probing.
+
+    Two channels; cancel_requested() flips True only once channel 1's
+    apply_channel_plan has run, simulating Stop pressed mid-run. Channel 2
+    must never reach apply_channel_plan.
+    """
+    channel_a = types.SimpleNamespace(name="RAI 1")
+    channel_b = types.SimpleNamespace(name="RAI 2")
+    attached = {
+        "RAI 1": [row(1, "IT: RAI 1 HD", "A")],
+        "RAI 2": [row(2, "IT: RAI 2 HD", "A")],
+    }
+    state = _make_state(tmp_path)
+    state.record(1, attached["RAI 1"][0].url, VALID)
+    state.record(2, attached["RAI 2"][0].url, VALID)
+
+    monkeypatch.setattr(
+        pipeline_module, "select_channels",
+        lambda *_a, **_kw: [channel_a, channel_b],
+    )
+    monkeypatch.setattr(
+        pipeline_module, "attached_rows",
+        lambda _resolved, ch: [
+            (r.stream_id, i) for i, r in enumerate(attached[ch.name])
+        ],
+    )
+    monkeypatch.setattr(
+        pipeline_module, "iter_attached_rows",
+        lambda _resolved, ch, _settings: iter(attached[ch.name]),
+    )
+    monkeypatch.setattr(
+        pipeline_module.State, "load", staticmethod(lambda *_a, **_kw: state)
+    )
+    monkeypatch.setattr(
+        pipeline_module, "report_path", lambda mode: tmp_path / f"{mode}.csv"
+    )
+    monkeypatch.setattr(models_access_module, "resolve_models", object)
+    monkeypatch.setattr(pipeline_module, "_close_old_connections", lambda: None)
+    monkeypatch.setattr(pipeline_module, "_close_connection", lambda: None)
+
+    apply_calls = []
+    canceled = {"flag": False}
+
+    def fake_apply(resolved, ch, ordered, detach, dry_run):  # noqa: ARG001
+        apply_calls.append(ch.name)
+        canceled["flag"] = True  # Stop pressed right after channel 1's write
+        return {"attached": 0, "detached": 0}
+
+    monkeypatch.setattr(models_access_module, "apply_channel_plan", fake_apply)
+    monkeypatch.setattr(pipeline_module, "cancel_requested", lambda: canceled["flag"])
+
+    result = run_pipeline({"settings": {}}, mode="reorder_only")
+
+    assert apply_calls == ["RAI 1"], (
+        "Stop pressed after channel 1 must skip channel 2's destructive writes"
+    )
+    assert result["status"] == "canceled"
+
+
 def test_run_pipeline_reports_interrupted_when_a_budget_is_exhausted(
     tmp_path, monkeypatch
 ):
