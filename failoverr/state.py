@@ -10,6 +10,7 @@ Plugin-private bookkeeping lives here and never in Stream.stream_stats.
 
 import hashlib
 import json
+import logging
 import os
 import pathlib
 import time
@@ -19,6 +20,8 @@ INVALID = "invalid"
 INCONCLUSIVE = "inconclusive"
 
 DEFAULT_PATH = "/data/failoverr/state.json"
+
+log = logging.getLogger("failoverr")
 
 
 def url_hash(url):
@@ -36,8 +39,12 @@ class State:
         path = pathlib.Path(path)
         try:
             data = json.loads(path.read_text())
-        except (OSError, ValueError):
-            # Missing or truncated: start clean rather than brick the plugin.
+        except (OSError, ValueError) as exc:
+            # Missing or truncated: start clean rather than brick the plugin -
+            # but log it so silent corruption is distinguishable from a
+            # genuine first run (the failure counters it resets are what keep
+            # a flaky stream attached).
+            log.warning("FAILOVERR state %s unreadable (%s); starting clean", path, exc)
             return cls(path)
         return cls(path, data.get("streams") or {}, data.get("meta") or {})
 

@@ -109,6 +109,21 @@ def test_load_of_a_corrupt_file_gives_empty_state_without_raising(tmp_path):
     assert State.load(path).failure_count(1) == 0
 
 
+def test_load_of_a_corrupt_file_logs_the_reset(tmp_path, caplog):
+    """Regression: silent corruption reset every failure counter with no trace.
+
+    Indistinguishable from a genuine first run - the counters it silently
+    drops are what keep a flaky stream attached.
+    """
+    import logging
+
+    path = tmp_path / "state.json"
+    path.write_text('{"streams": {"1": {"fail')
+    with caplog.at_level(logging.WARNING, logger="failoverr"):
+        State.load(path)
+    assert any("unreadable" in r.message for r in caplog.records), caplog.records
+
+
 def test_url_hash_is_stable_and_distinguishing():
     assert url_hash(URL) == url_hash(URL)
     assert url_hash(URL) != url_hash(URL + "?token=2")
