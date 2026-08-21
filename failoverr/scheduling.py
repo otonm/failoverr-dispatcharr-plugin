@@ -66,9 +66,11 @@ def _field_matches(spec, value, minimum, maximum):
         if not part:
             raise ValueError(f"empty cron field component in {spec!r}")
         step = 1
+        has_step = False
         if "/" in part:
             part, _, raw_step = part.partition("/")  # noqa: PLW2901
             step = int(raw_step)
+            has_step = True
             part = part or "*"  # noqa: PLW2901
         if part == "*":
             low, high = minimum, maximum
@@ -76,7 +78,17 @@ def _field_matches(spec, value, minimum, maximum):
             raw_low, _, raw_high = part.partition("-")
             low, high = int(raw_low), int(raw_high)
         else:
-            low = high = int(part)
+            low = int(part)
+            # "N/M" (a start value plus a step, no explicit range) means
+            # "every M-th value from N up to the field's max" in real cron -
+            # not the single value N with the step silently dropped.
+            high = maximum if has_step else low
+        out_of_domain = not (minimum <= low <= maximum and minimum <= high <= maximum)
+        if low > high or out_of_domain:
+            raise ValueError(
+                f"cron field component {part!r} in {spec!r} is out of range "
+                f"[{minimum}, {maximum}]"
+            )
         if low <= value <= high and (value - low) % step == 0:
             return True
     return False

@@ -64,6 +64,25 @@ def test_malformed_expressions_raise_value_error(expression):
         matches_cron(expression, at(2026, 8, 19, 4, 0))
 
 
+@pytest.mark.parametrize("minute,expected", [(0, True), (15, True), (30, True),
+                                             (45, True), (7, False), (16, False)])
+def test_step_values_with_an_explicit_start_still_step(minute, expected):
+    """"0/15" must mean every 15th minute from 0, not only minute 0 itself."""
+    assert matches_cron("0/15 * * * *", at(2026, 8, 19, 4, minute)) is expected
+
+
+@pytest.mark.parametrize("expression", [
+    "60 * * * *",   # minute out of range
+    "0 24 * * *",   # hour out of range
+    "0 4 32 * *",   # day out of range
+    "0 4 * 13 *",   # month out of range
+    "0 4 10-5 * *",  # reversed range
+])
+def test_out_of_range_field_raises_instead_of_silently_never_matching(expression):
+    with pytest.raises(ValueError):  # noqa: PT011 - every case here is a bad cron field
+        matches_cron(expression, at(2026, 8, 19, 4, 0))
+
+
 def test_unknown_timezone_falls_back_to_utc_without_raising():
     """A missing timezone database must not break the rest of the plugin."""
     assert resolve_timezone("Not/AZone") is not None
