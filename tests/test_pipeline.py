@@ -269,6 +269,64 @@ def test_write_report_with_no_rows_still_writes_a_header(tmp_path):
     assert "channel" in pathlib.Path(path).read_text()
 
 
+def test_write_report_prunes_old_reports_down_to_max_reports(tmp_path):
+    """Regression: exports accumulated one file per run with no cleanup.
+
+    An unattended cron deployment (one run/day by default) used to leave one
+    CSV in /data/exports per run forever - unbounded disk growth with no
+    rotation, retention limit, or cleanup anywhere. write_report now prunes
+    the directory down to MAX_REPORTS after each write.
+    """
+    import os
+    import time
+
+    from failoverr.pipeline import MAX_REPORTS
+
+    exports = tmp_path / "exports"
+    exports.mkdir()
+    # Seed more reports than the cap, each one second older than the next so
+    # the mtime sort is deterministic. Seed mtimes are in the past so the
+    # freshly-written report below is the newest of all.
+    base = time.time() - 20000
+    for i in range(MAX_REPORTS + 5):
+        p = exports / f"failoverr-run-{i:04d}.csv"
+        p.write_text("old")
+        os.utime(p, (base + i, base + i))
+
+    newest = exports / "failoverr-run-newest.csv"
+    write_report(
+        [{"channel": "X", "position": 0, "stream": "s", "provider": "A",
+          "verdict": "valid", "resolution": "", "codec": "", "action": "keep"}],
+        newest,
+    )
+
+    remaining = sorted(exports.glob("failoverr-*.csv"))
+    assert len(remaining) == MAX_REPORTS, (
+        f"rotation must prune down to {MAX_REPORTS}, found {len(remaining)}"
+    )
+    assert newest in remaining, "the report just written must survive rotation"
+    # The oldest 6 seeds (the first-seeded, lowest mtimes) are the ones pruned.
+    assert not (exports / "failoverr-run-0000.csv").exists()
+    assert not (exports / "failoverr-run-0005.csv").exists()
+
+
+def test_write_report_rotation_leaves_unrelated_files_alone(tmp_path):
+    """Only failoverr-*.csv files are pruned; other files in the dir survive."""
+    from failoverr.pipeline import MAX_REPORTS
+
+    exports = tmp_path / "exports"
+    exports.mkdir()
+    unrelated = exports / "not-a-failoverr-report.csv"
+    unrelated.write_text("keep me")
+
+    for i in range(MAX_REPORTS + 2):
+        (exports / f"failoverr-run-{i:04d}.csv").write_text("old")
+
+    write_report([], exports / "failoverr-run-newest.csv")
+
+    assert unrelated.exists(), "rotation must not touch non-report files"
+
+
 def test_report_path_is_version_independent_and_well_formed():
     """Regression: this used to call datetime.UTC, a Python 3.11+ attribute."""
     path = report_path("preview")

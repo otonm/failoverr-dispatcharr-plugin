@@ -5,6 +5,7 @@ section touch nothing but plain data so they can be tested offline.
 """
 
 import concurrent.futures
+import contextlib
 import csv
 import datetime
 import fcntl
@@ -35,6 +36,11 @@ REPORT_COLUMNS = [
     "channel", "position", "stream", "provider", "verdict",
     "resolution", "codec", "response_time_ms", "action",
 ]
+
+# Most recent reports to keep in EXPORT_DIR; older ones are pruned after each
+# write so an unattended cron deployment (one run/day by default) can't grow
+# the exports directory without bound.
+MAX_REPORTS = 100
 
 _DEFAULTS = {
     "dry_run": True,
@@ -263,7 +269,33 @@ def write_report(rows, path):
         writer.writeheader()
         for row in rows:
             writer.writerow({column: row.get(column, "") for column in REPORT_COLUMNS})
+    _rotate_reports(path.parent)
     return str(path)
+
+
+def _rotate_reports(directory, pattern="failoverr-*.csv", keep=MAX_REPORTS):
+    """Prune old exports so EXPORT_DIR can't grow without bound.
+
+    Best-effort: a stat/unlink failure (permissions, a concurrent cleaner)
+    must never break a run - the report was already written, so the worst
+    case is a few stale files lingering, not a crashed run. Only files
+    matching the report pattern are touched, so unrelated files in the
+    directory (or test fixtures under a monkeypatched path) survive.
+    """
+    directory = pathlib.Path(directory)
+    if not directory.is_dir():
+        return
+    try:
+        reports = sorted(
+            directory.glob(pattern),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+    except OSError:
+        return
+    for stale in reports[keep:]:
+        with contextlib.suppress(OSError):
+            stale.unlink(missing_ok=True)
 
 
 def report_path(action):
