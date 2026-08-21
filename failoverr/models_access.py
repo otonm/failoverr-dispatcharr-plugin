@@ -199,22 +199,26 @@ def apply_channel_plan(resolved, channel, ordered_ids, detach_ids, dry_run):
     link_model = resolved.channel_stream_model
     order_field = resolved.order_field
 
-    current = {
-        link.stream_id: getattr(link, order_field)
-        for link in link_model.objects.filter(channel=channel)
-    }
-    plan = plan_writes(
-        current, ordered_ids, detach_ids, resolved.has_unique_order_constraint
-    )
-    summary = {
-        "attached": len(plan["attach"]),
-        "detached": len(plan["detach"]),
-        "reordered": len(ordered_ids),
-    }
-    if dry_run or not plan["orders"]:
-        return summary
-
+    # Reading current state and writing the plan must be one atomic,
+    # row-locked operation - otherwise a concurrent manual Dispatcharr edit
+    # between the read and the write gets silently overwritten by a plan
+    # computed from a stale snapshot.
     with transaction.atomic():
+        current = {
+            link.stream_id: getattr(link, order_field)
+            for link in link_model.objects.select_for_update().filter(channel=channel)
+        }
+        plan = plan_writes(
+            current, ordered_ids, detach_ids, resolved.has_unique_order_constraint
+        )
+        summary = {
+            "attached": len(plan["attach"]),
+            "detached": len(plan["detach"]),
+            "reordered": len(ordered_ids),
+        }
+        if dry_run or not plan["orders"]:
+            return summary
+
         # Placeholder orders for new rows must be disjoint from every value
         # the order pass below might use, including rewrite_plan's bump
         # range — see placeholder_orders(). The order pass right after
