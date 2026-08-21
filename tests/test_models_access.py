@@ -244,3 +244,52 @@ def test_apply_channel_plan_dry_run_never_writes():
     assert [row.stream_id for row in link_model.rows] == [1], (
         "dry_run must never attach, reorder, or detach"
     )
+
+
+# --- save_stream_stats -----------------------------------------------------
+
+
+def test_save_stream_stats_logs_when_the_stream_was_deleted_mid_run(
+    monkeypatch, caplog,
+):
+    """Regression: a deleted Stream row dropped its probe stats with no trace.
+
+    A probe whose Stream row was deleted during the run used to drop its
+    freshly-measured stats with zero trace - indistinguishable from a
+    successful write, and the only path that silently wastes a probe.
+    """
+    import logging
+
+    # save_stream_stats lazily imports django.utils.timezone; Django isn't
+    # installed in this env, so stub it. The deleted-stream path returns
+    # before touching timezone, but the import still runs.
+    monkeypatch.setitem(
+        sys.modules, "django.utils",
+        types.SimpleNamespace(timezone=types.SimpleNamespace(now=lambda: 0)),
+    )
+
+    class _DeletedQuerySet:
+        def filter(self, **_kwargs):
+            return self
+
+        def first(self):
+            return None
+
+        def update(self, **_kwargs):
+            raise AssertionError("must not write stats for a deleted stream")
+
+    class _StreamModel:
+        objects = _DeletedQuerySet()
+
+    resolved = types.SimpleNamespace(stream_model=_StreamModel())
+
+    with caplog.at_level(logging.INFO, logger="failoverr"):
+        from failoverr.models_access import save_stream_stats
+
+        save_stream_stats(resolved, 42, {"video_codec": "hevc"})
+
+    matched = [
+        r for r in caplog.records
+        if "deleted mid-run" in r.message and "42" in r.message
+    ]
+    assert matched, caplog.records

@@ -8,10 +8,13 @@ resolved this way - they're assumed to be `channel`/`stream_id`.
 """
 
 import dataclasses
+import logging
 import shutil
 import subprocess
 
 from .ordering import rewrite_plan
+
+logger = logging.getLogger("failoverr")
 
 ORDER_FIELD_CANDIDATES = ["order", "position", "priority", "sort_order"]
 PROVIDER_FIELD_CANDIDATES = ["m3u_account", "m3u_source", "account", "source"]
@@ -252,6 +255,9 @@ def save_stream_stats(resolved, stream_id, stats):
 
     stream = resolved.stream_model.objects.filter(id=stream_id).first()
     if stream is None:
+        logger.info(
+            "FAILOVERR stream %s deleted mid-run; dropped probe stats", stream_id,
+        )
         return
     existing = stream.stream_stats if isinstance(stream.stream_stats, dict) else {}
     resolved.stream_model.objects.filter(id=stream_id).update(
