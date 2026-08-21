@@ -744,8 +744,8 @@ def _notify(payload):
         from core.utils import send_websocket_update
 
         send_websocket_update("updates", "update", payload)
-    except Exception:  # noqa: BLE001, S110 - notifications must never break a run
-        pass
+    except Exception:  # notifications must never break a run - but leave a trace
+        logger.debug("FAILOVERR progress notification failed", exc_info=True)
 
 
 def _select_probe_batch(  # noqa: PLR0913, PLR0917 - mirrors _probe_candidates' interface

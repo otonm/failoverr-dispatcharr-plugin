@@ -1385,3 +1385,20 @@ def test_gevent_patched_is_false_without_gevent_installed():
     """
     assert pipeline_module._gevent_patched() is False
     assert pipeline_module.execution_model() == "daemon thread"
+
+
+def test_notify_leaves_a_trace_when_the_websocket_update_fails(caplog):
+    """Regression: a bare `pass` left a notification failure with no trace.
+
+    A recurring best-effort notification failure left zero trace. It must at
+    least log at debug so a recurring send_websocket_update failure is
+    diagnosable from the log.
+    """
+    import logging
+
+    with caplog.at_level(logging.DEBUG, logger="failoverr"):
+        pipeline_module._notify({"type": "failoverr"})
+
+    assert any(
+        "progress notification failed" in r.message for r in caplog.records
+    ), caplog.records
