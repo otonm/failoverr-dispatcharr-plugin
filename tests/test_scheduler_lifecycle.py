@@ -156,6 +156,34 @@ def test_malformed_cron_does_not_raise_in_the_celery_beat_path(monkeypatch, capl
     assert any("not armed" in r.message for r in caplog.records), caplog.records
 
 
+def test_celery_beat_path_logs_when_the_schedule_is_armed(monkeypatch, caplog):
+    """Regression: the celery-beat success path armed with no confirmation.
+
+    The celery-beat success path armed the schedule with no confirmation
+    anywhere - only the failure path logged, so a user who successfully
+    armed a schedule got no log trace of it. (The thread path already logs
+    via Scheduler.start().)
+    """
+    monkeypatch.setattr("failoverr.scheduling.celery_beat_available", lambda: True)
+    monkeypatch.setattr("failoverr.scheduling.sync_celery_beat", lambda *_a, **_k: None)
+    context = {
+        "settings": {
+            "schedule_enabled": True,
+            "cron_expression": "0 4 * * *",
+            "timezone": "UTC",
+        }
+    }
+
+    with caplog.at_level(logging.INFO, logger="failoverr"):
+        result = _ensure_scheduler(context)
+
+    assert result is None
+    assert any(
+        "celery-beat schedule armed" in r.message and "0 4 * * *" in r.message
+        for r in caplog.records
+    ), caplog.records
+
+
 def test_stop_disables_celery_beat(monkeypatch):
     calls = []
     monkeypatch.setattr(

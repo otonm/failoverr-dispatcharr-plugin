@@ -70,6 +70,11 @@ def _ensure_scheduler(context):
                     "FAILOVERR celery-beat schedule not armed: bad cron_expression %r",
                     settings["cron_expression"],
                 )
+                return None
+            logger.info(
+                "FAILOVERR celery-beat schedule armed: %r (enabled=%s)",
+                settings["cron_expression"], settings["schedule_enabled"],
+            )
             return None
 
         if not settings["schedule_enabled"]:
