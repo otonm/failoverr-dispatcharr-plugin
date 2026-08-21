@@ -652,9 +652,6 @@ def test_run_preview_assembles_matched_and_attached_candidates_via_the_shared_me
         pipeline_module, "select_channels", lambda *_a, **_kw: [channel]
     )
     monkeypatch.setattr(
-        pipeline_module, "attached_rows", lambda *_a, **_kw: [(3, 0)]
-    )
-    monkeypatch.setattr(
         pipeline_module, "iter_attached_rows",
         lambda *_a, **_kw: iter([attached_not_matched]),
     )
@@ -678,6 +675,65 @@ def test_run_preview_assembles_matched_and_attached_candidates_via_the_shared_me
     # Matched-but-invalid stream 4 is labelled "would be probed", not attached.
     assert actions.get("IT: RAI 1 FHD") == "matched - would be probed"
     assert actions.get("IT: RAI 1 HD") == "attach"
+
+
+def test_channel_candidates_reads_the_link_table_once_per_channel_per_pass(
+    tmp_path, monkeypatch,
+):
+    """Regression: the attached-link table was queried up to 4x per channel.
+
+    _channel_candidates used to call both attached_rows() and
+    iter_attached_rows() - two queries for data available in one - and was
+    itself called twice per channel (the stale-count pre-pass plus the main
+    loop): 4 link-table reads per channel per run. attached_rows is gone now
+    and attached_ids is derived from iter_attached_rows' StreamRows, so the
+    link table is read once per pass: 2 per channel (pre-pass + main), not 4.
+    """
+    channel_a = types.SimpleNamespace(name="RAI 1")
+    channel_b = types.SimpleNamespace(name="RAI 2")
+    attached = {
+        "RAI 1": [row(1, "IT: RAI 1 HD", "A")],
+        "RAI 2": [row(2, "IT: RAI 2 HD", "A")],
+    }
+    state = _make_state(tmp_path)
+    for rows in attached.values():
+        for r in rows:
+            state.record(r.stream_id, r.url, VALID)  # fresh: no probing
+
+    calls = {"n": 0}
+
+    def counting_iter(_resolved, ch, _settings):
+        calls["n"] += 1
+        return iter(attached[ch.name])
+
+    monkeypatch.setattr(
+        pipeline_module, "select_channels",
+        lambda *_a, **_kw: [channel_a, channel_b],
+    )
+    monkeypatch.setattr(pipeline_module, "iter_attached_rows", counting_iter)
+    monkeypatch.setattr(pipeline_module, "iter_pool", lambda *_a, **_kw: iter([]))
+    monkeypatch.setattr(
+        pipeline_module.State, "load", staticmethod(lambda *_a, **_kw: state)
+    )
+    monkeypatch.setattr(
+        pipeline_module, "report_path", lambda *_a, **_kw: tmp_path / "run.csv"
+    )
+    monkeypatch.setattr(models_access_module, "resolve_models", object)
+    monkeypatch.setattr(pipeline_module, "_close_old_connections", lambda: None)
+    monkeypatch.setattr(pipeline_module, "_close_connection", lambda: None)
+    monkeypatch.setattr(
+        models_access_module, "apply_channel_plan",
+        lambda *_a, **_kw: {"attached": 0, "detached": 0},
+    )
+
+    run_pipeline({"settings": {}}, mode="run")
+
+    # 2 channels x (1 pre-pass + 1 main loop) = 4 link-table reads. The
+    # pre-merge code did attached_rows + iter_attached_rows per pass = 8.
+    assert calls["n"] == 4, (
+        f"link table read {calls['n']} times for 2 channels; expected 4 "
+        "(one per channel per pass), not the pre-merge 8"
+    )
 
 
 def test_refresh_lock_prevents_a_steal_at_the_original_ttl_deadline():
@@ -756,10 +812,10 @@ def test_budget_stops_and_flags_canceled_when_cancel_fn_fires():
 # --- run_pipeline mode-routing ----------------------------------------------
 #
 # run_pipeline touches the Django ORM through a handful of module-level
-# helpers (select_channels, attached_rows, iter_attached_rows, iter_pool).
-# These tests stub those helpers, following the monkeypatch-the-seam pattern
-# already used for Django-touching code in test_diagnose.py and
-# test_models_access.py, so the mode-routing logic can run offline.
+# helpers (select_channels, iter_attached_rows, iter_pool). These tests stub
+# those helpers, following the monkeypatch-the-seam pattern already used for
+# Django-touching code in test_diagnose.py and test_models_access.py, so the
+# mode-routing logic can run offline.
 
 
 def _make_state(tmp_path):
@@ -767,12 +823,8 @@ def _make_state(tmp_path):
 
 
 def _patch_common(monkeypatch, tmp_path, channel, attached, state):
-    orders = [(r.stream_id, i) for i, r in enumerate(attached)]
     monkeypatch.setattr(
         pipeline_module, "select_channels", lambda *_a, **_kw: [channel]
-    )
-    monkeypatch.setattr(
-        pipeline_module, "attached_rows", lambda *_a, **_kw: orders
     )
     monkeypatch.setattr(
         pipeline_module, "iter_attached_rows", lambda *_a, **_kw: iter(attached)
@@ -933,12 +985,6 @@ def test_cancel_mid_run_stops_writes_for_remaining_channels(tmp_path, monkeypatc
     monkeypatch.setattr(
         pipeline_module, "select_channels",
         lambda *_a, **_kw: [channel_a, channel_b],
-    )
-    monkeypatch.setattr(
-        pipeline_module, "attached_rows",
-        lambda _resolved, ch: [
-            (r.stream_id, i) for i, r in enumerate(attached[ch.name])
-        ],
     )
     monkeypatch.setattr(
         pipeline_module, "iter_attached_rows",

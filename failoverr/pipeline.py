@@ -366,16 +366,6 @@ def select_channels(resolved, settings):
     return list(queryset)
 
 
-def attached_rows(resolved, channel):
-    """Return the currently attached streams, in their present failover order."""
-    links = (
-        resolved.channel_stream_model.objects.filter(channel=channel)
-        .select_related("stream")
-        .order_by(resolved.order_field)
-    )
-    return [(link.stream_id, getattr(link, resolved.order_field)) for link in links]
-
-
 def iter_attached_rows(resolved, channel, settings):
     """StreamRows for the streams already attached to this channel.
 
@@ -959,6 +949,10 @@ def _channel_candidates(mode, channel, index, resolved, settings):
     shared by run_pipeline's main loop, _count_stale_candidates' pre-pass,
     and run_preview, so the three can never drift apart on what counts as a
     candidate (preview must show what a run would actually produce).
+
+    One attached-link query (iter_attached_rows), not two: attached_ids is
+    derived from the same StreamRows the candidate set is built from, so the
+    link table is read once per channel per pass, not twice.
     """
     tokens = normalize(
         channel.name or "", strip_tokens=settings["strip_tokens"],
@@ -969,11 +963,11 @@ def _channel_candidates(mode, channel, index, resolved, settings):
         else find_matches(tokens, index, settings["match_mode"],
                           settings["fuzzy_threshold"])
     )
-    current = attached_rows(resolved, channel)
-    attached_ids = {stream_id for stream_id, _ in current}
     by_id = {row.stream_id: row for row in matched}
+    attached_ids = set()
     for row in iter_attached_rows(resolved, channel, settings):
         by_id.setdefault(row.stream_id, row)
+        attached_ids.add(row.stream_id)
     return matched, attached_ids, list(by_id.values())
 
 
