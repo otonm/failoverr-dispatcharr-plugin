@@ -21,7 +21,7 @@ _log = logging.getLogger("failoverr")
 # Checked FIRST. A provider returning a 403 error page also makes ffprobe
 # report "Invalid data found", so an invalid-first check would classify a
 # rate limit as a dead stream and eventually detach a working one.
-INCONCLUSIVE_PATTERNS = [
+_INCONCLUSIVE_PATTERNS = [
     r"timed out",
     r"connection reset",
     r"connection refused",
@@ -47,7 +47,7 @@ INCONCLUSIVE_PATTERNS = [
 
 # Only affirmatively recognised defects. Anything not listed here and not
 # above stays inconclusive.
-INVALID_PATTERNS = [
+_INVALID_PATTERNS = [
     # Anchored to the HTTP context ffmpeg actually emits ("HTTP error 404
     # Not Found" / "Server returned 404 Not Found"). A bare "not found" also
     # matches an unrelated ffmpeg error ("Protocol not found", "Decoder ...
@@ -61,8 +61,8 @@ INVALID_PATTERNS = [
     r"could not find codec parameters",
 ]
 
-_INCONCLUSIVE_RE = re.compile("|".join(INCONCLUSIVE_PATTERNS), re.IGNORECASE)
-_INVALID_RE = re.compile("|".join(INVALID_PATTERNS), re.IGNORECASE)
+_INCONCLUSIVE_RE = re.compile("|".join(_INCONCLUSIVE_PATTERNS), re.IGNORECASE)
+_INVALID_RE = re.compile("|".join(_INVALID_PATTERNS), re.IGNORECASE)
 
 
 class ProbeResult(NamedTuple):
@@ -96,19 +96,19 @@ def _int(value, default=0):
 # noise-dominated rather than measured — a 2-packet sample was observed to
 # spike to 22924 kbps. Leave video_bitrate at 0 rather than persist a
 # misleading number; the next probe gets a fresh shot.
-MIN_PACKETS_FOR_BITRATE_CALC = 30
+_MIN_PACKETS_FOR_BITRATE_CALC = 30
 
 # Seconds of real packet data ffprobe reads for the bitrate fallback, via
 # -read_intervals. Live MPEG-TS/HLS almost never declares bit_rate in its
 # stream or format metadata (that requires a known total duration), so this
 # is the only way to get a real number for it.
-BITRATE_SAMPLE_SECONDS = 5
+_BITRATE_SAMPLE_SECONDS = 5
 
 
 def _packet_video_bitrate_kbps(packets, video_index):
     """Average bitrate over sampled packets for one stream, in kbps."""
     video_packets = [p for p in packets if p.get("stream_index") == video_index]
-    if len(video_packets) < MIN_PACKETS_FOR_BITRATE_CALC:
+    if len(video_packets) < _MIN_PACKETS_FOR_BITRATE_CALC:
         return None
     total_size = sum(_int(p.get("size")) for p in video_packets)
     total_duration = sum(_fraction(p.get("duration_time")) for p in video_packets)
@@ -181,7 +181,7 @@ def classify(returncode, stdout, stderr):  # noqa: PLR0911
 
 
 # A blank verdict requires essentially the whole sample to be black.
-BLANK_FRACTION = 0.9
+_BLANK_FRACTION = 0.9
 _BLACK_DURATION = re.compile(r"black_duration:\s*([0-9.]+)")
 
 
@@ -191,12 +191,16 @@ def run_command(argv, timeout):
     Returns (returncode, stdout, stderr); returncode is None on timeout,
     which classify() reads as inconclusive.
     """
+    _log.debug("FAILOVERR run_command: argv=%s timeout=%s", argv, timeout)
     try:
         proc = subprocess.run(
             argv, capture_output=True, text=True, timeout=timeout, check=False
         )
     except subprocess.TimeoutExpired:
+        _log.debug("FAILOVERR run_command: timeout after %ss", timeout)
         return None, "", ""
+    _log.debug("FAILOVERR run_command: returncode=%s stdout_len=%d stderr_len=%d",
+               proc.returncode, len(proc.stdout or ""), len(proc.stderr or ""))
     return proc.returncode, proc.stdout or "", proc.stderr or ""
 
 
@@ -220,8 +224,9 @@ def _validate_url(url):
 
 def probe(url, ffprobe_path, timeout, runner=run_command):
     if not _validate_url(url):
+        scheme = url.split("://", 1)[0].lower() if "://" in url else "unknown"
         return ProbeResult(
-            INCONCLUSIVE, {}, f"url scheme not allowed: {url[:80]}",
+            INCONCLUSIVE, {}, f"url scheme not allowed: scheme={scheme!r}",
         )
     argv = [
         ffprobe_path,
@@ -230,7 +235,7 @@ def probe(url, ffprobe_path, timeout, runner=run_command):
         "-show_streams",
         "-show_format",
         "-show_packets",
-        "-read_intervals", f"%+{BITRATE_SAMPLE_SECONDS}",
+        "-read_intervals", f"%+{_BITRATE_SAMPLE_SECONDS}",
         "-analyzeduration", "5000000",
         "-probesize", "5000000",
         url,
@@ -243,7 +248,15 @@ def probe(url, ffprobe_path, timeout, runner=run_command):
     elapsed_ms = round((time.monotonic() - started) * 1000)
     result = classify(returncode, stdout, stderr)
     if result.verdict != VALID:
+        _log.debug(
+            "FAILOVERR probe: url=%s verdict=%s reason=%s elapsed_ms=%d",
+            url, result.verdict, result.reason, elapsed_ms,
+        )
         return result
+    _log.debug(
+        "FAILOVERR probe: url=%s verdict=%s reason=%s elapsed_ms=%d",
+        url, result.verdict, result.reason, elapsed_ms,
+    )
     return result._replace(response_time_ms=elapsed_ms)
 
 
@@ -266,29 +279,37 @@ def is_blank(url, ffmpeg_path, seconds, runner=run_command):
     try:
         returncode, _stdout, stderr = runner(argv, seconds * 4 + 10)
         if returncode != 0:
+            _log.debug(
+                "FAILOVERR blank-detect failed open for %s: rc=%s",
+                url, returncode,
+            )
             return False
         black = sum(float(d) for d in _BLACK_DURATION.findall(stderr or ""))
-        return black >= seconds * BLANK_FRACTION
+        return black >= seconds * _BLANK_FRACTION
     except Exception:  # noqa: BLE001
+        _log.debug(
+            "FAILOVERR blank-detect failed open for %s: %s",
+            url, exc_info=True,
+        )
         return False
 
 
 # Never abort a provider on a sample of one: a provider that legitimately
 # carries a single dead stream is not a provider that is down.
-PROVIDER_ABORT_MINIMUM = 5
+_PROVIDER_ABORT_MINIMUM = 5
 
 
 def should_abort_provider(verdicts):
     """Determine if a provider should be aborted based on its probing verdicts.
 
-    Returns True when a provider's most recent PROVIDER_ABORT_MINIMUM verdicts
+    Returns True when a provider's most recent _PROVIDER_ABORT_MINIMUM verdicts
     are all bad. Windowed to the tail rather than the whole run's history, so
     one early success can't permanently disable the breaker against later
     degradation (e.g. rate-limiting after hundreds of prior successes).
     """
-    if len(verdicts) < PROVIDER_ABORT_MINIMUM:
+    if len(verdicts) < _PROVIDER_ABORT_MINIMUM:
         return False
-    return all(v != VALID for v in verdicts[-PROVIDER_ABORT_MINIMUM:])
+    return all(v != VALID for v in verdicts[-_PROVIDER_ABORT_MINIMUM:])
 
 
 class Prober:
@@ -326,9 +347,11 @@ class Prober:
                 "provider aborted this run; existing ranking left untouched",
             )
 
-        with self._global, self._semaphore(provider_id):
+        provider_sem = self._semaphore(provider_id)
+        with self._global, provider_sem:
             result = self.probe_fn(url, self.ffprobe_path, self.timeout)
-            if self.cooldown:
+        if self.cooldown:
+            with provider_sem:
                 self.sleep_fn(self.cooldown)
 
         with self._verdicts_guard:
@@ -338,6 +361,6 @@ class Prober:
                 self.aborted_providers.add(provider_id)
                 _log.warning(
                     "FAILOVERR provider %s aborted: last %d probes all bad",
-                    provider_id, PROVIDER_ABORT_MINIMUM,
+                    provider_id, _PROVIDER_ABORT_MINIMUM,
                 )
         return result

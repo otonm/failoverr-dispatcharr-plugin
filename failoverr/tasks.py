@@ -35,5 +35,7 @@ def scheduled_run():
     from apps.plugins.loader import PluginManager
 
     result = PluginManager.get().run_action(PLUGIN_KEY, "run", {})
-    logger.info("FAILOVERR scheduled_run (celery beat): %s", result)
+    status = result.get("status") if isinstance(result, dict) else None
+    verb = "COMPLETED" if status == "ok" else "FAILED"
+    logger.info("FAILOVERR scheduled_run (celery beat) %s: %s", verb, result)
     return result

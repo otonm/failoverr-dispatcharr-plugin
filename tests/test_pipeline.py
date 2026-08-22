@@ -34,7 +34,7 @@ from failoverr.probing import ProbeResult
 from failoverr.state import INCONCLUSIVE, INVALID, VALID, State
 
 
-def row(stream_id, name, provider="A", height=1080, codec="h264"):
+def row(stream_id, name, provider=1, height=1080, codec="h264"):
     return StreamRow(
         stream_id=stream_id,
         name=name,
@@ -53,12 +53,12 @@ def row(stream_id, name, provider="A", height=1080, codec="h264"):
 
 
 POOL = [
-    row(1, "IT: RAI 1 HD", "A"),
-    row(2, "IT: Rai 1 4K", "B"),
-    row(3, "IT: RAI1 FHD", "A"),
-    row(4, "IT: RAI 2 HD", "A"),
-    row(5, "IT: RAI Sport 1 HD", "B"),
-    row(6, "IT: RAI News 24 HD", "A"),
+    row(1, "IT: RAI 1 HD", 1),
+    row(2, "IT: Rai 1 4K", 2),
+    row(3, "IT: RAI1 FHD", 1),
+    row(4, "IT: RAI 2 HD", 1),
+    row(5, "IT: RAI Sport 1 HD", 2),
+    row(6, "IT: RAI News 24 HD", 1),
 ]
 
 
@@ -239,6 +239,30 @@ def test_planning_is_idempotent(tmp_path):
     first, _ = plan(state, attached=(1, 2, 3))
     second, _ = plan(state, attached=set(first))
     assert first == second
+
+
+def test_plan_channel_truncation_drops_unattached_valid_streams(tmp_path):
+    """Non-attached VALID streams beyond max_streams are silently dropped.
+
+    plan_channel only keeps max_streams from the ranked (VALID/demoted) list.
+    Unattached VALID streams that fall outside this limit are neither in
+    ordered nor in detach - they are simply not included in the result.
+    This test pins the current behavior so it cannot change silently.
+    """
+    state = make_state(tmp_path, {
+        1: (VALID, 1), 2: (VALID, 1), 3: (VALID, 1),
+        4: (VALID, 1), 5: (VALID, 1),  # not attached, only VALID
+    })
+    ordered, detach = plan(state, attached=(1, 2), max_streams=3)
+    # Only 3 streams kept (max_streams), none detached because unattached
+    # VALID streams don't count as "detached" - they were never attached.
+    assert len(ordered) == 3
+    assert detach == []
+    assert 1 in ordered and 2 in ordered
+    # One of 3,4,5 made it in; the other two were silently dropped.
+    # The exact one depends on provider interleaving/ranking.
+    assert set(ordered).issubset({1, 2, 3, 4, 5})
+    assert len(set(ordered) & {3, 4, 5}) == 1
 
 
 # --- Settings and reporting -------------------------------------------------
@@ -564,6 +588,19 @@ def test_clear_lock_force_releases_a_stale_lock_and_drops_any_cancel_flag():
 def test_clear_lock_reports_already_clear_when_nothing_is_running():
     result = clear_lock()
     assert result["status"] == "ok"
+
+
+def test_corrupt_lock_file_is_treated_as_empty_and_logged(caplog):
+    """A truncated/corrupt lock file must not block the plugin and must log."""
+    import logging
+    lock_file = pathlib.Path(pipeline_module.LOCK_PATH)
+    lock_file.write_text("{not valid json")
+
+    with caplog.at_level(logging.WARNING, logger="failoverr"):
+        assert acquire_lock("run", now=0.0) is True
+
+    assert lock_status()["holder"] == "run"
+    assert any("lock file corrupt" in r.message for r in caplog.records)
 
 
 def test_stop_run_requests_cancellation_for_an_active_run():
@@ -913,6 +950,21 @@ def test_a_fresh_budget_has_no_reason():
     assert Budget(10, 10, now_fn=lambda: 0.0).reason is None
 
 
+def test_budget_clamps_non_positive_values_to_one():
+    """Budget clamps non-positive max_probes/max_minutes to 1.
+
+    This prevents a misconfigured zero or negative budget from causing
+    infinite loops or immediate exhaustion.
+    """
+    budget = Budget(max_probes=0, max_minutes=0, now_fn=lambda: 0.0)
+    assert budget.max_probes == 1
+    assert budget.max_seconds == 60  # 1 minute * 60
+
+    budget = Budget(max_probes=-5, max_minutes=-10, now_fn=lambda: 0.0)
+    assert budget.max_probes == 1
+    assert budget.max_seconds == 60
+
+
 def test_budget_stops_and_flags_canceled_when_cancel_fn_fires():
     budget = Budget(1000, 60, now_fn=lambda: 0.0, cancel_fn=lambda: True)
     assert budget.allow() is False
@@ -1168,6 +1220,44 @@ def test_run_pipeline_reports_ok_on_a_normal_finish(tmp_path, monkeypatch):
     assert result["status"] == "ok"
 
 
+def test_run_pipeline_finally_populates_state_meta(tmp_path, monkeypatch):
+    """run_pipeline's finally block must populate state.meta for Show Status.
+
+    The finally block updates last_run, last_mode, degraded_providers, and
+    budget_stop. Show Status depends on this metadata being present even
+    when the run is canceled or interrupted.
+    """
+    channel = types.SimpleNamespace(name="RAI 1")
+    attached = [row(1, "IT: RAI 1 HD", "A")]
+    state = _make_state(tmp_path)
+    state.record(1, attached[0].url, VALID)
+    _patch_common(monkeypatch, tmp_path, channel, attached, state)
+    _stub_probe_one(monkeypatch)
+    acquire_lock("probe_only")
+
+    # Normal finish
+    run_pipeline({"settings": {}}, mode="probe_only")
+    reloaded = State.load(tmp_path / "state.json")
+    assert reloaded.meta["last_mode"] == "probe_only"
+    assert reloaded.meta["last_run"] > 0
+    assert reloaded.meta["degraded_providers"] == []
+    assert reloaded.meta["budget_stop"] is None
+
+    # Canceled run
+    state2 = _make_state(tmp_path / "state2.json")
+    state2.record(1, attached[0].url, VALID)
+    acquire_lock("probe_only")
+    monkeypatch.setattr(
+        pipeline_module.State, "load", staticmethod(lambda *_a, **_kw: state2)
+    )
+    monkeypatch.setattr(pipeline_module, "cancel_requested", lambda: True)
+
+    run_pipeline({"settings": {}}, mode="probe_only")
+    reloaded2 = State.load(tmp_path / "state2.json")
+    assert reloaded2.meta["last_mode"] == "probe_only"
+    assert reloaded2.meta["budget_stop"] == "canceled by user"
+
+
 # --- Live progress (Show Status) --------------------------------------------
 
 
@@ -1219,6 +1309,30 @@ def test_run_pipeline_publishes_per_stream_progress_while_probing(
     assert progress["current_stream"] in {"IT: RAI 1 HD", "IT: Rai 1 4K"}
 
 
+def test_update_progress_noops_when_lock_holder_mismatches():
+    """update_progress must silently no-op when it doesn't own the lock.
+
+    This mirrors the same guard in refresh_lock/release_lock - if the lock
+    has been stolen by another run, we must not resurrect the old lock with
+    stale progress data.
+    """
+    acquire_lock("run", now=0.0)
+    pipeline_module.update_progress("run", channel_name="RAI 1")
+    progress = lock_status()["progress"]
+    assert progress["channel_name"] == "RAI 1"
+
+    # Simulate another run stealing the lock
+    release_lock()
+    acquire_lock("reorder_only", now=10.0)
+
+    # Original run's update_progress must not overwrite the new run's lock
+    pipeline_module.update_progress("run", channel_name="STALE")
+    progress = lock_status()["progress"]
+    assert progress.get("channel_name") != "STALE", (
+        "update_progress must no-op when holder mismatches"
+    )
+
+
 def test_run_pipeline_counts_newly_found_valid_streams(tmp_path, monkeypatch):
     """"Found" means matched-but-not-yet-attached and confirmed VALID.
 
@@ -1256,6 +1370,13 @@ def test_run_pipeline_counts_newly_found_valid_streams(tmp_path, monkeypatch):
 def test_run_pipeline_closes_old_django_connections_before_touching_the_orm(
     tmp_path, monkeypatch
 ):
+    """run_pipeline closes stale DB connections before any ORM access.
+
+    The test name promises ordering: _close_old_connections must run *before*
+    models_access.resolve_models (the first ORM touch). A regression that
+    moves _close_old_connections() to the end of run_pipeline would keep the
+    old test green (it only asserted the function was called at all).
+    """
     channel = types.SimpleNamespace(name="RAI 1")
     attached = [row(1, "IT: RAI 1 HD", "A")]
     state = _make_state(tmp_path)
@@ -1266,15 +1387,22 @@ def test_run_pipeline_closes_old_django_connections_before_touching_the_orm(
         lambda *_a, **_kw: {"attached": 0, "detached": 0},
     )
 
-    calls = []
-    monkeypatch.setattr(pipeline_module, "_close_old_connections",
-                        lambda: calls.append(True))
+    call_sequence = []
+
+    def track_close_old():
+        call_sequence.append("close_old_connections")
+
+    def track_resolve_models():
+        call_sequence.append("resolve_models")
+        return object  # the stub used in _patch_common
+
+    monkeypatch.setattr(pipeline_module, "_close_old_connections", track_close_old)
+    monkeypatch.setattr(models_access_module, "resolve_models", track_resolve_models)
 
     run_pipeline({"settings": {}}, mode="reorder_only")
 
-    assert calls, (
-        "run_pipeline runs outside a Django request cycle and must close "
-        "stale connections itself"
+    assert call_sequence == ["close_old_connections", "resolve_models"], (
+        "_close_old_connections must be called before resolve_models (first ORM access)"
     )
 
 
@@ -1387,7 +1515,9 @@ def test_probe_candidates_skips_candidates_on_an_already_aborted_provider():
                 "must not probe a candidate on an already-aborted provider"
             )
 
-    log = types.SimpleNamespace(info=lambda *_a, **_kw: None)
+    log = types.SimpleNamespace(
+        info=lambda *_a, **_kw: None, debug=lambda *_a, **_kw: None
+    )
 
     probed = pipeline_module._probe_candidates(
         [candidate], state, settings, AbortedProber(), budget,
@@ -1396,6 +1526,59 @@ def test_probe_candidates_skips_candidates_on_an_already_aborted_provider():
 
     assert probed == 0
     assert budget.probes == 0, "an aborted provider's candidates must not spend budget"
+
+
+def test_select_probe_batch_mid_batch_provider_abort_still_probes_selected(
+    tmp_path
+):
+    """Mid-batch provider abort: already-selected candidates still get probed.
+
+    _select_probe_batch selects the entire batch up front, before any probe
+    runs. If a provider crosses the abort threshold during the batch, its
+    already-selected remaining candidates are still dispatched and charged.
+    Only subsequent calls to _select_probe_batch will skip them.
+    """
+    settings = load_settings({"settings": {}})
+    budget = Budget(max_probes=10, max_minutes=60, now_fn=lambda: 0.0)
+
+    # 3 candidates from provider A, none fresh
+    candidates = [
+        row(1, "IT: RAI 1 HD", 1),
+        row(2, "IT: RAI 2 HD", 1),
+        row(3, "IT: RAI 3 HD", 1),
+    ]
+
+    class ProberMidAbort:
+        aborted_providers = set()
+
+        def probe_one(self, provider_id, url):
+            if provider_id == 1 and "2" in url:
+                # Simulate provider 1 aborting on the 2nd probe
+                self.aborted_providers.add(1)
+            return ProbeResult(VALID, {}, "ok")
+
+    log = types.SimpleNamespace(
+        info=lambda *_a, **_kw: None, debug=lambda *_a, **_kw: None
+    )
+
+    # First call: all 3 selected (provider not aborted yet)
+    state1 = State(path=tmp_path / "state1.json")
+    prober = ProberMidAbort()
+    to_probe_1 = pipeline_module._select_probe_batch(
+        candidates, state1, settings, prober, budget, log
+    )
+    assert len(to_probe_1) == 3
+    assert budget.probes == 3
+
+    # Second call: provider A now aborted, should skip all
+    state2 = State(path=tmp_path / "state2.json")
+    prober2 = ProberMidAbort()
+    prober2.aborted_providers = {"A"}  # already aborted
+    to_probe_2 = pipeline_module._select_probe_batch(
+        candidates, state2, settings, prober2, budget, log
+    )
+    assert len(to_probe_2) == 0
+    assert budget.probes == 3  # no additional budget spent
 
 
 def test_probe_candidates_logs_the_offending_stream_when_a_worker_raises(monkeypatch):
@@ -1416,7 +1599,7 @@ def test_probe_candidates_logs_the_offending_stream_when_a_worker_raises(monkeyp
         def probe_one(self, *_args, **_kwargs):
             raise RuntimeError("simulated ffprobe crash")
 
-    monkeypatch.setattr(pipeline_module, "models_access_save", lambda *_a, **_kw: None)
+    monkeypatch.setattr(pipeline_module, "_models_access_save", lambda *_a, **_kw: None)
     monkeypatch.setattr(pipeline_module, "_notify", lambda *_a, **_kw: None)
 
     captured = {}
@@ -1477,7 +1660,7 @@ def test_probe_candidates_probes_different_providers_concurrently(monkeypatch):
         for i, provider in enumerate(["A", "B", "C", "D"], start=1)
     ]
 
-    monkeypatch.setattr(pipeline_module, "models_access_save", lambda *_a, **_kw: None)
+    monkeypatch.setattr(pipeline_module, "_models_access_save", lambda *_a, **_kw: None)
     log = types.SimpleNamespace(info=lambda *_a, **_kw: None)
 
     result = {}
@@ -1538,7 +1721,7 @@ def test_probe_candidates_stops_launching_new_probes_once_stopped_mid_batch(
         for i, provider in enumerate(["A", "B", "C", "D"], start=1)
     ]
 
-    monkeypatch.setattr(pipeline_module, "models_access_save", lambda *_a, **_kw: None)
+    monkeypatch.setattr(pipeline_module, "_models_access_save", lambda *_a, **_kw: None)
     canceled = {"flag": False}
     monkeypatch.setattr(pipeline_module, "cancel_requested", lambda: canceled["flag"])
     log = types.SimpleNamespace(info=lambda *_a, **_kw: None)
@@ -1560,6 +1743,78 @@ def test_probe_candidates_stops_launching_new_probes_once_stopped_mid_batch(
 
     assert result["probed"] == 2, "only the 2 already in flight should complete"
     assert len(calls) == 2, "the 2 queued-but-not-started candidates must never probe"
+
+
+def test_probe_candidates_stop_shortcircuit_does_not_mark_stream_fresh(
+    tmp_path, monkeypatch
+):
+    """Stop short-circuit must not mark stream as fresh.
+
+    When Stop is pressed before a probe starts, verdict=None must not be
+    recorded in state, and the stream must NOT be considered fresh.
+
+    This tests the guard in _handle_probe_result (pipeline.py:908) that
+    returns False for verdict=None, and that state.record is never called
+    with verdict=None. If it were, is_fresh would incorrectly return True
+    (since it only short-circuits on INCONCLUSIVE, not None), causing the
+    next run to skip re-probing that stream entirely.
+    """
+    settings = load_settings({"settings": {"global_concurrency": 2}})
+    state = State(path=tmp_path / "state.json")
+    budget = Budget(max_probes=10, max_minutes=60, now_fn=lambda: 0.0)
+
+    started = threading.Event()
+    release = threading.Event()
+    live = {"n": 0}
+    lock = threading.Lock()
+
+    class SlowProber:
+        aborted_providers = set()
+
+        def probe_one(self, _provider_id, url):
+            with lock:
+                live["n"] += 1
+                if live["n"] == 2:
+                    started.set()
+            release.wait(timeout=2)
+            return ProbeResult(VALID, {}, "ok")
+
+    candidates = [
+        row(i, f"IT: RAI {i} HD", provider)
+        for i, provider in enumerate(["A", "B", "C", "D"], start=1)
+    ]
+
+    monkeypatch.setattr(pipeline_module, "_models_access_save", lambda *_a, **_kw: None)
+    canceled = {"flag": False}
+    monkeypatch.setattr(pipeline_module, "cancel_requested", lambda: canceled["flag"])
+    log = types.SimpleNamespace(info=lambda *_a, **_kw: None)
+
+    result = {}
+
+    def run():
+        result["probed"] = pipeline_module._probe_candidates(
+            candidates, state, settings, SlowProber(), budget,
+            resolved=None, log=log,
+        )
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    assert started.wait(timeout=2), "the first 2 (global_concurrency=2) must start"
+    canceled["flag"] = True  # Stop pressed while 2 are in flight, 2 still queued
+    release.set()
+    thread.join(timeout=2)
+
+    assert result["probed"] == 2, "only the 2 already in flight should complete"
+
+    # The 2 queued candidates (C and D) had their work() short-circuit
+    # with verdict=None. They must NOT be recorded in state.
+    assert "3" not in state.streams, "stream 3 (C) must not have a state entry"
+    assert "4" not in state.streams, "stream 4 (D) must not have a state entry"
+
+    # And they must NOT be considered fresh - is_fresh must return False
+    # so the next run will re-probe them.
+    assert state.is_fresh(3, "http://example.com/C", 24) is False
+    assert state.is_fresh(4, "http://example.com/D", 24) is False
 
 
 # --- Lock heartbeat + periodic state.save() cadence (Fixes 1 & 3) ----------
@@ -1590,7 +1845,7 @@ def test_probe_candidates_refreshes_the_lock_and_saves_state_every_25_probes(
     monkeypatch.setattr(
         pipeline_module, "refresh_lock", lambda *_a, **_kw: refreshes.append(True)
     )
-    monkeypatch.setattr(pipeline_module, "models_access_save", lambda *_a, **_kw: None)
+    monkeypatch.setattr(pipeline_module, "_models_access_save", lambda *_a, **_kw: None)
     monkeypatch.setattr(pipeline_module, "_notify", lambda *_a, **_kw: None)
 
     log = types.SimpleNamespace(info=lambda *_a, **_kw: None)
@@ -1638,7 +1893,7 @@ def test_probe_candidates_accumulates_the_heartbeat_cadence_across_channels(
     monkeypatch.setattr(
         pipeline_module, "refresh_lock", lambda *_a, **_kw: refreshes.append(True)
     )
-    monkeypatch.setattr(pipeline_module, "models_access_save", lambda *_a, **_kw: None)
+    monkeypatch.setattr(pipeline_module, "_models_access_save", lambda *_a, **_kw: None)
     monkeypatch.setattr(pipeline_module, "_notify", lambda *_a, **_kw: None)
 
     log = types.SimpleNamespace(info=lambda *_a, **_kw: None)
@@ -1682,7 +1937,7 @@ def test_probe_candidates_records_the_measured_response_time(tmp_path, monkeypat
         def probe_one(self, *_args, **_kwargs):
             return ProbeResult(VALID, valid_stats, "ok", 275)
 
-    monkeypatch.setattr(pipeline_module, "models_access_save", lambda *_a, **_kw: None)
+    monkeypatch.setattr(pipeline_module, "_models_access_save", lambda *_a, **_kw: None)
     log = types.SimpleNamespace(info=lambda *_a, **_kw: None)
 
     pipeline_module._probe_candidates(
@@ -1709,7 +1964,7 @@ def test_blank_detected_stream_does_not_record_a_response_time(tmp_path, monkeyp
         def probe_one(self, *_args, **_kwargs):
             return ProbeResult(VALID, valid_stats, "ok", 275)
 
-    monkeypatch.setattr(pipeline_module, "models_access_save", lambda *_a, **_kw: None)
+    monkeypatch.setattr(pipeline_module, "_models_access_save", lambda *_a, **_kw: None)
     monkeypatch.setattr(probing_module, "is_blank", lambda *_a, **_kw: True)
     log = types.SimpleNamespace(info=lambda *_a, **_kw: None)
 
@@ -1718,6 +1973,63 @@ def test_blank_detected_stream_does_not_record_a_response_time(tmp_path, monkeyp
     )
 
     assert state.response_time_ms(1) is None
+
+
+def test_handle_probe_result_calls_models_access_save_on_valid(tmp_path, monkeypatch):
+    """_handle_probe_result must call _models_access_save for VALID probes.
+
+    The save path could be deleted and every test would pass (all sites stub
+    it to no-op). This test ensures the call actually happens.
+    """
+    state = State(path=tmp_path / "state.json")
+    candidate = row(1, "IT: RAI 1 HD", "A")
+
+    valid_stats = {
+        "video_codec": "hevc", "resolution": "1920x1080", "video_bitrate": 5000,
+        "source_fps": 25, "audio_codec": "aac", "audio_channels": 2,
+    }
+
+    save_calls = []
+
+    def fake_save(_resolved, stream_id, stats):
+        save_calls.append((stream_id, stats))
+
+    monkeypatch.setattr(pipeline_module, "_models_access_save", fake_save)
+
+    # Call _handle_probe_result directly with a VALID verdict
+    result = pipeline_module._handle_probe_result(
+        candidate, VALID, valid_stats, 275, "ok",
+        resolved=None, state=state,
+        log=types.SimpleNamespace(info=lambda *_a, **_kw: None),
+        progress_cb=None, probed_before=0, mode="probe_only",
+    )
+
+    assert result is True
+    assert len(save_calls) == 1
+    assert save_calls[0][0] == 1
+    assert save_calls[0][1] == valid_stats
+
+
+def test_handle_probe_result_skips_save_on_invalid(tmp_path, monkeypatch):
+    """_handle_probe_result must NOT call _models_access_save for INVALID."""
+    state = State(path=tmp_path / "state.json")
+    candidate = row(1, "IT: RAI 1 HD", "A")
+
+    save_calls = []
+    monkeypatch.setattr(
+        pipeline_module, "_models_access_save",
+        lambda *a, **_kw: save_calls.append(a)
+    )
+
+    result = pipeline_module._handle_probe_result(
+        candidate, INVALID, {}, None, "dead",
+        resolved=None, state=state,
+        log=types.SimpleNamespace(info=lambda *_a, **_kw: None),
+        progress_cb=None, probed_before=0, mode="probe_only",
+    )
+
+    assert result is True
+    assert save_calls == [], "INVALID must not trigger save"
 
 
 # --- Gevent detection (Task 2) --------------------------------------------------

@@ -42,6 +42,14 @@ def test_quality_token_glued_to_a_digit_is_stripped():
     assert normalize("IT: RAI1HD") == ("rai", "1")
 
 
+def test_underscore_separators_are_normalized_before_stripping():
+    r"""Underscore is \w so \b doesn't apply; _NON_ALNUM must run first.
+
+    'RAI_1_HD' -> ('rai', '1') not ('rai', '1', 'hd')
+    """
+    assert normalize("IT: RAI_1_HD") == ("rai", "1")
+
+
 def test_accents_are_folded():
     assert normalize("FR: Canal Plus Café") == ("canal", "plus", "cafe")
 

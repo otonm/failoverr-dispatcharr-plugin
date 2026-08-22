@@ -16,7 +16,7 @@ import pathlib
 import threading
 import time
 from collections import defaultdict
-from typing import Any, NamedTuple
+from typing import NamedTuple
 
 from .naming import DEFAULT_STRIP_TOKENS, normalize
 from .naming import matches as name_matches
@@ -32,7 +32,7 @@ from .state import INCONCLUSIVE, INVALID, VALID, State
 logger = logging.getLogger("failoverr")
 
 EXPORT_DIR = "/data/exports"
-REPORT_COLUMNS = [
+_REPORT_COLUMNS = [
     "channel", "position", "stream", "provider", "verdict",
     "resolution", "codec", "response_time_ms", "action",
 ]
@@ -40,7 +40,7 @@ REPORT_COLUMNS = [
 # Most recent reports to keep in EXPORT_DIR; older ones are pruned after each
 # write so an unattended cron deployment (one run/day by default) can't grow
 # the exports directory without bound.
-MAX_REPORTS = 100
+_MAX_REPORTS = 100
 
 _DEFAULTS = {
     "dry_run": True,
@@ -91,10 +91,31 @@ _FALSE_STRINGS = ("false", "0", "no", "off")
 class StreamRow(NamedTuple):
     stream_id: int
     name: str
-    provider_id: Any
+    provider_id: int | None
     url: str
     stats: dict
     tokens: tuple
+
+
+def _stream_to_row(stream, resolved, settings):
+    """Convert a Django Stream model instance to a StreamRow.
+
+    Shared by iter_pool and iter_attached_rows so the construction logic
+    (isinstance guard + normalize call) exists in one place and cannot drift.
+    """
+    provider = getattr(stream, f"{resolved.provider_field}_id", None)
+    return StreamRow(
+        stream_id=stream.id,
+        name=stream.name or "",
+        provider_id=provider,
+        url=stream.url or "",
+        stats=stream.stream_stats if isinstance(stream.stream_stats, dict) else {},
+        tokens=normalize(
+            stream.name or "",
+            strip_tokens=settings["strip_tokens"],
+            map_number_words=settings["map_number_words"],
+        ),
+    )
 
 
 def build_index(rows):
@@ -265,15 +286,15 @@ def write_report(rows, path):
     path = pathlib.Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=REPORT_COLUMNS)
+        writer = csv.DictWriter(handle, fieldnames=_REPORT_COLUMNS)
         writer.writeheader()
         for row in rows:
-            writer.writerow({column: row.get(column, "") for column in REPORT_COLUMNS})
+            writer.writerow({column: row.get(column, "") for column in _REPORT_COLUMNS})
     _rotate_reports(path.parent)
     return str(path)
 
 
-def _rotate_reports(directory, pattern="failoverr-*.csv", keep=MAX_REPORTS):
+def _rotate_reports(directory, pattern="failoverr-*.csv", keep=_MAX_REPORTS):
     """Prune old exports so EXPORT_DIR can't grow without bound.
 
     Best-effort: a stat/unlink failure (permissions, a concurrent cleaner)
@@ -291,11 +312,27 @@ def _rotate_reports(directory, pattern="failoverr-*.csv", keep=MAX_REPORTS):
             key=lambda p: p.stat().st_mtime,
             reverse=True,
         )
-    except OSError:
+    except OSError as exc:
+        logger.debug(
+            "FAILOVERR report rotation: failed to list directory %s: %s",
+            directory, exc,
+        )
         return
     for stale in reports[keep:]:
-        with contextlib.suppress(OSError):
+        try:
             stale.unlink(missing_ok=True)
+            logger.debug("FAILOVERR report rotation: pruned %s", stale)
+        except OSError as exc:
+            logger.debug(
+                "FAILOVERR report rotation: failed to prune %s: %s", stale, exc
+            )
+    for stale in reports[keep:]:
+        try:
+            stale.unlink(missing_ok=True)
+        except OSError as exc:
+            logger.debug(
+                "FAILOVERR report rotation: failed to prune %s: %s", stale, exc
+            )
 
 
 def report_path(action):
@@ -330,31 +367,60 @@ def _report_row(channel, position, stream_id, row, state, action):  # noqa: PLR0
     }
 
 
+def _build_channel_report_rows(  # noqa: PLR0913, PLR0917
+    channel, ordered, detach, candidates, attached_ids, state
+):
+    """Build report rows for a single channel from its plan.
+
+    Centralizes the report-row logic shared by run_preview and run_pipeline
+    so the two never drift apart (e.g. Preview passing the StreamRow for
+    detach while Run passed None).
+    """
+    rows = []
+    lookup = {row.stream_id: row for row in candidates}
+    for position, stream_id in enumerate(ordered):
+        row = lookup.get(stream_id)
+        rows.append(_report_row(
+            channel, position, stream_id, row, state,
+            "keep" if stream_id in attached_ids else "attach",
+        ))
+    for stream_id in detach:
+        row = lookup.get(stream_id)
+        rows.append(_report_row(channel, "", stream_id, row, state, "detach"))
+    return rows
+
+
+def _plan_channel_args(settings):
+    """Extract the plan_channel arguments from settings.
+
+    Shared by run_preview and run_pipeline so the 11-argument call cannot
+    drift between the two sites.
+    """
+    return (
+        settings["removal_failure_threshold"],
+        settings["max_streams_per_channel"],
+        settings["order_strategy"], settings["codec_priority"],
+        settings["response_time_bucket_ms"],
+        settings["rank_by_resolution"], settings["rank_by_response_time"],
+        settings["rank_by_codec"], settings["rank_by_fps"],
+        settings["rank_by_bitrate"],
+    )
+
+
 def iter_pool(resolved, settings):
     """One streaming pass over the whole Stream pool.
 
-    select_related on the provider FK avoids an N+1; .iterator() keeps a
-    100k-row pool out of memory.
+    We only need the provider_id FK column from the stream row, not the
+    joined provider object. Using only() without select_related avoids the
+    unnecessary JOIN on a 100k-row scan. .iterator() keeps memory bounded.
     """
     queryset = (
-        resolved.stream_model.objects.select_related(resolved.provider_field)
-        .only("id", "name", "url", "stream_stats", resolved.provider_field)
+        resolved.stream_model.objects
+        .only("id", "name", "url", "stream_stats", f"{resolved.provider_field}_id")
         .iterator(chunk_size=2000)
     )
     for stream in queryset:
-        provider = getattr(stream, f"{resolved.provider_field}_id", None)
-        yield StreamRow(
-            stream_id=stream.id,
-            name=stream.name or "",
-            provider_id=provider,
-            url=stream.url or "",
-            stats=stream.stream_stats if isinstance(stream.stream_stats, dict) else {},
-            tokens=normalize(
-                stream.name or "",
-                strip_tokens=settings["strip_tokens"],
-                map_number_words=settings["map_number_words"],
-            ),
-        )
+        yield _stream_to_row(stream, resolved, settings)
 
 
 def select_channels(resolved, settings):
@@ -378,17 +444,7 @@ def iter_attached_rows(resolved, channel, settings):
         .order_by(resolved.order_field)
     )
     for link in links:
-        stream = link.stream
-        yield StreamRow(
-            stream_id=stream.id,
-            name=stream.name or "",
-            provider_id=getattr(stream, f"{resolved.provider_field}_id", None),
-            url=stream.url or "",
-            stats=stream.stream_stats if isinstance(stream.stream_stats, dict) else {},
-            tokens=normalize(stream.name or "",
-                             strip_tokens=settings["strip_tokens"],
-                             map_number_words=settings["map_number_words"]),
-        )
+        yield _stream_to_row(link.stream, resolved, settings)
 
 
 def run_preview(context):
@@ -412,25 +468,12 @@ def run_preview(context):
 
         ordered, detach = plan_channel(
             attached_ids, candidates, state,
-            settings["removal_failure_threshold"],
-            settings["max_streams_per_channel"],
-            settings["order_strategy"], settings["codec_priority"],
-            settings["response_time_bucket_ms"],
-            settings["rank_by_resolution"], settings["rank_by_response_time"],
-            settings["rank_by_codec"], settings["rank_by_fps"],
-            settings["rank_by_bitrate"],
+            *_plan_channel_args(settings),
         )
 
-        lookup = {row.stream_id: row for row in candidates}
-        for position, stream_id in enumerate(ordered):
-            row = lookup.get(stream_id)
-            rows.append(_report_row(
-                channel, position, stream_id, row, state,
-                "keep" if stream_id in attached_ids else "attach",
-            ))
-        for stream_id in detach:
-            row = lookup.get(stream_id)
-            rows.append(_report_row(channel, "", stream_id, row, state, "detach"))
+        rows.extend(_build_channel_report_rows(
+            channel, ordered, detach, candidates, attached_ids, state
+        ))
 
         # Everything matched but not acted on. Until probing exists, this is
         # the whole report: it is what lets the user check that matching
@@ -464,27 +507,29 @@ def run_preview(context):
 # --- Run lock, budgets, background execution --------------------------------
 
 # A stale lock from a killed run must not block the plugin forever.
-LOCK_TTL_SECONDS = 1800
+_LOCK_TTL_SECONDS = 1800
 
 # A file, not an in-memory dict: a scheduled run fires inside the celery
 # worker process while a manual Run fires inside the uwsgi process - two
 # separate OS processes that share no Python memory. flock() around every
 # read-modify-write below is what actually keeps them from stepping on
 # each other; the file's content is just {"holder": ..., "since": ...}.
-LOCK_PATH = "/data/failoverr/run.lock"
+_LOCK_PATH = "/data/failoverr/run.lock"
 
 # Presence-only flag, checked by the running job itself at its next
 # checkpoint (Budget.allow(), the same spot the probe/time budgets are
 # checked). A separate process (Clear Lock, pressed from the UI) can only
 # ask the run to stop cooperatively - it has no way to kill the thread or
 # greenlet actually doing the work.
-CANCEL_PATH = "/data/failoverr/cancel.flag"
+_CANCEL_PATH = "/data/failoverr/cancel.flag"
 
 
 def _open_lock_file():
-    path = pathlib.Path(LOCK_PATH)
+    path = pathlib.Path(_LOCK_PATH)
     path.parent.mkdir(parents=True, exist_ok=True)
-    return path.open("a+")
+    if not path.exists():
+        path.touch()
+    return path.open("r+")
 
 
 def _read_locked(fh):
@@ -492,31 +537,62 @@ def _read_locked(fh):
     raw = fh.read()
     try:
         return json.loads(raw) if raw else {}
-    except ValueError:
+    except ValueError as exc:
+        logger.warning("FAILOVERR lock file corrupt (%s); treating as empty", exc)
         return {}
 
 
 def _write_locked(fh, data):
+    # Write first, then truncate: if a crash occurs mid-write, the file
+    # contains the new data (possibly with old tail) rather than being
+    # left empty. json.loads will fail on the old tail and _read_locked
+    # will log the corruption and treat it as empty, which is safe.
+    payload = json.dumps(data)
     fh.seek(0)
+    fh.write(payload)
     fh.truncate()
-    fh.write(json.dumps(data))
     fh.flush()
     os.fsync(fh.fileno())
 
 
-def acquire_lock(name, now=None, ttl=LOCK_TTL_SECONDS):
+@contextlib.contextmanager
+def _lock_file(exclusive=True):
+    """Context manager for lock file access.
+
+    Args:
+        exclusive: If True, acquire LOCK_EX (write); else LOCK_SH (read).
+
+    """
+    fh = _open_lock_file()
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+        yield fh
+    finally:
+        fcntl.flock(fh, fcntl.LOCK_UN)
+        fh.close()
+
+
+def acquire_lock(name, now=None, ttl=_LOCK_TTL_SECONDS):
     now = time.time() if now is None else now
-    with _open_lock_file() as fh:
-        fcntl.flock(fh, fcntl.LOCK_EX)
-        try:
-            data = _read_locked(fh)
-            holder, since = data.get("holder"), float(data.get("since", 0.0))
-            if holder is not None and (now - since) < ttl:
-                return False
-            _write_locked(fh, {"holder": name, "since": now})
-            return True
-        finally:
-            fcntl.flock(fh, fcntl.LOCK_UN)
+    with _lock_file() as fh:
+        data = _read_locked(fh)
+        holder, since = data.get("holder"), float(data.get("since", 0.0))
+        if holder is not None and (now - since) < ttl:
+            logger.debug(
+                "FAILOVERR acquire_lock: refused for %r "
+                "(held by %r, age %ss < ttl %ss)",
+                name, holder, int(now - since), ttl,
+            )
+            return False
+        if holder is not None:
+            logger.warning(
+                "FAILOVERR lock %r stale (age %ss > ttl %ss); taken by %r",
+                holder, int(now - since), ttl, name,
+            )
+        else:
+            logger.debug("FAILOVERR acquire_lock: acquired by %r (was free)", name)
+        _write_locked(fh, {"holder": name, "since": now})
+        return True
 
 
 def refresh_lock(holder=None, now=None):
@@ -533,16 +609,17 @@ def refresh_lock(holder=None, now=None):
     unconditional - it bumps whichever lock is present.
     """
     now = time.time() if now is None else now
-    with _open_lock_file() as fh:
-        fcntl.flock(fh, fcntl.LOCK_EX)
-        try:
-            data = _read_locked(fh)
-            if holder is not None and data.get("holder") != holder:
-                return
-            data["since"] = now
-            _write_locked(fh, data)
-        finally:
-            fcntl.flock(fh, fcntl.LOCK_UN)
+    with _lock_file() as fh:
+        data = _read_locked(fh)
+        if holder is not None and data.get("holder") != holder:
+            logger.debug(
+                "FAILOVERR refresh_lock: no-op for %r (lock held by %r)",
+                holder, data.get("holder"),
+            )
+            return
+        data["since"] = now
+        _write_locked(fh, data)
+        logger.debug("FAILOVERR refresh_lock: refreshed for %r", holder or "any")
 
 
 def release_lock(holder=None):
@@ -555,14 +632,16 @@ def release_lock(holder=None):
     ``holder=None`` (the default, used by clear_lock and tests) is the
     unconditional force-release path.
     """
-    with _open_lock_file() as fh:
-        fcntl.flock(fh, fcntl.LOCK_EX)
-        try:
-            if holder is not None and _read_locked(fh).get("holder") != holder:
-                return
-            _write_locked(fh, {"holder": None, "since": 0.0})
-        finally:
-            fcntl.flock(fh, fcntl.LOCK_UN)
+    with _lock_file() as fh:
+        data = _read_locked(fh)
+        if holder is not None and data.get("holder") != holder:
+            logger.debug(
+                "FAILOVERR release_lock: no-op for %r (lock held by %r)",
+                holder, data.get("holder"),
+            )
+            return
+        _write_locked(fh, {"holder": None, "since": 0.0})
+        logger.debug("FAILOVERR release_lock: released by %r", holder or "any")
 
 
 def update_progress(holder, **fields):
@@ -573,31 +652,32 @@ def update_progress(holder, **fields):
     than resurrecting a finished/replaced lock with stale progress. Also
     doubles as a heartbeat (bumps "since"), same as refresh_lock().
     """
-    with _open_lock_file() as fh:
-        fcntl.flock(fh, fcntl.LOCK_EX)
-        try:
-            data = _read_locked(fh)
-            if data.get("holder") != holder:
-                return
-            data["since"] = time.time()
-            data["progress"] = fields
-            _write_locked(fh, data)
-        finally:
-            fcntl.flock(fh, fcntl.LOCK_UN)
+    with _lock_file() as fh:
+        data = _read_locked(fh)
+        if data.get("holder") != holder:
+            logger.debug(
+                "FAILOVERR update_progress: no-op for %r (lock held by %r)",
+                holder, data.get("holder"),
+            )
+            return
+        data["since"] = time.time()
+        data["progress"] = fields
+        _write_locked(fh, data)
+        logger.debug("FAILOVERR update_progress: updated for %r", holder)
 
 
 def request_cancel():
-    path = pathlib.Path(CANCEL_PATH)
+    path = pathlib.Path(_CANCEL_PATH)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.touch()
 
 
 def cancel_requested():
-    return pathlib.Path(CANCEL_PATH).exists()
+    return pathlib.Path(_CANCEL_PATH).exists()
 
 
 def _clear_cancel():
-    pathlib.Path(CANCEL_PATH).unlink(missing_ok=True)
+    pathlib.Path(_CANCEL_PATH).unlink(missing_ok=True)
 
 
 def stop_run():
@@ -622,6 +702,20 @@ def stop_run():
     }
 
 
+def _lock_is_active(now=None):
+    """Check if the lock is held by an active (non-stale) run.
+
+    Returns the holder name if active, None if free or stale.
+    """
+    now = time.time() if now is None else now
+    with _lock_file() as fh:
+        data = _read_locked(fh)
+        holder, since = data.get("holder"), float(data.get("since", 0.0))
+        if holder is not None and (now - since) < _LOCK_TTL_SECONDS:
+            return holder
+    return None
+
+
 def clear_lock(now=None):
     """Force-release a lock left behind by a crashed run.
 
@@ -633,37 +727,41 @@ def clear_lock(now=None):
     is still active; this is only the escape hatch for one that is not.
     """
     now = time.time() if now is None else now
-    status = lock_status()
-    if status["holder"] is None:
-        return {"status": "ok", "message": "Lock already clear."}
-    if (now - status["since"]) < LOCK_TTL_SECONDS:
+    active_holder = _lock_is_active(now)
+    if active_holder:
         return {
             "status": "error",
             "message": (
-                f"The {status['holder']} lock is still recent and looks "
+                f"The {active_holder} lock is still recent and looks "
                 "like a run that's genuinely active - Clear Lock only "
                 "force-releases a stale lock, to avoid letting a second "
                 "run start while the first is still working. Use Stop to "
                 "interrupt it instead."
             ),
         }
-    release_lock()
-    _clear_cancel()
-    return {"status": "ok", "message": "Lock cleared."}
+    with _lock_file() as fh:
+        data = _read_locked(fh)
+        holder = data.get("holder")
+        if holder is None:
+            return {"status": "ok", "message": "Lock already clear."}
+        _write_locked(fh, {"holder": None, "since": 0.0})
+        _clear_cancel()
+        return {"status": "ok", "message": "Lock cleared."}
 
 
 def lock_status():
-    with _open_lock_file() as fh:
-        fcntl.flock(fh, fcntl.LOCK_SH)
-        try:
-            data = _read_locked(fh)
-        finally:
-            fcntl.flock(fh, fcntl.LOCK_UN)
-    return {
+    with _lock_file(exclusive=False) as fh:
+        data = _read_locked(fh)
+    result = {
         "holder": data.get("holder"),
         "since": float(data.get("since", 0.0)),
         "progress": data.get("progress") or {},
     }
+    logger.debug(
+        "FAILOVERR lock_status: holder=%r since=%.0f",
+        result["holder"], result["since"],
+    )
+    return result
 
 
 def clear_state():
@@ -674,12 +772,12 @@ def clear_state():
     reset with its own data on its next periodic save(), silently undoing
     the clear.
     """
-    status = lock_status()
-    if status["holder"] and (time.time() - status["since"]) < LOCK_TTL_SECONDS:
+    active_holder = _lock_is_active()
+    if active_holder:
         return {
             "status": "error",
             "message": (
-                f"A {status['holder']} operation is in progress and holds "
+                f"A {active_holder} operation is in progress and holds "
                 "the probe cache in memory - clearing it now would be "
                 "silently undone by that run's next save. Wait for it to "
                 "finish, or use Stop to interrupt it first."
@@ -760,7 +858,7 @@ def execution_model():
     return "gevent greenlet" if _gevent_patched() else "daemon thread"
 
 
-INLINE_CHANNEL_LIMIT = 15
+_INLINE_CHANNEL_LIMIT = 15
 
 
 def _notify(payload):
@@ -782,8 +880,11 @@ def _select_probe_batch(  # noqa: PLR0913, PLR0917 - mirrors _probe_candidates' 
     submitted to the probe pool, so Budget needs no lock.
     """
     to_probe = []
+    skipped_fresh = 0
+    skipped_aborted = 0
     for row in candidates:
         if state.is_fresh(row.stream_id, row.url, settings["probe_ttl_hours"]):
+            skipped_fresh += 1
             continue
         if row.provider_id in prober.aborted_providers:
             # probe_one already no-ops for an aborted provider; skip the
@@ -793,12 +894,19 @@ def _select_probe_batch(  # noqa: PLR0913, PLR0917 - mirrors _probe_candidates' 
             # THIS batch still has its already-selected remaining
             # candidates dispatched and charged, since the whole batch is
             # selected up front, before any probe runs.
+            skipped_aborted += 1
             continue
         if not budget.allow():
             log.info("FAILOVERR run stopping early: %s", budget.reason)
             break
         budget.spend()
         to_probe.append(row)
+    if skipped_fresh or skipped_aborted:
+        log.debug(
+            "FAILOVERR _select_probe_batch: candidates=%d fresh=%d "
+            "aborted_provider=%d to_probe=%d",
+            len(candidates), skipped_fresh, skipped_aborted, len(to_probe)
+        )
     return to_probe
 
 
@@ -839,7 +947,6 @@ def _probe_candidates(  # noqa: PLR0913, PLR0917 - interface fixed by the task s
     current probe, then stop," not "wait for this whole channel."
     """
     from .probing import is_blank
-    from .state import INVALID, VALID
 
     to_probe = _select_probe_batch(candidates, state, settings, prober, budget, log)
     if not to_probe:
@@ -847,15 +954,17 @@ def _probe_candidates(  # noqa: PLR0913, PLR0917 - interface fixed by the task s
 
     def work(candidate_row):
         if cancel_requested():
-            return candidate_row, None, None, None
+            return candidate_row, None, None, None, None
         result = prober.probe_one(candidate_row.provider_id, candidate_row.url)
         verdict, stats = result.verdict, result.stats
         response_time_ms = result.response_time_ms
+        reason = result.reason
         if verdict == VALID and settings["blank_detect"] and is_blank(
             candidate_row.url, settings["ffmpeg_path"], settings["blank_detect_seconds"]
         ):
             verdict, stats, response_time_ms = INVALID, {}, None
-        return candidate_row, verdict, stats, response_time_ms
+            reason = "blank stream detected"
+        return candidate_row, verdict, stats, response_time_ms, reason
 
     probed = 0
     workers = max(1, int(settings["global_concurrency"]))
@@ -866,7 +975,10 @@ def _probe_candidates(  # noqa: PLR0913, PLR0917 - interface fixed by the task s
         }
         for future in concurrent.futures.as_completed(future_to_row):
             try:
-                candidate_row, verdict, stats, response_time_ms = future.result()
+                result = future.result()
+                candidate_row, verdict = result[0], result[1]
+                stats, response_time_ms = result[2], result[3]
+                reason = result[4]
             except Exception:
                 candidate_row = future_to_row[future]
                 log.exception(
@@ -877,15 +989,16 @@ def _probe_candidates(  # noqa: PLR0913, PLR0917 - interface fixed by the task s
                 )
                 continue
             if _handle_probe_result(
-                candidate_row, verdict, stats, response_time_ms, resolved, state, log,
-                progress_cb, probed_so_far + probed, mode,
+                candidate_row, verdict, stats, response_time_ms, reason,
+                resolved, state, log, progress_cb,
+                probed_so_far + probed, mode,
             ):
                 probed += 1
     return probed
 
 
 def _handle_probe_result(  # noqa: PLR0913, PLR0917 - one call site, _probe_candidates
-    candidate_row, verdict, stats, response_time_ms, resolved, state, log,
+    candidate_row, verdict, stats, response_time_ms, reason, resolved, state, log,
     progress_cb, probed_before, mode=None,
 ):
     """Record one probe's verdict, save stats, and report progress.
@@ -901,19 +1014,26 @@ def _handle_probe_result(  # noqa: PLR0913, PLR0917 - one call site, _probe_cand
         response_time_ms=response_time_ms,
     )
     log.info(
-        "FAILOVERR probe stream=%s name=%r provider=%s verdict=%s",
+        "FAILOVERR probe stream=%s name=%r provider=%s verdict=%s reason=%s",
         candidate_row.stream_id, candidate_row.name,
-        candidate_row.provider_id, verdict,
+        candidate_row.provider_id, verdict, reason,
     )
-    if verdict == VALID and stats:
-        models_access_save(resolved, candidate_row.stream_id, stats)
-    probed_total = probed_before + 1
-    if progress_cb is not None:
-        progress_cb(candidate_row, verdict, probed_total)
-    if probed_total % 25 == 0:
-        refresh_lock(mode)
-        state.save()
-        _notify({"type": "failoverr", "probed": probed_total})
+    try:
+        if verdict == VALID and stats:
+            _models_access_save(resolved, candidate_row.stream_id, stats)
+        probed_total = probed_before + 1
+        if progress_cb is not None:
+            progress_cb(candidate_row, verdict, probed_total)
+        if probed_total % 25 == 0:
+            refresh_lock(mode)
+            state.save()
+            _notify({"type": "failoverr", "probed": probed_total})
+    except Exception:
+        log.exception(
+            "FAILOVERR post-probe ops failed for stream=%s; "
+            "verdict recorded, continuing",
+            candidate_row.stream_id,
+        )
     return True
 
 
@@ -1049,7 +1169,7 @@ def _start_channel_progress(  # noqa: PLR0913, PLR0917 - one call site, run_pipe
     return on_probe
 
 
-def models_access_save(resolved, stream_id, stats):
+def _models_access_save(resolved, stream_id, stats):
     from . import models_access
 
     models_access.save_stream_stats(resolved, stream_id, stats)
@@ -1078,7 +1198,7 @@ def _close_connection():
     connection.close()
 
 
-def run_pipeline(context, mode="run"):  # noqa: PLR0915 - the whole pipeline in one function
+def run_pipeline(context, mode="run"):
     """Single entry point for Run, Reorder Only, and Probe Only."""
     from . import models_access
     from .probing import Prober
@@ -1152,13 +1272,7 @@ def run_pipeline(context, mode="run"):  # noqa: PLR0915 - the whole pipeline in 
 
             ordered, detach = plan_channel(
                 attached_ids, candidates, state,
-                settings["removal_failure_threshold"],
-                settings["max_streams_per_channel"],
-                settings["order_strategy"], settings["codec_priority"],
-                settings["response_time_bucket_ms"],
-                settings["rank_by_resolution"], settings["rank_by_response_time"],
-                settings["rank_by_codec"], settings["rank_by_fps"],
-                settings["rank_by_bitrate"],
+                *_plan_channel_args(settings),
             )
             if mode == "reorder_only":
                 # Reorder Only never detaches. plan_channel's removal branch
@@ -1178,17 +1292,9 @@ def run_pipeline(context, mode="run"):  # noqa: PLR0915 - the whole pipeline in 
             totals["detached"] += summary["detached"]
             totals["channels"] += 1
 
-            lookup = {row.stream_id: row for row in candidates}
-            for position, stream_id in enumerate(ordered):
-                row = lookup.get(stream_id)
-                rows.append(_report_row(
-                    channel, position, stream_id, row, state,
-                    "keep" if stream_id in attached_ids else "attach",
-                ))
-            rows.extend(
-                _report_row(channel, "", stream_id, None, state, "detach")
-                for stream_id in detach
-            )
+            rows.extend(_build_channel_report_rows(
+                channel, ordered, detach, candidates, attached_ids, state
+            ))
     finally:
         state.meta.update({
             "last_run": time.time(),
@@ -1221,7 +1327,7 @@ def start(context, mode="run"):
     # must not have its lock auto-stolen by a second acquire_lock partway
     # through. The per-channel + after-indexing heartbeat keeps the lock
     # fresh well inside this TTL, so it only governs the auto-steal window.
-    lock_ttl = max(LOCK_TTL_SECONDS, settings["max_run_minutes"] * 60 + 300)
+    lock_ttl = max(_LOCK_TTL_SECONDS, settings["max_run_minutes"] * 60 + 300)
     if not acquire_lock(mode, ttl=lock_ttl):
         held = lock_status()["holder"]
         return {
@@ -1231,7 +1337,8 @@ def start(context, mode="run"):
                 f"finish, or use Clear Lock if it is stuck."
             ),
         }
-    _clear_cancel()  # a previous run's leftover cancel flag must not preempt this one
+
+    _clear_cancel()  # clear cancel flag, now that we hold the lock
 
     try:
         from . import models_access
@@ -1243,7 +1350,7 @@ def start(context, mode="run"):
         log.exception("FAILOVERR %s FAILED", mode)
         return {"status": "error", "message": str(exc)}
 
-    if channel_count <= INLINE_CHANNEL_LIMIT and mode == "reorder_only":
+    if channel_count <= _INLINE_CHANNEL_LIMIT and mode == "reorder_only":
         try:
             return run_pipeline(context, mode)
         finally:

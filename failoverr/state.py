@@ -47,9 +47,19 @@ class State:
             # a flaky stream attached).
             log.warning("FAILOVERR state %s unreadable (%s); starting clean", path, exc)
             return cls(path)
+        if not isinstance(data, dict):
+            log.warning(
+                "FAILOVERR state %s is not a JSON object (%s); starting clean",
+                path, type(data).__name__,
+            )
+            return cls(path)
         return cls(path, data.get("streams") or {}, data.get("meta") or {})
 
     def save(self):
+        log.debug(
+            "FAILOVERR State.save: writing %d stream entries to %s",
+            len(self.streams), self.path
+        )
         self.path.parent.mkdir(parents=True, exist_ok=True)
         payload = json.dumps(
             {"streams": self.streams, "meta": self.meta}, indent=1, sort_keys=True
@@ -62,6 +72,7 @@ class State:
             with contextlib.suppress(OSError):
                 tmp.unlink(missing_ok=True)
             raise
+        log.debug("FAILOVERR State.save: completed write to %s", self.path)
 
     def _entry(self, stream_id):
         return self.streams.get(str(stream_id)) or {}

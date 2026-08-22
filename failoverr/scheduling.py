@@ -11,11 +11,11 @@ import threading
 
 logger = logging.getLogger("failoverr")
 
-CHECK_INTERVAL_SECONDS = 20
+_CHECK_INTERVAL_SECONDS = 20
 
 # django-celery-beat's PeriodicTask.name - not the celery task name (see
 # tasks.TASK_NAME), just this row's identity in the PeriodicTask table.
-PERIODIC_TASK_NAME = "failoverr-scheduled-run"
+_PERIODIC_TASK_NAME = "failoverr-scheduled-run"
 
 
 def celery_beat_available():
@@ -40,7 +40,7 @@ def sync_celery_beat(cron_expression, enabled):
     from .tasks import TASK_NAME
 
     create_or_update_periodic_task(
-        task_name=PERIODIC_TASK_NAME,
+        task_name=_PERIODIC_TASK_NAME,
         celery_task_path=TASK_NAME,
         cron_expression=cron_expression,
         enabled=enabled,
@@ -58,7 +58,7 @@ def disable_celery_beat():
     except ImportError:
         logger.debug("FAILOVERR celery-beat not available, nothing to remove")
         return
-    delete_periodic_task(PERIODIC_TASK_NAME)
+    delete_periodic_task(_PERIODIC_TASK_NAME)
     logger.info("FAILOVERR celery-beat periodic task removed")
 
 
@@ -129,8 +129,11 @@ def resolve_timezone(name):
         from zoneinfo import ZoneInfo
 
         return ZoneInfo(str(name or "UTC"))
-    except Exception:  # noqa: S110, BLE001 - falling through to the pytz/UTC fallback below
-        pass
+    except Exception as exc:  # noqa: BLE001 - falling through to the pytz/UTC fallback below
+        logger.debug(
+            "FAILOVERR zoneinfo failed for %r: %s; trying pytz fallback",
+            name, exc,
+        )
     try:
         import pytz
 
@@ -170,7 +173,7 @@ class Scheduler:
     def stop(self):
         self._stop.set()
         if self._thread is not None:
-            self._thread.join(timeout=CHECK_INTERVAL_SECONDS + 5)
+            self._thread.join(timeout=_CHECK_INTERVAL_SECONDS + 5)
             if self._thread.is_alive():
                 logger.warning(
                     "FAILOVERR scheduler stop timed out; a callback run is "
@@ -180,7 +183,7 @@ class Scheduler:
         logger.info("FAILOVERR scheduler stopped")
 
     def _loop(self):
-        while not self._stop.wait(CHECK_INTERVAL_SECONDS):
+        while not self._stop.wait(_CHECK_INTERVAL_SECONDS):
             now = datetime.datetime.now(self.tzinfo)
             marker = now.replace(second=0, microsecond=0)
             if marker == self._last_fired_minute:

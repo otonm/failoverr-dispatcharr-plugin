@@ -5,6 +5,7 @@ modules stay importable in a bare pytest run.
 """
 
 import collections
+import datetime
 import logging
 import threading
 
@@ -22,7 +23,7 @@ logger = logging.getLogger("failoverr")
 _STATS_SAMPLES = 3
 _STATS_SCAN_LIMIT = 2000
 
-BACKUP_WARNING = (
+_BACKUP_WARNING = (
     "There is no undo. Back up your Dispatcharr database before running this."
 )
 
@@ -61,7 +62,10 @@ def _ensure_scheduler(context):
 
         if scheduling.celery_beat_available():
             try:
-                scheduling.matches_cron(settings["cron_expression"], _now())
+                # matches_cron takes naive datetimes for shape validation only
+                scheduling.matches_cron(
+                    settings["cron_expression"], datetime.datetime.now()  # noqa: DTZ005
+                )
                 scheduling.sync_celery_beat(
                     settings["cron_expression"], settings["schedule_enabled"]
                 )
@@ -94,12 +98,6 @@ def _ensure_scheduler(context):
             return None
         _scheduler = new_scheduler
         return _scheduler
-
-
-def _now():
-    import datetime
-
-    return datetime.datetime.now()  # noqa: DTZ005 - matches_cron takes naive datetimes, shape check only
 
 
 def _scheduler_report(scheduling):
@@ -594,7 +592,7 @@ class Plugin:
                 "title": "Run Failoverr?",
                 "message": (
                     "This will attach, detach and reorder streams on your "
-                    "channels. " + BACKUP_WARNING
+                    "channels. " + _BACKUP_WARNING
                 ),
             },
         },
@@ -610,7 +608,7 @@ class Plugin:
                 "title": "Reorder attached streams?",
                 "message": (
                     "This will change the failover order on your channels. "
-                    + BACKUP_WARNING
+                    + _BACKUP_WARNING
                 ),
             },
         },
@@ -627,7 +625,7 @@ class Plugin:
                 "message": (
                     "This will consume provider connections for several "
                     "minutes and update stored stream statistics. "
-                    + BACKUP_WARNING
+                    + _BACKUP_WARNING
                 ),
             },
         },
@@ -723,6 +721,9 @@ class Plugin:
     def _diagnose(self, params, context):
         from . import models_access, naming, pipeline, scheduling
 
+        log = context.get("logger") or logger
+        log.info("FAILOVERR diagnose START: loading settings and resolving models")
+
         settings = pipeline.load_settings(context)
 
         resolved = models_access.resolve_models()
@@ -791,6 +792,10 @@ class Plugin:
             "scheduler": _scheduler_report(scheduling),
         }
         _ensure_scheduler(context)
+        log.info(
+            "FAILOVERR diagnose COMPLETED: pool=%d channels=%d",
+            pool_size, channel_model.objects.count()
+        )
         return result
 
     def _preview(self, params, context):
@@ -825,9 +830,9 @@ class Plugin:
 
     def _show_status(self, params, context):
         from . import pipeline
-        from .state import DEFAULT_PATH, State
+        from .state import State
 
-        state = State.load(DEFAULT_PATH)
+        state = State.load(pipeline.STATE_PATH)
         lock = pipeline.lock_status()
         meta = state.meta
         return {

@@ -158,8 +158,8 @@ def test_disabling_bitrate_ties_when_nothing_else_differs():
 
 
 def test_order_candidates_forwards_toggles_to_quality_key():
-    fast_bad = Candidate(1, "fast bad codec", "A", stats(1920, 1080, "avc"), 100)
-    slow_good = Candidate(2, "slow good codec", "A", stats(1920, 1080, "hevc"), 2000)
+    fast_bad = Candidate(1, "fast bad codec", 1, stats(1920, 1080, "avc"), 100)
+    slow_good = Candidate(2, "slow good codec", 1, stats(1920, 1080, "hevc"), 2000)
 
     result = order_candidates([fast_bad, slow_good])
     assert result[0].stream_id == 1
@@ -172,13 +172,13 @@ def test_order_candidates_forwards_toggles_to_quality_key():
 
 # Spec §16. Note the lies: A's "4K" is really 720p, B's "SD" is really
 # 1080p HEVC. Ranking must follow the stats, not the names.
-A_UHD = Candidate(1, "RAI 1 UHD", "A", stats(3840, 2160, "hevc"))
-B_4K = Candidate(2, "Rai 1 4K", "B", stats(3840, 2160, "hevc"))
-A_HEVC = Candidate(3, "RAI 1 HEVC", "A", stats(1920, 1080, "hevc"))
-B_SD = Candidate(4, "RAI 1 SD", "B", stats(1920, 1080, "hevc"))
-A_HD = Candidate(5, "RAI 1 HD", "A", stats(1920, 1080, "h264"))
-A_4K = Candidate(6, "RAI 1 4K", "A", stats(1280, 720, "h264"))
-B_HD = Candidate(7, "RAI 1 HD", "B", stats(1280, 720, "h264"))
+A_UHD = Candidate(1, "RAI 1 UHD", 1, stats(3840, 2160, "hevc"))
+B_4K = Candidate(2, "Rai 1 4K", 2, stats(3840, 2160, "hevc"))
+A_HEVC = Candidate(3, "RAI 1 HEVC", 1, stats(1920, 1080, "hevc"))
+B_SD = Candidate(4, "RAI 1 SD", 2, stats(1920, 1080, "hevc"))
+A_HD = Candidate(5, "RAI 1 HD", 1, stats(1920, 1080, "h264"))
+A_4K = Candidate(6, "RAI 1 4K", 1, stats(1280, 720, "h264"))
+B_HD = Candidate(7, "RAI 1 HD", 2, stats(1280, 720, "h264"))
 
 # Deliberately shuffled: the function must sort, not preserve input order.
 SEVEN = [A_4K, B_SD, A_UHD, B_HD, A_HEVC, B_4K, A_HD]
@@ -190,32 +190,32 @@ def as_pairs(result):
 
 def test_quality_first_matches_the_spec_fixture():
     assert as_pairs(order_candidates(SEVEN, strategy="quality_first")) == [
-        ("A", "RAI 1 UHD"),
-        ("B", "Rai 1 4K"),
-        ("A", "RAI 1 HEVC"),
-        ("B", "RAI 1 SD"),
-        ("A", "RAI 1 HD"),
-        ("A", "RAI 1 4K"),
-        ("B", "RAI 1 HD"),
+        (1, "RAI 1 UHD"),
+        (2, "Rai 1 4K"),
+        (1, "RAI 1 HEVC"),
+        (2, "RAI 1 SD"),
+        (1, "RAI 1 HD"),
+        (1, "RAI 1 4K"),
+        (2, "RAI 1 HD"),
     ]
 
 
 def test_provider_first_matches_the_spec_fixture():
     assert as_pairs(order_candidates(SEVEN, strategy="provider_first")) == [
-        ("A", "RAI 1 UHD"),
-        ("B", "Rai 1 4K"),
-        ("A", "RAI 1 HEVC"),
-        ("B", "RAI 1 SD"),
-        ("A", "RAI 1 HD"),
-        ("B", "RAI 1 HD"),
-        ("A", "RAI 1 4K"),
+        (1, "RAI 1 UHD"),
+        (2, "Rai 1 4K"),
+        (1, "RAI 1 HEVC"),
+        (2, "RAI 1 SD"),
+        (1, "RAI 1 HD"),
+        (2, "RAI 1 HD"),
+        (1, "RAI 1 4K"),
     ]
 
 
 def test_lying_names_are_ignored():
     """The whole reason this plugin exists: 'SD' outranks 'HD' and '4K'."""
     result = as_pairs(order_candidates(SEVEN))
-    assert result.index(("B", "RAI 1 SD")) < result.index(("A", "RAI 1 4K"))
+    assert result.index((2, "RAI 1 SD")) < result.index((1, "RAI 1 4K"))
 
 
 def test_quality_first_alternates_providers_within_a_tier():
@@ -232,9 +232,9 @@ def test_no_candidate_is_lost_or_duplicated():
 
 
 def test_single_provider_degrades_to_plain_quality_order():
-    only_a = [c for c in SEVEN if c.provider_id == "A"]
+    only_a = [c for c in SEVEN if c.provider_id == 1]
     assert as_pairs(order_candidates(only_a)) == [
-        ("A", "RAI 1 UHD"), ("A", "RAI 1 HEVC"), ("A", "RAI 1 HD"), ("A", "RAI 1 4K"),
+        (1, "RAI 1 UHD"), (1, "RAI 1 HEVC"), (1, "RAI 1 HD"), (1, "RAI 1 4K"),
     ]
 
 

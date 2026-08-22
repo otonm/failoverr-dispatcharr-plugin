@@ -15,7 +15,9 @@ DEFAULT_STRIP_TOKENS = (
 
 # one-ten in English, Italian, German and French. Accents are already
 # folded by the time this is consulted, so 'fünf' arrives as 'funf'.
-NUMBER_WORDS = {
+# French "un" (1) is omitted because it collides with English "un" prefix
+# (as in "undo", "unlock") and is handled by the letter-digit split instead.
+_NUMBER_WORDS = {
     "one": "1", "two": "2", "three": "3", "four": "4", "five": "5",
     "six": "6", "seven": "7", "eight": "8", "nine": "9", "ten": "10",
     "uno": "1", "due": "2", "tre": "3", "quattro": "4", "cinque": "5",
@@ -57,6 +59,8 @@ def normalize(name, strip_tokens=DEFAULT_STRIP_TOKENS, map_number_words=True):
     text = _COUNTRY_PREFIX.sub("", text)
     text = _BRACKETED.sub(" ", text)
 
+    text = _NON_ALNUM.sub(" ", text)
+
     pattern = (
         _DEFAULT_TOKEN_PATTERN
         if strip_tokens == DEFAULT_STRIP_TOKENS
@@ -65,12 +69,11 @@ def normalize(name, strip_tokens=DEFAULT_STRIP_TOKENS, map_number_words=True):
     if pattern is not None:
         text = pattern.sub(" ", text)
 
-    text = _NON_ALNUM.sub(" ", text)
     text = _LETTER_DIGIT.sub(" ", text)
 
     tokens = text.split()
     if map_number_words:
-        tokens = [NUMBER_WORDS.get(t, t) for t in tokens]
+        tokens = [_NUMBER_WORDS.get(t, t) for t in tokens]
     return tuple(tokens)
 
 

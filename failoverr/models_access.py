@@ -12,12 +12,14 @@ import logging
 import shutil
 import subprocess
 
+from django.db.models import UniqueConstraint
+
 from .ordering import rewrite_plan
 
 logger = logging.getLogger("failoverr")
 
-ORDER_FIELD_CANDIDATES = ["order", "position", "priority", "sort_order"]
-PROVIDER_FIELD_CANDIDATES = ["m3u_account", "m3u_source", "account", "source"]
+_ORDER_FIELD_CANDIDATES = ["order", "position", "priority", "sort_order"]
+_PROVIDER_FIELD_CANDIDATES = ["m3u_account", "m3u_source", "account", "source"]
 
 
 class FieldResolutionError(Exception):
@@ -64,7 +66,7 @@ def _detect_unique_order_constraint(model, order_field):
         fields = getattr(constraint, "fields", ()) or ()
         if (
             order_field in fields
-            and constraint.__class__.__name__ == "UniqueConstraint"
+            and isinstance(constraint, UniqueConstraint)
         ):
             return True
     return False
@@ -75,10 +77,10 @@ def resolve_models():
 
     channel_stream = _import_channel_stream(Channel)
     order_field = resolve_field(
-        channel_stream, ORDER_FIELD_CANDIDATES, "stream ordering"
+        channel_stream, _ORDER_FIELD_CANDIDATES, "stream ordering"
     )
     provider_field = resolve_field(
-        Stream, PROVIDER_FIELD_CANDIDATES, "the M3U provider link"
+        Stream, _PROVIDER_FIELD_CANDIDATES, "the M3U provider link"
     )
     return ResolvedModels(
         channel_model=Channel,
@@ -149,10 +151,10 @@ def environment_report(ffprobe_path, ffmpeg_path):
     }
 
 
-ORDER_OFFSET = 100000
+_ORDER_OFFSET = 100000
 
 
-def plan_writes(current, ordered_ids, detach_ids, use_offset, offset=ORDER_OFFSET):
+def plan_writes(current, ordered_ids, detach_ids, use_offset, offset=_ORDER_OFFSET):
     """Turn a channel plan into concrete write operations.
 
     `current` maps attached stream_id -> current order. Returns attach /
@@ -179,7 +181,7 @@ def plan_writes(current, ordered_ids, detach_ids, use_offset, offset=ORDER_OFFSE
     }
 
 
-def placeholder_orders(current, attach, offset=ORDER_OFFSET):
+def placeholder_orders(current, attach, offset=_ORDER_OFFSET):
     """Distinct create-time orders for newly attached rows.
 
     Provably disjoint from rewrite_plan's bump range (v + offset for v in
@@ -208,6 +210,11 @@ def apply_channel_plan(resolved, channel, ordered_ids, detach_ids, dry_run):
         }
         plan = plan_writes(
             current, ordered_ids, detach_ids, resolved.has_unique_order_constraint
+        )
+        logger.debug(
+            "FAILOVERR apply_channel_plan: channel=%s ordered=%s "
+            "attach=%s detach=%s dry_run=%s",
+            channel.name, ordered_ids, plan["attach"], plan["detach"], dry_run,
         )
         summary = {
             "attached": len(plan["attach"]),
@@ -245,15 +252,24 @@ def save_stream_stats(resolved, stream_id, stats):
     a Failoverr probe. Plugin-private bookkeeping never goes here — it lives
     in the sidecar.
     """
+    from django.db import transaction
     from django.utils import timezone
 
-    stream = resolved.stream_model.objects.filter(id=stream_id).first()
-    if stream is None:
-        logger.info(
-            "FAILOVERR stream %s deleted mid-run; dropped probe stats", stream_id,
+    with transaction.atomic():
+        stream = (
+            resolved.stream_model.objects.select_for_update()
+            .filter(id=stream_id).first()
         )
-        return
-    existing = stream.stream_stats if isinstance(stream.stream_stats, dict) else {}
-    resolved.stream_model.objects.filter(id=stream_id).update(
-        stream_stats={**existing, **stats}, stream_stats_updated_at=timezone.now()
-    )
+        if stream is None:
+            logger.info(
+                "FAILOVERR stream %s deleted mid-run; dropped probe stats", stream_id,
+            )
+            return
+        existing = stream.stream_stats if isinstance(stream.stream_stats, dict) else {}
+        updated = resolved.stream_model.objects.filter(id=stream_id).update(
+            stream_stats={**existing, **stats}, stream_stats_updated_at=timezone.now()
+        )
+        logger.debug(
+            "FAILOVERR save_stream_stats: stream=%s updated=%s keys=%s",
+            stream_id, updated, list(stats.keys()),
+        )

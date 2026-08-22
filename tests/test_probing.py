@@ -173,6 +173,20 @@ def test_timeout_signalled_by_none_returncode_is_inconclusive():
     assert classify(None, "", "").verdict == INCONCLUSIVE
 
 
+def test_run_command_timeout_returns_none_returncode():
+    """run_command translates TimeoutExpired to (None, '', '')."""
+    import subprocess
+
+    from failoverr.probing import probe
+
+    def slow_runner(argv, timeout):
+        raise subprocess.TimeoutExpired(cmd=argv, timeout=timeout)
+
+    result = probe("http://example.com/stream.ts", "ffprobe", 1, runner=slow_runner)
+    assert result.verdict == INCONCLUSIVE
+    assert "could not run ffprobe" in result.reason
+
+
 def test_unrecognised_failure_defaults_to_inconclusive():
     """Never guess 'dead' from an error we do not recognise."""
     assert classify(1, "", "some novel error nobody has seen").verdict == INCONCLUSIVE

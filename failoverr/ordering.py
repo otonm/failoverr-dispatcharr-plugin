@@ -6,7 +6,7 @@ Pure module: imports nothing from Django or Dispatcharr.
 import re
 from collections import defaultdict
 from itertools import zip_longest
-from typing import Any, NamedTuple
+from typing import NamedTuple
 
 DEFAULT_CODEC_PRIORITY = ("hevc", "h265", "h264", "avc")
 
@@ -27,7 +27,7 @@ _RESOLUTION = re.compile(r"(\d+)\s*[xX*]\s*(\d+)")
 class Candidate(NamedTuple):
     stream_id: int
     name: str
-    provider_id: Any
+    provider_id: int | None
     stats: dict
     response_time_ms: float | None = None
 
@@ -50,7 +50,7 @@ def _tier(height):
 
 
 def _codec_rank(stats, codec_priority):
-    """Negative index so that better codecs sort higher under reverse=False."""
+    """Negative index so that better codecs sort higher under reverse=True."""
     codec = str(stats.get("video_codec") or "").lower()
     priority = list(codec_priority)
     if codec in priority:
