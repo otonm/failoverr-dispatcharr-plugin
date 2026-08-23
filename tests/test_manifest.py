@@ -52,8 +52,8 @@ def test_plugin_json_metadata_matches_plugin_class():
 
     from failoverr.plugin import Plugin
 
-    PLUGIN_DIR = pathlib.Path(__file__).resolve().parent.parent / "failoverr"
-    manifest = json.loads((PLUGIN_DIR / "plugin.json").read_text())
+    plugin_dir = pathlib.Path(__file__).resolve().parent.parent / "failoverr"
+    manifest = json.loads((plugin_dir / "plugin.json").read_text())
 
     assert manifest["name"] == Plugin.name
     assert manifest["version"] == Plugin.version
