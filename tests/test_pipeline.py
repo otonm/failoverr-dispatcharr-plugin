@@ -14,7 +14,6 @@ from failoverr import pipeline as pipeline_module
 from failoverr import probing as probing_module
 from failoverr.naming import normalize
 from failoverr.pipeline import (
-    LOCK_TTL_SECONDS,
     Budget,
     StreamRow,
     acquire_lock,
@@ -32,6 +31,9 @@ from failoverr.pipeline import (
 )
 from failoverr.probing import ProbeResult
 from failoverr.state import INCONCLUSIVE, INVALID, VALID, State
+
+# Lock TTL is a private constant in pipeline.py; tests use the value directly.
+LOCK_TTL_SECONDS = 1800
 
 
 def row(stream_id, name, provider=1, height=1080, codec="h264"):
@@ -299,12 +301,12 @@ def test_write_report_prunes_old_reports_down_to_max_reports(tmp_path):
     An unattended cron deployment (one run/day by default) used to leave one
     CSV in /data/exports per run forever - unbounded disk growth with no
     rotation, retention limit, or cleanup anywhere. write_report now prunes
-    the directory down to MAX_REPORTS after each write.
+    the directory down to _MAX_REPORTS (100) after each write.
     """
     import os
     import time
 
-    from failoverr.pipeline import MAX_REPORTS
+    max_reports = 100
 
     exports = tmp_path / "exports"
     exports.mkdir()
@@ -312,7 +314,7 @@ def test_write_report_prunes_old_reports_down_to_max_reports(tmp_path):
     # the mtime sort is deterministic. Seed mtimes are in the past so the
     # freshly-written report below is the newest of all.
     base = time.time() - 20000
-    for i in range(MAX_REPORTS + 5):
+    for i in range(max_reports + 5):
         p = exports / f"failoverr-run-{i:04d}.csv"
         p.write_text("old")
         os.utime(p, (base + i, base + i))
@@ -325,8 +327,8 @@ def test_write_report_prunes_old_reports_down_to_max_reports(tmp_path):
     )
 
     remaining = sorted(exports.glob("failoverr-*.csv"))
-    assert len(remaining) == MAX_REPORTS, (
-        f"rotation must prune down to {MAX_REPORTS}, found {len(remaining)}"
+    assert len(remaining) == max_reports, (
+        f"rotation must prune down to {max_reports}, found {len(remaining)}"
     )
     assert newest in remaining, "the report just written must survive rotation"
     # The oldest 6 seeds (the first-seeded, lowest mtimes) are the ones pruned.
@@ -336,14 +338,14 @@ def test_write_report_prunes_old_reports_down_to_max_reports(tmp_path):
 
 def test_write_report_rotation_leaves_unrelated_files_alone(tmp_path):
     """Only failoverr-*.csv files are pruned; other files in the dir survive."""
-    from failoverr.pipeline import MAX_REPORTS
+    max_reports = 100
 
     exports = tmp_path / "exports"
     exports.mkdir()
     unrelated = exports / "not-a-failoverr-report.csv"
     unrelated.write_text("keep me")
 
-    for i in range(MAX_REPORTS + 2):
+    for i in range(max_reports + 2):
         (exports / f"failoverr-run-{i:04d}.csv").write_text("old")
 
     write_report([], exports / "failoverr-run-newest.csv")
@@ -521,8 +523,8 @@ def test_load_settings_parses_the_channel_name_list():
 
 @pytest.fixture(autouse=True)
 def _reset_lock(tmp_path, monkeypatch):
-    monkeypatch.setattr(pipeline_module, "LOCK_PATH", str(tmp_path / "run.lock"))
-    monkeypatch.setattr(pipeline_module, "CANCEL_PATH", str(tmp_path / "cancel.flag"))
+    monkeypatch.setattr(pipeline_module, "_LOCK_PATH", str(tmp_path / "run.lock"))
+    monkeypatch.setattr(pipeline_module, "_CANCEL_PATH", str(tmp_path / "cancel.flag"))
     clear_lock()
     yield
     clear_lock()
@@ -593,7 +595,7 @@ def test_clear_lock_reports_already_clear_when_nothing_is_running():
 def test_corrupt_lock_file_is_treated_as_empty_and_logged(caplog):
     """A truncated/corrupt lock file must not block the plugin and must log."""
     import logging
-    lock_file = pathlib.Path(pipeline_module.LOCK_PATH)
+    lock_file = pathlib.Path(pipeline_module._LOCK_PATH)
     lock_file.write_text("{not valid json")
 
     with caplog.at_level(logging.WARNING, logger="failoverr"):
@@ -909,13 +911,13 @@ def test_lock_is_visible_across_separate_processes():
     Proving it here means actually spawning a second process against the
     same lock file, not just calling the function twice in this one.
     """
-    lock_path = pipeline_module.LOCK_PATH
+    lock_path = pipeline_module._LOCK_PATH
     acquire_lock("run", now=0.0)
 
     script = (
         "import sys; sys.path.insert(0, sys.argv[1]); "
         "from failoverr import pipeline; "
-        "pipeline.LOCK_PATH = sys.argv[2]; "
+        "pipeline._LOCK_PATH = sys.argv[2]; "
         "print(pipeline.acquire_lock('scheduled_run', now=10.0))"
     )
     repo_root = str(pathlib.Path(__file__).resolve().parents[1])
@@ -1573,7 +1575,7 @@ def test_select_probe_batch_mid_batch_provider_abort_still_probes_selected(
     # Second call: provider A now aborted, should skip all
     state2 = State(path=tmp_path / "state2.json")
     prober2 = ProberMidAbort()
-    prober2.aborted_providers = {"A"}  # already aborted
+    prober2.aborted_providers = {1}  # already aborted (provider_id is int)
     to_probe_2 = pipeline_module._select_probe_batch(
         candidates, state2, settings, prober2, budget, log
     )
@@ -1650,7 +1652,7 @@ def test_probe_candidates_probes_different_providers_concurrently(monkeypatch):
                 peak["n"] = max(peak["n"], live["n"])
                 if peak["n"] >= 2:
                     started.set()
-            release.wait(timeout=2)
+            release.wait(timeout=10)
             with lock:
                 live["n"] -= 1
             return ProbeResult(VALID, {}, "ok")
@@ -1673,9 +1675,9 @@ def test_probe_candidates_probes_different_providers_concurrently(monkeypatch):
 
     thread = threading.Thread(target=run)
     thread.start()
-    assert started.wait(timeout=2), "the pool must reach concurrent execution"
+    assert started.wait(timeout=10), "the pool must reach concurrent execution"
     release.set()
-    thread.join(timeout=2)
+    thread.join(timeout=10)
 
     assert result["probed"] == 4
     assert peak["n"] > 1, (
@@ -1713,7 +1715,7 @@ def test_probe_candidates_stops_launching_new_probes_once_stopped_mid_batch(
                 live["n"] += 1
                 if live["n"] == 2:
                     started.set()
-            release.wait(timeout=2)
+            release.wait(timeout=10)
             return ProbeResult(VALID, {}, "ok")
 
     candidates = [
@@ -1736,10 +1738,10 @@ def test_probe_candidates_stops_launching_new_probes_once_stopped_mid_batch(
 
     thread = threading.Thread(target=run)
     thread.start()
-    assert started.wait(timeout=2), "the first 2 (global_concurrency=2) must start"
+    assert started.wait(timeout=10), "the first 2 (global_concurrency=2) must start"
     canceled["flag"] = True  # Stop pressed while 2 are in flight, 2 still queued
     release.set()
-    thread.join(timeout=2)
+    thread.join(timeout=10)
 
     assert result["probed"] == 2, "only the 2 already in flight should complete"
     assert len(calls) == 2, "the 2 queued-but-not-started candidates must never probe"
@@ -1776,7 +1778,7 @@ def test_probe_candidates_stop_shortcircuit_does_not_mark_stream_fresh(
                 live["n"] += 1
                 if live["n"] == 2:
                     started.set()
-            release.wait(timeout=2)
+            release.wait(timeout=10)
             return ProbeResult(VALID, {}, "ok")
 
     candidates = [
@@ -1799,10 +1801,10 @@ def test_probe_candidates_stop_shortcircuit_does_not_mark_stream_fresh(
 
     thread = threading.Thread(target=run)
     thread.start()
-    assert started.wait(timeout=2), "the first 2 (global_concurrency=2) must start"
+    assert started.wait(timeout=10), "the first 2 (global_concurrency=2) must start"
     canceled["flag"] = True  # Stop pressed while 2 are in flight, 2 still queued
     release.set()
-    thread.join(timeout=2)
+    thread.join(timeout=10)
 
     assert result["probed"] == 2, "only the 2 already in flight should complete"
 

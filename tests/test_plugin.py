@@ -50,3 +50,32 @@ def test_status_message_flags_a_pending_stop_request():
     lock = {"holder": "run", "progress": {}}
     message = _status_message(lock, True, 0)
     assert message.endswith("Stop requested - finishing current probe, then stopping.")
+
+
+def test_status_message_flags_stop_during_stream_probing():
+    """stop_requested with non-empty streams_total uses the stream-progress template."""
+    lock = {
+        "holder": "run",
+        "progress": {
+            "stream_index": 5, "streams_total": 20, "channel_name": "RAI 1",
+            "channel_index": 1, "channels_total": 3,
+            "new_found": 2, "attached": 1, "detached": 0,
+        },
+    }
+    message = _status_message(lock, True, 0)
+    assert "Processing stream 5 of 20 (RAI 1)" in message
+    assert message.endswith("Stop requested - finishing current probe, then stopping.")
+
+
+def test_status_message_fallback_when_channel_index_missing():
+    """Missing channel_index shows as None in the message."""
+    lock = {
+        "holder": "reorder_only",
+        "progress": {
+            "channels_total": 6, "channel_name": "RAI Movie",
+            "new_found": 0, "attached": 0, "detached": 0,
+        },
+    }
+    message = _status_message(lock, False, 0)
+    assert "channel None of 6" in message  # channel_index defaults to None
+    assert "RAI Movie" in message

@@ -111,13 +111,13 @@ def test_every_declared_action_has_a_handler(action_id, monkeypatch, tmp_path):
     monkeypatch.setattr("failoverr.pipeline.run_preview", fail)
 
     # stop/clear_lock/clear_state/show_status touch the filesystem directly
-    # (LOCK_PATH, CANCEL_PATH, STATE_PATH, DEFAULT_PATH). Point them at tmp_path
+    # (_LOCK_PATH, _CANCEL_PATH, STATE_PATH, DEFAULT_PATH). Point them at tmp_path
     # so the test never hits real /data/failoverr/* paths.
     lock = str(tmp_path / "run.lock")
     cancel = str(tmp_path / "cancel.flag")
     state_path = str(tmp_path / "state.json")
-    monkeypatch.setattr("failoverr.pipeline.LOCK_PATH", lock)
-    monkeypatch.setattr("failoverr.pipeline.CANCEL_PATH", cancel)
+    monkeypatch.setattr("failoverr.pipeline._LOCK_PATH", lock)
+    monkeypatch.setattr("failoverr.pipeline._CANCEL_PATH", cancel)
     monkeypatch.setattr("failoverr.pipeline.STATE_PATH", state_path)
     monkeypatch.setattr("failoverr.state.DEFAULT_PATH", state_path)
 

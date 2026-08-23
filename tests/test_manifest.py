@@ -37,12 +37,28 @@ def test_every_field_has_help_text():
 def test_mutating_actions_require_confirmation():
     from failoverr.plugin import Plugin
 
-    mutating = {"run", "reorder_only", "probe_only"}
+    mutating = {"run", "reorder_only", "probe_only", "clear_state"}
     for action in Plugin.actions:
         if action["id"] in mutating:
             assert action.get("confirm", {}).get("required") is True, (
                 f"{action['id']} must have a confirm modal"
             )
+
+
+def test_plugin_json_metadata_matches_plugin_class():
+    """plugin.json metadata must match Plugin class attributes."""
+    import json
+    import pathlib
+
+    from failoverr.plugin import Plugin
+
+    PLUGIN_DIR = pathlib.Path(__file__).resolve().parent.parent / "failoverr"
+    manifest = json.loads((PLUGIN_DIR / "plugin.json").read_text())
+
+    assert manifest["name"] == Plugin.name
+    assert manifest["version"] == Plugin.version
+    assert manifest["description"] == Plugin.description
+    assert manifest["author"] == Plugin.author
 
 
 def test_dry_run_defaults_to_on():

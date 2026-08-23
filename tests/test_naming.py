@@ -126,7 +126,7 @@ def test_strict_mode_excludes_near_misses(stream_name):
 
 def test_fuzzy_mode_at_default_threshold_still_excludes_rai_2():
     """RAI 2 scores 80; the default threshold of 85 must exclude it."""
-    assert not matches(CHANNEL, normalize("IT: RAI 2 HD"), mode="fuzzy", threshold=85)
+    assert not matches(CHANNEL, normalize("IT: RAI 2 HD"), mode="fuzzy")
 
 
 def test_fuzzy_mode_with_a_low_threshold_attaches_the_wrong_channel():

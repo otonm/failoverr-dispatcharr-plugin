@@ -179,7 +179,8 @@ class _FakeQuerySet:
         return len(self._rows)
 
     def delete(self):
-        for row in self._rows:
+        # Iterate over a copy to avoid mutating the list while iterating.
+        for row in list(self._rows):
             self._model.rows.remove(row)
 
 
@@ -227,7 +228,7 @@ def _resolved(link_model, order_field="order", use_offset=False):
 
 def test_apply_channel_plan_locks_current_rows_before_reading_them():
     """A concurrent edit between the read and the write must not be clobbered."""
-    channel = object()
+    channel = types.SimpleNamespace(name="Test Channel")
     link_model = FakeChannelStreamModel(
         [_FakeLinkRow(channel, 1, 0), _FakeLinkRow(channel, 2, 1)]
     )
@@ -238,7 +239,7 @@ def test_apply_channel_plan_locks_current_rows_before_reading_them():
 
 
 def test_apply_channel_plan_writes_attach_reorder_and_detach():
-    channel = object()
+    channel = types.SimpleNamespace(name="Test Channel")
     link_model = FakeChannelStreamModel(
         [_FakeLinkRow(channel, 1, 0), _FakeLinkRow(channel, 2, 1)]
     )
@@ -256,7 +257,7 @@ def test_apply_channel_plan_writes_attach_reorder_and_detach():
 
 
 def test_apply_channel_plan_dry_run_never_writes():
-    channel = object()
+    channel = types.SimpleNamespace(name="Test Channel")
     link_model = FakeChannelStreamModel([_FakeLinkRow(channel, 1, 0)])
 
     apply_channel_plan(_resolved(link_model), channel, [1, 2], [], dry_run=True)
@@ -264,6 +265,30 @@ def test_apply_channel_plan_dry_run_never_writes():
     assert [row.stream_id for row in link_model.rows] == [1], (
         "dry_run must never attach, reorder, or detach"
     )
+
+
+def test_apply_channel_plan_use_offset_path_placeholder_bump_rewrite():
+    """End-to-end test of the unique-constraint offset path.
+
+    When has_unique_order_constraint=True, apply_channel_plan must:
+    1. Bump existing rows by offset (placeholder_orders)
+    2. Create new rows with placeholder orders
+    3. Rewrite all rows to their final positions
+    This ensures no unique constraint violation on (channel, order).
+    """
+    channel = types.SimpleNamespace(name="Test Channel")
+    link_model = FakeChannelStreamModel(
+        [_FakeLinkRow(channel, 1, 0), _FakeLinkRow(channel, 2, 1)]
+    )
+    resolved = _resolved(link_model, use_offset=True)
+
+    summary = apply_channel_plan(resolved, channel, [2, 3], [1], dry_run=False)
+
+    remaining = {row.stream_id: row.order for row in link_model.rows}
+    assert 1 not in remaining, "stream 1 must be detached"
+    assert remaining[2] == 0, "stream 2 must be at position 0"
+    assert remaining[3] == 1, "stream 3 must be at position 1"
+    assert summary == {"attached": 1, "detached": 1}
 
 
 # --- save_stream_stats -----------------------------------------------------
@@ -289,6 +314,9 @@ def test_save_stream_stats_logs_when_the_stream_was_deleted_mid_run(
     )
 
     class _DeletedQuerySet:
+        def select_for_update(self):
+            return self
+
         def filter(self, **_kwargs):
             return self
 
