@@ -12,7 +12,7 @@ from failoverr.ordering import (
 def stats(width, height, codec, fps=25, bitrate=5000):
     """Build a stats dict using Dispatcharr's real stream_stats key names.
 
-    Confirmed via Diagnose against the live pool (CLAUDE.md §4).
+    Confirmed via Diagnose against the live pool.
     """
     return {
         "video_codec": codec,
@@ -91,12 +91,10 @@ def test_default_codec_priority_prefers_hevc():
 
 def test_response_time_bucketing_creates_ties_for_ranking():
     a, b = stats(1920, 1080, "hevc"), stats(1920, 1080, "hevc")
-    assert quality_key(
-        a, response_time_ms=240, response_time_bucket_ms=250
-    ) == quality_key(b, response_time_ms=10, response_time_bucket_ms=250)
-    assert quality_key(
-        a, response_time_ms=260, response_time_bucket_ms=250
-    ) != quality_key(b, response_time_ms=240, response_time_bucket_ms=250)
+    assert quality_key(a, response_time_ms=240) == quality_key(b, response_time_ms=10)
+    assert quality_key(a, response_time_ms=260) != quality_key(
+        b, response_time_ms=240
+    )
 
 
 def test_missing_response_time_sorts_worst():
@@ -164,7 +162,7 @@ def as_pairs(result):
 
 
 def test_quality_first_matches_the_spec_fixture():
-    assert as_pairs(order_candidates(SEVEN, strategy="quality_first")) == [
+    assert as_pairs(order_candidates(SEVEN)) == [
         (1, "RAI 1 UHD"),
         (2, "Rai 1 4K"),
         (1, "RAI 1 HEVC"),
@@ -172,18 +170,6 @@ def test_quality_first_matches_the_spec_fixture():
         (1, "RAI 1 HD"),
         (1, "RAI 1 4K"),
         (2, "RAI 1 HD"),
-    ]
-
-
-def test_provider_first_matches_the_spec_fixture():
-    assert as_pairs(order_candidates(SEVEN, strategy="provider_first")) == [
-        (1, "RAI 1 UHD"),
-        (2, "Rai 1 4K"),
-        (1, "RAI 1 HEVC"),
-        (2, "RAI 1 SD"),
-        (1, "RAI 1 HD"),
-        (2, "RAI 1 HD"),
-        (1, "RAI 1 4K"),
     ]
 
 
@@ -199,11 +185,8 @@ def test_quality_first_alternates_providers_within_a_tier():
 
 
 def test_no_candidate_is_lost_or_duplicated():
-    for strategy in ("quality_first", "provider_first"):
-        result = order_candidates(SEVEN, strategy=strategy)
-        assert sorted(c.stream_id for c in result) == sorted(
-            c.stream_id for c in SEVEN
-        )
+    result = order_candidates(SEVEN)
+    assert sorted(c.stream_id for c in result) == sorted(c.stream_id for c in SEVEN)
 
 
 def test_single_provider_degrades_to_plain_quality_order():
@@ -220,71 +203,18 @@ def test_empty_input_gives_empty_output():
 def test_uneven_provider_counts_do_not_drop_entries():
     """zip_longest must not truncate to the shortest provider."""
     lopsided = [A_UHD, A_HEVC, A_HD, B_4K]
-    assert len(order_candidates(lopsided, strategy="provider_first")) == 4
+    assert len(order_candidates(lopsided)) == 4
 
 
-def test_unknown_strategy_falls_back_to_quality_first():
-    assert order_candidates(SEVEN, strategy="nonsense") == order_candidates(SEVEN)
+def test_rewrite_plan_assigns_final_positions_in_order():
+    assert rewrite_plan([2, 1]) == [(2, 0), (1, 1)]
 
 
-class UniqueOrderStore:
-    """Simulates a unique (channel, order) constraint."""
-
-    def __init__(self, initial):
-        self.rows = dict(initial)
-
-    def apply(self, plan):
-        for stream_id, new_order in plan:
-            for other_id, other_order in self.rows.items():
-                if other_id != stream_id and other_order == new_order:
-                    raise AssertionError(
-                        f"unique constraint violated: order {new_order} "
-                        f"already held by stream {other_id}"
-                    )
-            self.rows[stream_id] = new_order
-
-
-def test_a_naive_swap_would_violate_the_constraint():
-    """Establishes that the offset trick is solving a real problem."""
-    store = UniqueOrderStore({1: 0, 2: 1})
-    with pytest.raises(AssertionError, match="unique constraint"):
-        store.apply([(2, 0), (1, 1)])
-
-
-def test_offset_plan_reverses_order_without_collision():
-    store = UniqueOrderStore({1: 0, 2: 1})
-    store.apply(rewrite_plan({1: 0, 2: 1}, [2, 1], use_offset=True))
-    assert store.rows[2] == 0
-    assert store.rows[1] == 1
-
-
-def test_offset_plan_handles_a_full_reshuffle():
-    current = {10: 0, 11: 1, 12: 2, 13: 3}
-    desired = [13, 11, 10, 12]
-    store = UniqueOrderStore(current)
-    store.apply(rewrite_plan(current, desired, use_offset=True))
-    assert [store.rows[s] for s in desired] == [0, 1, 2, 3]
-
-
-def test_detached_rows_keep_offset_values_and_never_collide():
-    """Stream 12 is being truncated away; it must not block final positions."""
-    current = {10: 0, 11: 1, 12: 2}
-    store = UniqueOrderStore(current)
-    store.apply(rewrite_plan(current, [11, 10], use_offset=True))
-    assert store.rows[11] == 0 and store.rows[10] == 1
-    assert store.rows[12] >= 100000
-
-
-def test_without_offset_the_plan_is_just_final_assignments():
-    assert rewrite_plan({1: 0, 2: 1}, [2, 1], use_offset=False) == [(2, 0), (1, 1)]
-
-
-def test_new_streams_not_in_current_are_assigned():
-    plan = rewrite_plan({1: 0}, [1, 99], use_offset=True)
-    assert (99, 1) in plan
+def test_new_streams_are_assigned_a_position():
+    assert (99, 1) in rewrite_plan([1, 99])
 
 
 def test_empty_desired_produces_no_final_assignments():
     """A channel that matched nothing is never cleared — spec §12."""
-    assert rewrite_plan({1: 0, 2: 1}, [], use_offset=True) == []
+    assert rewrite_plan([]) == []
 

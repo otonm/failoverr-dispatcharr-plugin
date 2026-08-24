@@ -210,30 +210,6 @@ class Plugin:
             ),
         },
         {
-            "id": "match_mode",
-            "label": "Match mode",
-            "type": "select",
-            "default": "strict",
-            "options": ["strict", "fuzzy"],
-            "help_text": (
-                "strict requires an exact token match, so 'RAI 1' never picks "
-                "up 'RAI 2' or 'RAI Sport 1'. fuzzy accepts near matches and "
-                "will eventually attach a wrong channel - always Preview "
-                "before running it."
-            ),
-        },
-        {
-            "id": "fuzzy_threshold",
-            "label": "Fuzzy match threshold",
-            "type": "number",
-            "default": 85,
-            "help_text": (
-                "Only used in fuzzy mode. Lower values match more streams and "
-                "more wrong ones: 'RAI 2 HD' scores 80 against 'RAI 1', so "
-                "anything at or below 80 will attach the wrong channel."
-            ),
-        },
-        {
             "id": "strip_tokens",
             "label": "Quality tokens to ignore",
             "type": "text",
@@ -271,20 +247,6 @@ class Plugin:
             ),
         },
         {
-            "id": "order_strategy",
-            "label": "Order strategy",
-            "type": "select",
-            "default": "quality_first",
-            "options": ["quality_first", "provider_first"],
-            "help_text": (
-                "quality_first puts the best stream at position 1 and "
-                "alternates providers within each quality tier. "
-                "provider_first alternates providers from position 1, giving "
-                "better outage protection at the cost of sometimes ranking a "
-                "lower-quality stream higher."
-            ),
-        },
-        {
             "id": "rank_by_bitrate",
             "label": "Rank by bitrate",
             "type": "boolean",
@@ -296,29 +258,10 @@ class Plugin:
                 "is measured per-probe and rarely comes out identical "
                 "between streams, so leaving this on usually prevents an "
                 "exact tie from ever reaching this point - which means "
-                "quality_first's provider interleaving rarely triggers "
-                "even when everything above matches. Turn this off if "
-                "you want similar-quality streams from different "
-                "providers to actually interleave."
-            ),
-        },
-        {
-            "id": "response_time_bucket_ms",
-            "label": "Response time bucket size (ms)",
-            "type": "number",
-            "default": 250,
-            "help_text": (
-                "Response times are rounded to this granularity before "
-                "ranking, so streams with similar-but-not-identical "
-                "latency can still tie on this factor. Too fine and "
-                "near-identical latencies stop tying at all. Too coarse "
-                "and response time stops meaningfully differentiating "
-                "similar streams. Note: bitrate and height rank below "
-                "response time and are rarely identical between real "
-                "streams, so even a well-tuned bucket does not guarantee "
-                "provider interleaving on its own - turning off 'Rank by "
-                "bitrate' removes the factor most likely to break that "
-                "tie again."
+                "provider interleaving rarely triggers even when "
+                "everything above matches. Turn this off if you want "
+                "similar-quality streams from different providers to "
+                "actually interleave."
             ),
         },
         {
@@ -497,39 +440,6 @@ class Plugin:
             },
         },
         {
-            "id": "reorder_only",
-            "label": "Reorder Only",
-            "description": (
-                "Re-sorts already attached streams using cached probe data. "
-                "No probing, no matching, nothing attached or detached."
-            ),
-            "confirm": {
-                "required": True,
-                "title": "Reorder attached streams?",
-                "message": (
-                    "This will change the failover order on your channels. "
-                    + _BACKUP_WARNING
-                ),
-            },
-        },
-        {
-            "id": "probe_only",
-            "label": "Probe Only",
-            "description": (
-                "Refreshes probe data for attached streams. Does not change "
-                "which streams are attached or their order."
-            ),
-            "confirm": {
-                "required": True,
-                "title": "Probe attached streams?",
-                "message": (
-                    "This will consume provider connections for several "
-                    "minutes and update stored stream statistics. "
-                    + _BACKUP_WARNING
-                ),
-            },
-        },
-        {
             "id": "stop",
             "label": "Stop",
             "description": (
@@ -537,15 +447,6 @@ class Plugin:
                 "instant: the probe already in flight finishes, then the run "
                 "stops and releases its lock. Does nothing if nothing is "
                 "running."
-            ),
-        },
-        {
-            "id": "clear_lock",
-            "label": "Clear Lock",
-            "description": (
-                "Force-releases a stuck run lock left behind by a crashed "
-                "run. Refuses if the lock still looks like a genuinely "
-                "active run - use Stop for that instead."
             ),
         },
         {
@@ -588,10 +489,7 @@ class Plugin:
             "diagnose": self._diagnose,
             "preview": self._preview,
             "run": lambda _, c: self._start(c, "run"),
-            "reorder_only": lambda _, c: self._start(c, "reorder_only"),
-            "probe_only": lambda _, c: self._start(c, "probe_only"),
             "stop": self._stop,
-            "clear_lock": self._clear_lock,
             "clear_state": self._clear_state,
             "show_status": self._show_status,
         }
@@ -602,7 +500,7 @@ class Plugin:
         try:
             result = handler(params or {}, context)
         except Exception as exc:
-            # This is the plugin's outer boundary: whichever of the nine
+            # This is the plugin's outer boundary: whichever of the six
             # action handlers just ran can fail in ways specific to it (a
             # bad ffprobe path, a Django error, a malformed setting), and
             # every one of them has to come back as a normal error dict -
@@ -660,7 +558,6 @@ class Plugin:
                 "channel_stream_model": str(resolved.channel_stream_model),
                 "order_field": resolved.order_field,
                 "provider_field": resolved.provider_field,
-                "has_unique_order_constraint": resolved.has_unique_order_constraint,
                 "channel_stream_fields": sorted(
                     f.name for f in resolved.channel_stream_model._meta.get_fields()
                 ),
@@ -710,12 +607,6 @@ class Plugin:
 
         (context.get("logger") or logger).info("FAILOVERR stop requested by user")
         return pipeline.stop_run()
-
-    def _clear_lock(self, params, context):
-        from . import pipeline
-
-        (context.get("logger") or logger).info("FAILOVERR lock cleared by user")
-        return pipeline.clear_lock()
 
     def _clear_state(self, params, context):
         from . import pipeline

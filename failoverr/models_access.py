@@ -19,13 +19,9 @@ import logging
 import shutil
 import subprocess
 
-from .ordering import ORDER_OFFSET, rewrite_plan
+from .ordering import rewrite_plan
 
 logger = logging.getLogger("failoverr")
-
-_ORDER_FIELD_CANDIDATES = ["order"]
-_PROVIDER_FIELD_CANDIDATES = ["m3u_account"]
-
 
 class FieldResolutionError(Exception):
     """Raised when no candidate field name exists on a model."""
@@ -50,26 +46,6 @@ class ResolvedModels:
     channel_stream_model: object
     order_field: str
     provider_field: str
-    has_unique_order_constraint: bool
-
-
-def _detect_unique_order_constraint(model, order_field):
-    """Report a unique (channel, order) constraint: it forces the offset trick."""
-    # Lazy per the module docstring - this is the specific import that
-    # originally motivated the policy (it used to sit at module level).
-    from django.db.models import UniqueConstraint
-
-    for unique_together in getattr(model._meta, "unique_together", ()) or ():
-        if order_field in unique_together:
-            return True
-    for constraint in getattr(model._meta, "constraints", ()) or ():
-        fields = getattr(constraint, "fields", ()) or ()
-        if (
-            order_field in fields
-            and isinstance(constraint, UniqueConstraint)
-        ):
-            return True
-    return False
 
 
 def resolve_models():
@@ -78,25 +54,17 @@ def resolve_models():
     from apps.channels.models import Channel, Stream
 
     # Channel.streams.through is authoritative regardless of whether the
-    # M2M's through-model has its own importable name (CLAUDE.md §4): when
-    # one is set via `through=`, Django's .through returns exactly that
-    # class either way.
+    # M2M's through-model has its own importable name: when one is set via
+    # `through=`, Django's .through returns exactly that class either way.
     channel_stream = Channel.streams.through
-    order_field = resolve_field(
-        channel_stream, _ORDER_FIELD_CANDIDATES, "stream ordering"
-    )
-    provider_field = resolve_field(
-        Stream, _PROVIDER_FIELD_CANDIDATES, "the M3U provider link"
-    )
+    order_field = resolve_field(channel_stream, ["order"], "stream ordering")
+    provider_field = resolve_field(Stream, ["m3u_account"], "the M3U provider link")
     return ResolvedModels(
         channel_model=Channel,
         stream_model=Stream,
         channel_stream_model=channel_stream,
         order_field=order_field,
         provider_field=provider_field,
-        has_unique_order_constraint=_detect_unique_order_constraint(
-            channel_stream, order_field
-        ),
     )
 
 
@@ -128,13 +96,24 @@ def _module_available(name):
     return {"available": True, "version": getattr(module, "__version__", "unknown")}
 
 
-def _gevent_status():
-    """Decides the execution model. See spec §6."""
+def gevent_monkey():
+    """gevent.monkey if gevent is installed and importable, else None.
+
+    Shared by pipeline._gevent_patched (execution model) and _gevent_status
+    below (Diagnose report) - gevent is an optional third-party dependency,
+    not stdlib, so both call sites need the same ImportError guard.
+    """
     try:
-        # gevent is an optional third-party dependency, not stdlib - it may
-        # not be installed at all outside the live Dispatcharr container.
         from gevent import monkey
     except ImportError:
+        return None
+    return monkey
+
+
+def _gevent_status():
+    """Decides the execution model. See spec §6."""
+    monkey = gevent_monkey()
+    if monkey is None:
         return {"gevent": False, "patched": {}}
     return {
         "gevent": True,
@@ -151,15 +130,10 @@ def environment_report(ffprobe_path, ffmpeg_path):
         "ffmpeg": _binary_version(ffmpeg_path),
         "gevent": _gevent_status(),
         "celery_beat": _module_available("django_celery_beat"),
-        # both halves of scheduling._timezone's chain: zoneinfo first, pytz
-        # as the fallback. Reporting only one makes a timezone failure
-        # undiagnosable from the report alone.
-        "zoneinfo": _module_available("zoneinfo"),
-        "pytz": _module_available("pytz"),
     }
 
 
-def plan_writes(current, ordered_ids, detach_ids, use_offset):
+def plan_writes(current, ordered_ids, detach_ids):
     """Turn a channel plan into concrete write operations.
 
     `current` maps attached stream_id -> current order. Returns attach /
@@ -169,11 +143,9 @@ def plan_writes(current, ordered_ids, detach_ids, use_offset):
     Caller contract: `ordered_ids` must include every stream_id the caller
     wants to remain attached, not just newly matched ones — a currently
     attached stream that is kept but merely omitted from `ordered_ids` is
-    neither detached nor given a final order; its order keeps escalating by
-    ORDER_OFFSET on every run that omits it, since it is never assigned a
-    position by the pass below. The Phase 5 candidate-assembly step
-    ("newly matched streams + streams already attached", CLAUDE.md §6) is
-    what is meant to guarantee this in practice.
+    neither detached nor given a final order. The candidate-assembly step
+    ("newly matched streams + streams already attached") is what is meant
+    to guarantee this in practice.
     """
     ordered_ids = list(dict.fromkeys(ordered_ids))
     if not ordered_ids:
@@ -182,20 +154,8 @@ def plan_writes(current, ordered_ids, detach_ids, use_offset):
     return {
         "attach": [sid for sid in ordered_ids if sid not in current],
         "detach": [sid for sid in detach_ids if sid not in keep],
-        "orders": rewrite_plan(current, ordered_ids, use_offset),
+        "orders": rewrite_plan(ordered_ids),
     }
-
-
-def placeholder_orders(current, attach):
-    """Distinct create-time orders for newly attached rows.
-
-    Provably disjoint from rewrite_plan's bump range (v + ORDER_OFFSET for
-    v in current.values()) regardless of how many rows exist or their
-    values, since it starts past the highest possible bump target. Both
-    sides read the one ORDER_OFFSET defined in ordering.py.
-    """
-    high_water = max(current.values(), default=-1)
-    return [ORDER_OFFSET + high_water + 1 + index for index in range(len(attach))]
 
 
 def apply_channel_plan(resolved, channel, ordered_ids, detach_ids, dry_run):
@@ -215,9 +175,7 @@ def apply_channel_plan(resolved, channel, ordered_ids, detach_ids, dry_run):
             link.stream_id: getattr(link, order_field)
             for link in link_model.objects.select_for_update().filter(channel=channel)
         }
-        plan = plan_writes(
-            current, ordered_ids, detach_ids, resolved.has_unique_order_constraint
-        )
+        plan = plan_writes(current, ordered_ids, detach_ids)
         logger.debug(
             "FAILOVERR apply_channel_plan: channel=%s ordered=%s "
             "attach=%s detach=%s dry_run=%s",
@@ -230,15 +188,13 @@ def apply_channel_plan(resolved, channel, ordered_ids, detach_ids, dry_run):
         if dry_run or not plan["orders"]:
             return summary
 
-        # Placeholder orders for new rows must be disjoint from every value
-        # the order pass below might use, including rewrite_plan's bump
-        # range — see placeholder_orders(). The order pass right after
-        # overwrites all of these unconditionally.
-        for stream_id, order in zip(
-            plan["attach"], placeholder_orders(current, plan["attach"]), strict=True
-        ):
+        # Dispatcharr's ChannelStream carries no unique constraint on order
+        # (only on channel+stream), so a new row's create-time order value
+        # is never checked for collisions. The order pass right after
+        # overwrites it unconditionally regardless.
+        for stream_id in plan["attach"]:
             link_model.objects.create(
-                channel=channel, stream_id=stream_id, **{order_field: order}
+                channel=channel, stream_id=stream_id, **{order_field: 0}
             )
         for stream_id, new_order in plan["orders"]:
             link_model.objects.filter(

@@ -5,7 +5,6 @@ Pure module: imports nothing from Django or Dispatcharr.
 
 import re
 import unicodedata
-from difflib import SequenceMatcher
 
 DEFAULT_STRIP_TOKENS = (
     "4k", "uhd", "fhd", "hd", "sd", "hevc", "h265", "h264", "avc", "raw",
@@ -75,28 +74,3 @@ def normalize(name, strip_tokens=DEFAULT_STRIP_TOKENS, map_number_words=True):
     if map_number_words:
         tokens = [_NUMBER_WORDS.get(t, t) for t in tokens]
     return tuple(tokens)
-
-
-def score(a, b):
-    """0-100 similarity between two token tuples.
-
-    Truncates rather than rounds: 'rai sport 1' against 'rai 1' is 0.625,
-    which spec §16 pins at 62.
-    """
-    if not a or not b:
-        return 0
-    if tuple(a) == tuple(b):
-        return 100
-    if sorted(a) == sorted(b):
-        return 98
-    ratio = SequenceMatcher(None, " ".join(a), " ".join(b)).ratio()
-    return int(ratio * 100)
-
-
-def matches(channel_tokens, stream_tokens, mode="strict", threshold=85):
-    """Decide whether this stream belongs on this channel."""
-    if not channel_tokens or not stream_tokens:
-        return False
-    if mode == "strict":
-        return set(channel_tokens) == set(stream_tokens)
-    return score(channel_tokens, stream_tokens) >= threshold

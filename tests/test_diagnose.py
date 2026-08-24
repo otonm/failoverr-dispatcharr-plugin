@@ -92,7 +92,7 @@ def test_every_declared_action_has_a_handler(action_id, monkeypatch, tmp_path):
     monkeypatch.setattr("failoverr.pipeline.start", fail)
     monkeypatch.setattr("failoverr.pipeline.run_preview", fail)
 
-    # stop/clear_lock/clear_state/show_status touch the filesystem directly
+    # stop/clear_state/show_status touch the filesystem directly
     # (_LOCK_PATH, _CANCEL_PATH, STATE_PATH, DEFAULT_PATH). Point them at tmp_path
     # so the test never hits real /data/failoverr/* paths.
     lock = str(tmp_path / "run.lock")
@@ -111,7 +111,7 @@ def test_diagnose_computes_settings_via_pipeline_load_settings(monkeypatch):
     """Diagnose must reuse pipeline.load_settings rather than re-parsing.
 
     strip_tokens/map_number_words/paths itself - two copies of those
-    defaults would silently drift (ponytail-audit finding #1).
+    defaults would silently drift.
     """
     from failoverr import pipeline
 

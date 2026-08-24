@@ -37,7 +37,7 @@ def test_every_field_has_help_text():
 def test_mutating_actions_require_confirmation():
     from failoverr.plugin import Plugin
 
-    mutating = {"run", "reorder_only", "probe_only", "clear_state"}
+    mutating = {"run", "clear_state"}
     for action in Plugin.actions:
         if action["id"] in mutating:
             assert action.get("confirm", {}).get("required") is True, (
@@ -74,17 +74,6 @@ def test_rank_by_bitrate_defaults_to_true():
     field = next(f for f in Plugin.fields if f["id"] == "rank_by_bitrate")
     assert field["type"] == "boolean"
     assert field["default"] is True
-
-
-def test_response_time_bucket_ms_field_exists_with_a_sane_default():
-    from failoverr.ordering import DEFAULT_RESPONSE_TIME_BUCKET_MS
-    from failoverr.plugin import Plugin
-
-    field = next(f for f in Plugin.fields if f["id"] == "response_time_bucket_ms")
-    assert field["type"] == "number"
-    # the constant, not a literal: the UI default and the ranking fallback
-    # are the same number and must stay that way.
-    assert field["default"] == DEFAULT_RESPONSE_TIME_BUCKET_MS
 
 
 def test_every_settings_field_id_is_consumed_by_load_settings():
@@ -133,7 +122,7 @@ def test_every_settings_default_matches_the_field_default():
 
 
 def test_no_module_level_django_or_dispatcharr_imports():
-    """CLAUDE.md: Django/Dispatcharr imports stay inside functions.
+    """Django/Dispatcharr imports stay inside functions.
 
     The pure modules must import with neither Django nor celery installed,
     which is what lets `uv run --with pytest pytest tests/` work with no

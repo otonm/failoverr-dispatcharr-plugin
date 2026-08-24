@@ -6,11 +6,9 @@ import pytest
 from failoverr.models_access import (
     FieldResolutionError,
     apply_channel_plan,
-    placeholder_orders,
     plan_writes,
     resolve_field,
 )
-from failoverr.ordering import rewrite_plan
 
 
 class FakeField:
@@ -58,88 +56,43 @@ def test_raises_listing_available_fields_when_none_match():
 
 def test_empty_ordered_list_produces_no_writes():
     """Spec §12: a channel that matched nothing is never cleared."""
-    assert plan_writes({1: 0, 2: 1}, [], [1, 2], use_offset=False) == {
+    assert plan_writes({1: 0, 2: 1}, [], [1, 2]) == {
         "attach": [], "detach": [], "orders": []
     }
 
 
 def test_new_streams_are_attached_and_missing_ones_detached():
-    result = plan_writes({1: 0, 2: 1}, [1, 3], [2], use_offset=False)
+    result = plan_writes({1: 0, 2: 1}, [1, 3], [2])
     assert result["attach"] == [3]
     assert result["detach"] == [2]
     assert result["orders"] == [(1, 0), (3, 1)]
 
 
-def test_offset_mode_bumps_existing_rows_first():
-    result = plan_writes({1: 0, 2: 1}, [2, 1], [], use_offset=True)
-    bumps = [o for o in result["orders"] if o[1] >= 100000]
-    assert len(bumps) == 2
-    assert result["orders"][-2:] == [(2, 0), (1, 1)]
-
-
 def test_detach_list_never_includes_a_stream_being_kept():
-    result = plan_writes({1: 0, 2: 1}, [1, 2], [1], use_offset=False)
+    result = plan_writes({1: 0, 2: 1}, [1, 2], [1])
     assert result["detach"] == []
 
 
-def test_an_omitted_attached_stream_keeps_escalating():
+def test_an_omitted_attached_stream_is_left_untouched():
     """A stream in current but omitted from both ordered_ids and detach_ids.
 
     plan_writes' docstring documents this as a caller contract hazard: the
-    stream is neither detached nor given a final order, so its order keeps
-    escalating by offset on every run that omits it. This test pins that
-    behavior so a future change to the contract is caught.
+    stream is neither detached nor given a final order, so its order is
+    simply never written by this pass.
     """
     current = {1: 0, 2: 1}
-    result = plan_writes(current, [1], [], use_offset=True)
-    orders = result["orders"]
-    stream_2_orders = [order for sid, order in orders if sid == 2]
-    assert stream_2_orders == [100001], (
-        "stream 2 is bumped into the offset range but never assigned a "
-        "final position - its order will keep escalating by offset on "
-        "every run that omits it"
-    )
+    result = plan_writes(current, [1], [])
+    stream_2_orders = [order for sid, order in result["orders"] if sid == 2]
+    assert stream_2_orders == [], "stream 2's order must not be touched"
     assert 2 not in result["detach"], "stream 2 is not detached either"
 
 
 def test_duplicate_ordered_ids_do_not_produce_a_duplicate_attach_entry():
     """Regression: duplicates used to create two rows with contradictory orders."""
-    result = plan_writes({1: 0}, [2, 2, 1], [], use_offset=True)
+    result = plan_writes({1: 0}, [2, 2, 1], [])
     assert result["attach"] == [2]
     ordered_stream_ids = [sid for sid, _order in result["orders"]]
     assert ordered_stream_ids.count(2) == 1
-
-
-# --- placeholder_orders ------------------------------------------------------
-
-
-def test_placeholder_orders_are_disjoint_from_the_bump_range():
-    """The invariant that broke twice during task review.
-
-    New-row placeholder orders must never collide with rewrite_plan's bump
-    range. The range is read back out of rewrite_plan rather than recomputed
-    here: a hardcoded `v + 100000` would still pass if the two halves ever
-    stopped sharing ORDER_OFFSET, which is the only way this can break.
-
-    Sized so a divergence would actually show: a delta of 1..len(attach)
-    collides, larger deltas overshoot the placeholders entirely.
-    """
-    current = {10: 0, 11: 1, 12: 2}
-    attach = list(range(20, 30))
-    placeholders = set(placeholder_orders(current, attach))
-    bump_targets = {
-        order for _, order in rewrite_plan(current, [*attach, 10, 11, 12], True)
-    }
-    assert not (placeholders & bump_targets)
-
-
-def test_placeholder_orders_are_mutually_distinct():
-    placeholders = placeholder_orders({1: 0}, attach=[2, 3, 4])
-    assert len(placeholders) == len(set(placeholders))
-
-
-def test_placeholder_orders_with_no_existing_rows():
-    assert placeholder_orders({}, attach=[1, 2]) == [100000, 100001]
 
 
 # --- apply_channel_plan --------------------------------------------------
@@ -227,11 +180,10 @@ def _fake_django_db(monkeypatch):
     monkeypatch.setitem(sys.modules, "django", types.SimpleNamespace(db=fake_db))
 
 
-def _resolved(link_model, order_field="order", use_offset=False):
+def _resolved(link_model, order_field="order"):
     return types.SimpleNamespace(
         channel_stream_model=link_model,
         order_field=order_field,
-        has_unique_order_constraint=use_offset,
     )
 
 
@@ -274,33 +226,6 @@ def test_apply_channel_plan_dry_run_never_writes():
     assert [row.stream_id for row in link_model.rows] == [1], (
         "dry_run must never attach, reorder, or detach"
     )
-
-
-def test_apply_channel_plan_use_offset_path_placeholder_bump_rewrite():
-    """End-to-end test of the unique-constraint offset path.
-
-    When has_unique_order_constraint=True, apply_channel_plan must:
-    1. Bump existing rows by offset (placeholder_orders)
-    2. Create new rows with placeholder orders
-    3. Rewrite all rows to their final positions
-    Covers the sequencing only - FakeChannelStreamModel does not enforce
-    uniqueness, so the no-collision half of the invariant is pinned by
-    test_placeholder_orders_are_disjoint_from_the_bump_range above and by
-    UniqueOrderStore in test_ordering.py.
-    """
-    channel = types.SimpleNamespace(name="Test Channel")
-    link_model = FakeChannelStreamModel(
-        [_FakeLinkRow(channel, 1, 0), _FakeLinkRow(channel, 2, 1)]
-    )
-    resolved = _resolved(link_model, use_offset=True)
-
-    summary = apply_channel_plan(resolved, channel, [2, 3], [1], dry_run=False)
-
-    remaining = {row.stream_id: row.order for row in link_model.rows}
-    assert 1 not in remaining, "stream 1 must be detached"
-    assert remaining[2] == 0, "stream 2 must be at position 0"
-    assert remaining[3] == 1, "stream 3 must be at position 1"
-    assert summary == {"attached": 1, "detached": 1}
 
 
 # --- save_stream_stats -----------------------------------------------------

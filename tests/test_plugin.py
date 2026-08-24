@@ -50,7 +50,7 @@ def test_status_message_flags_stop_while_running():
 def test_status_message_fallback_when_channel_index_missing():
     """Missing channel_index shows as None in the message."""
     lock = {
-        "holder": "reorder_only",
+        "holder": "run",
         "progress": {
             "channels_total": 6, "channel_name": "RAI Movie",
             "new_found": 0, "attached": 0, "detached": 0,

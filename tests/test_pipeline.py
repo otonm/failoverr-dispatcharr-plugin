@@ -18,7 +18,6 @@ from failoverr.pipeline import (
     StreamRow,
     acquire_lock,
     build_index,
-    clear_lock,
     find_matches,
     load_settings,
     lock_status,
@@ -73,28 +72,19 @@ def test_index_groups_streams_that_reduce_to_the_same_tokens():
 
 def test_strict_matching_finds_only_the_right_channel():
     index = build_index(POOL)
-    found = find_matches(normalize("RAI 1"), index, mode="strict")
+    found = find_matches(normalize("RAI 1"), index)
     assert {r.stream_id for r in found} == {1, 2, 3}
 
 
 def test_strict_matching_excludes_rai_2_and_rai_sport():
     index = build_index(POOL)
-    found = {
-        r.stream_id for r in find_matches(normalize("RAI 1"), index, mode="strict")
-    }
+    found = {r.stream_id for r in find_matches(normalize("RAI 1"), index)}
     assert 4 not in found and 5 not in found and 6 not in found
 
 
 def test_channel_with_no_matches_returns_empty():
     index = build_index(POOL)
-    assert find_matches(normalize("BBC One"), index, mode="strict") == []
-
-
-def test_fuzzy_matching_widens_the_net():
-    index = build_index(POOL)
-    found = {r.stream_id for r in
-             find_matches(normalize("RAI 1"), index, mode="fuzzy", threshold=60)}
-    assert 5 in found, "fuzzy at 60 should pull in RAI Sport 1 (scores 62)"
+    assert find_matches(normalize("BBC One"), index) == []
 
 
 def test_empty_pool_indexes_cleanly():
@@ -119,7 +109,6 @@ def plan(state, attached=(), candidates=POOL[:3], max_streams=10):
         state=state,
         threshold=3,
         max_streams=max_streams,
-        strategy="quality_first",
         codec_priority=("hevc", "h265", "h264", "avc"),
     )
 
@@ -139,7 +128,7 @@ def test_plan_channel_ranks_by_response_time_from_state(tmp_path):
 
     ordered, _detach = plan_channel(
         attached_ids=set(), candidates=[slow, fast], state=state, threshold=3,
-        max_streams=10, strategy="quality_first", codec_priority=("hevc",),
+        max_streams=10, codec_priority=("hevc",),
     )
 
     assert ordered[0] == 2
@@ -428,22 +417,17 @@ def test_report_row_falls_back_to_the_stream_id_when_the_row_is_missing():
 def test_load_settings_applies_defaults_for_missing_keys():
     settings = load_settings({"settings": {}})
     assert settings["dry_run"] is True
-    assert settings["match_mode"] == "strict"
     assert settings["removal_failure_threshold"] == 3
 
 
 def test_load_settings_defaults_the_ranking_toggle_to_true():
     settings = load_settings({"settings": {}})
     assert settings["rank_by_bitrate"] is True
-    assert settings["response_time_bucket_ms"] == 250
 
 
 def test_load_settings_coerces_the_ranking_toggle():
-    settings = load_settings({"settings": {
-        "rank_by_bitrate": "false", "response_time_bucket_ms": "500",
-    }})
+    settings = load_settings({"settings": {"rank_by_bitrate": "false"}})
     assert settings["rank_by_bitrate"] is False
-    assert settings["response_time_bucket_ms"] == 500
 
 
 def test_load_settings_coerces_numeric_strings():
@@ -521,9 +505,9 @@ def test_load_settings_parses_the_channel_name_list():
 def _reset_lock(tmp_path, monkeypatch):
     monkeypatch.setattr(pipeline_module, "_LOCK_PATH", str(tmp_path / "run.lock"))
     monkeypatch.setattr(pipeline_module, "_CANCEL_PATH", str(tmp_path / "cancel.flag"))
-    clear_lock()
+    release_lock()
     yield
-    clear_lock()
+    release_lock()
 
 
 def test_lock_is_acquired_when_free():
@@ -548,44 +532,8 @@ def test_stale_lock_is_stolen_after_the_ttl():
 
 
 def test_lock_status_reports_the_holder():
-    acquire_lock("probe_only", now=0.0)
-    assert lock_status()["holder"] == "probe_only"
-
-
-def test_clear_lock_releases_a_held_lock():
     acquire_lock("run", now=0.0)
-    clear_lock()
-    assert lock_status()["holder"] is None
-
-
-def test_clear_lock_refuses_a_still_active_run():
-    """Clear Lock must not free the lock out from under a genuinely active run.
-
-    Freeing it would let a second run start while the first is still
-    probing - two runs writing state.json/attaching streams at once. It
-    must refuse and point at Stop instead, and must not itself set the
-    cancel flag - that would silently turn Clear Lock into a second Stop
-    button with different wording, which is exactly the confusion Stop was
-    added to resolve.
-    """
-    acquire_lock("run", now=1000.0)
-    result = clear_lock(now=1005.0)  # well within LOCK_TTL_SECONDS
-    assert result["status"] == "error"
     assert lock_status()["holder"] == "run"
-    assert pipeline_module.cancel_requested() is False
-
-
-def test_clear_lock_force_releases_a_stale_lock_and_drops_any_cancel_flag():
-    acquire_lock("run", now=0.0)
-    pipeline_module.request_cancel()
-    clear_lock(now=LOCK_TTL_SECONDS + 1)
-    assert lock_status()["holder"] is None
-    assert pipeline_module.cancel_requested() is False
-
-
-def test_clear_lock_reports_already_clear_when_nothing_is_running():
-    result = clear_lock()
-    assert result["status"] == "ok"
 
 
 def test_corrupt_lock_file_is_treated_as_empty_and_logged(caplog):
@@ -634,7 +582,8 @@ def test_clear_state_refuses_while_a_run_is_genuinely_active(tmp_path, monkeypat
     """Clearing mid-run would be silently undone by that run's next save().
 
     It holds its own State instance in memory, so it must be refused rather
-    than racing - same reasoning as clear_lock's active/stale split.
+    than racing - the same active/stale distinction acquire_lock's
+    self-heal relies on.
     """
     monkeypatch.setattr(pipeline_module, "STATE_PATH", tmp_path / "state.json")
     acquire_lock("run", now=time.time())
@@ -788,18 +737,18 @@ def test_update_progress_heartbeat_prevents_a_steal_at_the_original_ttl_deadline
 def test_release_lock_no_ops_when_it_no_longer_owns_the_lock():
     """Regression: release_lock wiped any lock, not just its own.
 
-    A run whose lock was force-cleared (Clear Lock) and then re-acquired by
-    a second run would still call release_lock() on its way out, clearing
-    the SECOND run's lock and letting a third start - the two-runs-at-once
-    hazard the lock exists to prevent. release_lock now checks it still
-    owns the lock (holder matches) before clearing.
+    A run whose lock was force-cleared (release_lock()) and then
+    re-acquired by a second run would still call release_lock() on its way
+    out, clearing the SECOND run's lock and letting a third start - the
+    two-runs-at-once hazard the lock exists to prevent. release_lock now
+    checks it still owns the lock (holder matches) before clearing.
     """
     acquire_lock("run", now=0.0)
-    release_lock()  # force-clear (the Clear Lock path, holder=None)
-    acquire_lock("reorder_only", now=10.0)
+    release_lock()  # force-clear, holder=None
+    acquire_lock("preview", now=10.0)
     # Run A's release_lock("run") must NOT clear B's lock.
     release_lock("run")
-    assert lock_status()["holder"] == "reorder_only"
+    assert lock_status()["holder"] == "preview"
 
 
 def test_update_progress_heartbeat_no_ops_when_it_no_longer_owns_the_lock():
@@ -811,10 +760,10 @@ def test_update_progress_heartbeat_no_ops_when_it_no_longer_owns_the_lock():
     """
     acquire_lock("run", now=0.0)
     release_lock()
-    acquire_lock("reorder_only", now=10.0)
+    acquire_lock("preview", now=10.0)
     # Run A's heartbeat must NOT touch B's lock timestamp.
     update_progress("run", now=9999.0)
-    assert lock_status()["holder"] == "reorder_only"
+    assert lock_status()["holder"] == "preview"
     assert lock_status()["since"] == 10.0
 
 
@@ -838,12 +787,13 @@ def test_acquire_lock_uses_a_ttl_that_outlives_max_run_minutes():
 def test_run_pipeline_heartbeats_the_lock_between_channels(
     tmp_path, monkeypatch,
 ):
-    """The lock heartbeat fired only every 25 probes, never during a reorder_only run.
+    """The lock heartbeat fired only every 25 probes, never when nothing needs probing.
 
-    reorder_only skips probing entirely, and the 25-probe cadence never
-    fires between channels either, so a non-probing run's lock could go
-    stale and be force-cleared mid-run. The lock now refreshes at every
-    channel boundary and after indexing.
+    A run whose candidates are all fresh (nothing to re-probe) never
+    exercises the 25-probe cadence, and that cadence never fires between
+    channels either, so such a run's lock could go stale and be
+    force-cleared mid-run. The lock now refreshes at every channel
+    boundary and after indexing.
     """
     channel_a = types.SimpleNamespace(name="RAI 1")
     channel_b = types.SimpleNamespace(name="RAI 2")
@@ -868,6 +818,7 @@ def test_run_pipeline_heartbeats_the_lock_between_channels(
         return real_update_progress(*args, **kwargs)
 
     monkeypatch.setattr(pipeline_module, "update_progress", counting_update_progress)
+    monkeypatch.setattr(pipeline_module, "iter_pool", lambda *_a, **_kw: iter([]))
     monkeypatch.setattr(
         pipeline_module, "select_channels",
         lambda *_a, **_kw: [channel_a, channel_b],
@@ -890,10 +841,10 @@ def test_run_pipeline_heartbeats_the_lock_between_channels(
         lambda *_a, **_kw: {"attached": 0, "detached": 0},
     )
 
-    run_pipeline({"settings": {}}, mode="reorder_only")
+    run_pipeline({"settings": {}}, mode="run")
 
-    # 1 after-index heartbeat + 2 per-channel heartbeats (reorder_only never
-    # probes, so the 25-probe cadence contributes nothing).
+    # 1 after-index heartbeat + 2 per-channel heartbeats (every candidate is
+    # fresh, so the 25-probe cadence contributes nothing).
     assert len(refreshes) == 3, (
         f"expected 3 lock heartbeats (after-index + 2 channels), "
         f"got {len(refreshes)}"
@@ -991,6 +942,10 @@ def _patch_common(monkeypatch, tmp_path, channel, attached, state):
     monkeypatch.setattr(
         pipeline_module, "iter_attached_rows", lambda *_a, **_kw: iter(attached)
     )
+    # index-building (build_index(iter_pool(...))) always runs now, so give
+    # it a harmless empty pool - these tests only exercise already-attached
+    # candidates, never newly matched ones.
+    monkeypatch.setattr(pipeline_module, "iter_pool", lambda *_a, **_kw: iter([]))
     monkeypatch.setattr(
         pipeline_module.State, "load", staticmethod(lambda *_a, **_kw: state)
     )
@@ -1003,97 +958,26 @@ def _patch_common(monkeypatch, tmp_path, channel, attached, state):
     # Individual tests override one of these to assert it was really called.
     monkeypatch.setattr(pipeline_module, "_close_old_connections", lambda: None)
     monkeypatch.setattr(pipeline_module, "_close_connection", lambda: None)
-
-
-def test_reorder_only_never_detaches_via_a_stale_cross_run_failure_counter(
-    tmp_path, monkeypatch
-):
-    """Finding 1 regression.
-
-    A stream that racked up 3 consecutive INVALID verdicts under prior
-    Probe Only runs must not be detached by a later Reorder Only run:
-    that action's own description promises "nothing attached or detached".
-    """
-    channel = types.SimpleNamespace(name="RAI 1")
-    healthy = row(1, "IT: RAI 1 HD", "A")
-    failing = row(2, "IT: RAI 1 4K", "B")
-    state = _make_state(tmp_path)
-    state.record(1, healthy.url, VALID)
-    for _ in range(3):
-        state.record(2, failing.url, INVALID)
-    _patch_common(monkeypatch, tmp_path, channel, [healthy, failing], state)
-
-    apply_calls = []
-
-    def fake_apply(resolved, ch, ordered, detach, dry_run):  # noqa: ARG001
-        apply_calls.append((ordered, detach))
-        return {"attached": 0, "detached": len(detach)}
-
-    monkeypatch.setattr(models_access_module, "apply_channel_plan", fake_apply)
-
-    result = run_pipeline({"settings": {}}, mode="reorder_only")
-
-    assert result["detached"] == 0
-    assert apply_calls == [([1], [])], (
-        "stream 2 has 3 consecutive failures and would normally be "
-        "detached by plan_channel, but Reorder Only must discard that"
-    )
-
-
-def test_reorder_only_report_includes_the_response_time_column(tmp_path, monkeypatch):
-    channel = types.SimpleNamespace(name="RAI 1")
-    attached = [row(1, "IT: RAI 1 HD", "A")]
-    state = _make_state(tmp_path)
-    state.record(1, attached[0].url, VALID, response_time_ms=180)
-    _patch_common(monkeypatch, tmp_path, channel, attached, state)
+    # apply_channel_plan is always reached now too (no more probe_only early
+    # exit); individual tests override this when they need to inspect calls.
     monkeypatch.setattr(
         models_access_module, "apply_channel_plan",
         lambda *_a, **_kw: {"attached": 0, "detached": 0},
     )
 
-    result = run_pipeline({"settings": {}}, mode="reorder_only")
+
+def test_run_pipeline_report_includes_the_response_time_column(tmp_path, monkeypatch):
+    channel = types.SimpleNamespace(name="RAI 1")
+    attached = [row(1, "IT: RAI 1 HD", "A")]
+    state = _make_state(tmp_path)
+    state.record(1, attached[0].url, VALID, response_time_ms=180)
+    _patch_common(monkeypatch, tmp_path, channel, attached, state)
+
+    result = run_pipeline({"settings": {}}, mode="run")
 
     with pathlib.Path(result["report"]).open(newline="") as handle:
         rows = list(csv.DictReader(handle))
     assert rows[0]["response_time_ms"] == "180"
-
-
-@pytest.mark.parametrize("mode", ["reorder_only", "probe_only"])
-def test_non_run_modes_never_index_the_pool_or_match_by_name(
-    mode, tmp_path, monkeypatch
-):
-    """Finding 2: reorder_only/probe_only must not discover new streams.
-
-    Also covers probe_only never calling apply_channel_plan: the spy below
-    records zero calls for that mode.
-    """
-    channel = types.SimpleNamespace(name="RAI 1")
-    attached = [row(1, "IT: RAI 1 HD", "A")]
-    state = _make_state(tmp_path)
-    state.record(1, attached[0].url, VALID)  # fresh: probe_only won't re-probe it
-    _patch_common(monkeypatch, tmp_path, channel, attached, state)
-
-    def _forbidden(*_args, **_kwargs):
-        raise AssertionError(f"must not run in {mode} mode")
-
-    monkeypatch.setattr(pipeline_module, "iter_pool", _forbidden)
-    monkeypatch.setattr(pipeline_module, "find_matches", _forbidden)
-
-    apply_calls = []
-
-    def fake_apply(resolved, ch, ordered, detach, dry_run):  # noqa: ARG001
-        apply_calls.append((ordered, detach))
-        return {"attached": 0, "detached": 0}
-
-    monkeypatch.setattr(models_access_module, "apply_channel_plan", fake_apply)
-
-    result = run_pipeline({"settings": {}}, mode=mode)
-
-    assert result["status"] == "ok"
-    if mode == "reorder_only":
-        assert apply_calls == [([1], [])]
-    else:
-        assert apply_calls == [], "probe_only must never call apply_channel_plan"
 
 
 # --- Run-ending status: completed / canceled / interrupted -----------------
@@ -1121,7 +1005,7 @@ def test_run_pipeline_reports_canceled_when_the_cancel_flag_is_set(
     _stub_probe_one(monkeypatch)
     monkeypatch.setattr(pipeline_module, "cancel_requested", lambda: True)
 
-    result = run_pipeline({"settings": {}}, mode="probe_only")
+    result = run_pipeline({"settings": {}}, mode="run")
 
     assert result["status"] == "canceled"
     assert result["probed"] == 0, "canceled before the first probe was spent"
@@ -1159,6 +1043,7 @@ def test_cancel_mid_run_stops_writes_for_remaining_channels(tmp_path, monkeypatc
         pipeline_module, "report_path", lambda mode: tmp_path / f"{mode}.csv"
     )
     monkeypatch.setattr(models_access_module, "resolve_models", object)
+    monkeypatch.setattr(pipeline_module, "iter_pool", lambda *_a, **_kw: iter([]))
     monkeypatch.setattr(pipeline_module, "_close_old_connections", lambda: None)
     monkeypatch.setattr(pipeline_module, "_close_connection", lambda: None)
 
@@ -1173,7 +1058,7 @@ def test_cancel_mid_run_stops_writes_for_remaining_channels(tmp_path, monkeypatc
     monkeypatch.setattr(models_access_module, "apply_channel_plan", fake_apply)
     monkeypatch.setattr(pipeline_module, "cancel_requested", lambda: canceled["flag"])
 
-    result = run_pipeline({"settings": {}}, mode="reorder_only")
+    result = run_pipeline({"settings": {}}, mode="run")
 
     assert apply_calls == ["RAI 1"], (
         "Stop pressed after channel 1 must skip channel 2's destructive writes"
@@ -1201,7 +1086,7 @@ def test_run_pipeline_reports_interrupted_when_a_budget_is_exhausted(
         lambda _c: {**load_settings({"settings": {}}), "max_probes_per_run": 1},
     )
 
-    result = run_pipeline({"settings": {}}, mode="probe_only")
+    result = run_pipeline({"settings": {}}, mode="run")
 
     assert result["status"] == "interrupted"
     assert result["probed"] == 1
@@ -1214,7 +1099,7 @@ def test_run_pipeline_reports_ok_on_a_normal_finish(tmp_path, monkeypatch):
     state.record(1, attached[0].url, VALID)  # fresh: nothing left to probe
     _patch_common(monkeypatch, tmp_path, channel, attached, state)
 
-    result = run_pipeline({"settings": {}}, mode="probe_only")
+    result = run_pipeline({"settings": {}}, mode="run")
 
     assert result["status"] == "ok"
 
@@ -1232,12 +1117,12 @@ def test_run_pipeline_finally_populates_state_meta(tmp_path, monkeypatch):
     state.record(1, attached[0].url, VALID)
     _patch_common(monkeypatch, tmp_path, channel, attached, state)
     _stub_probe_one(monkeypatch)
-    acquire_lock("probe_only")
+    acquire_lock("run")
 
     # Normal finish
-    run_pipeline({"settings": {}}, mode="probe_only")
+    run_pipeline({"settings": {}}, mode="run")
     reloaded = State.load(tmp_path / "state.json")
-    assert reloaded.meta["last_mode"] == "probe_only"
+    assert reloaded.meta["last_mode"] == "run"
     assert reloaded.meta["last_run"] > 0
     assert reloaded.meta["degraded_providers"] == []
     assert reloaded.meta["budget_stop"] is None
@@ -1245,15 +1130,15 @@ def test_run_pipeline_finally_populates_state_meta(tmp_path, monkeypatch):
     # Canceled run
     state2 = _make_state(tmp_path / "state2.json")
     state2.record(1, attached[0].url, VALID)
-    acquire_lock("probe_only")
+    acquire_lock("run")
     monkeypatch.setattr(
         pipeline_module.State, "load", staticmethod(lambda *_a, **_kw: state2)
     )
     monkeypatch.setattr(pipeline_module, "cancel_requested", lambda: True)
 
-    run_pipeline({"settings": {}}, mode="probe_only")
+    run_pipeline({"settings": {}}, mode="run")
     reloaded2 = State.load(tmp_path / "state2.json")
-    assert reloaded2.meta["last_mode"] == "probe_only"
+    assert reloaded2.meta["last_mode"] == "run"
     assert reloaded2.meta["budget_stop"] == "canceled by user"
 
 
@@ -1274,9 +1159,9 @@ def test_run_pipeline_publishes_per_channel_progress_to_the_lock_file(
     state = _make_state(tmp_path)
     state.record(1, attached[0].url, VALID)  # fresh: nothing left to probe
     _patch_common(monkeypatch, tmp_path, channel, attached, state)
-    acquire_lock("probe_only")
+    acquire_lock("run")
 
-    run_pipeline({"settings": {}}, mode="probe_only")
+    run_pipeline({"settings": {}}, mode="run")
 
     progress = lock_status()["progress"]
     assert progress["channel_index"] == 1
@@ -1297,9 +1182,9 @@ def test_run_pipeline_publishes_current_stream_while_probing(
     state = _make_state(tmp_path)
     _patch_common(monkeypatch, tmp_path, channel, attached, state)
     _stub_probe_one(monkeypatch)
-    acquire_lock("probe_only")
+    acquire_lock("run")
 
-    run_pipeline({"settings": {}}, mode="probe_only")
+    run_pipeline({"settings": {}}, mode="run")
 
     progress = lock_status()["progress"]
     assert progress["current_stream"] in {"IT: RAI 1 HD", "IT: Rai 1 4K"}
@@ -1320,7 +1205,7 @@ def test_update_progress_noops_when_lock_holder_mismatches():
 
     # Simulate another run stealing the lock
     release_lock()
-    acquire_lock("reorder_only", now=10.0)
+    acquire_lock("preview", now=10.0)
 
     # Original run's update_progress must not overwrite the new run's lock
     pipeline_module.update_progress("run", channel_name="STALE")
@@ -1379,10 +1264,6 @@ def test_run_pipeline_closes_old_django_connections_before_touching_the_orm(
     state = _make_state(tmp_path)
     state.record(1, attached[0].url, VALID)
     _patch_common(monkeypatch, tmp_path, channel, attached, state)
-    monkeypatch.setattr(
-        models_access_module, "apply_channel_plan",
-        lambda *_a, **_kw: {"attached": 0, "detached": 0},
-    )
 
     call_sequence = []
 
@@ -1396,7 +1277,7 @@ def test_run_pipeline_closes_old_django_connections_before_touching_the_orm(
     monkeypatch.setattr(pipeline_module, "_close_old_connections", track_close_old)
     monkeypatch.setattr(models_access_module, "resolve_models", track_resolve_models)
 
-    run_pipeline({"settings": {}}, mode="reorder_only")
+    run_pipeline({"settings": {}}, mode="run")
 
     assert call_sequence == ["close_old_connections", "resolve_models"], (
         "_close_old_connections must be called before resolve_models (first ORM access)"
@@ -1419,7 +1300,7 @@ def test_backgrounded_start_closes_its_django_connection(tmp_path, monkeypatch):
     monkeypatch.setattr(pipeline_module, "_close_connection",
                         lambda: calls.append(True))
 
-    result = pipeline_module.start({"settings": {}}, mode="probe_only")
+    result = pipeline_module.start({"settings": {}}, mode="run")
 
     assert result["status"] == "started"
     assert calls, "the backgrounded run must close its connection when done"
@@ -1439,7 +1320,7 @@ def test_backgrounded_run_releases_the_lock_once_it_finishes(tmp_path, monkeypat
     _patch_common(monkeypatch, tmp_path, channel, attached, state)
     monkeypatch.setattr(pipeline_module, "spawn", lambda fn, *args: fn(*args))
 
-    pipeline_module.start({"settings": {}}, mode="probe_only")
+    pipeline_module.start({"settings": {}}, mode="run")
 
     assert lock_status()["holder"] is None
 
@@ -1599,7 +1480,7 @@ def test_probe_candidates_logs_the_offending_stream_when_a_worker_raises(monkeyp
 
 
 def test_probe_candidates_probes_different_providers_concurrently(monkeypatch):
-    """Different providers must be probed in parallel (CLAUDE.md §7).
+    """Different providers must be probed in parallel.
 
     Prober.probe_one already enforces the per-account/global caps (see
     test_probing.py); this proves _probe_candidates actually dispatches
@@ -1847,11 +1728,10 @@ def test_probe_candidates_accumulates_the_heartbeat_cadence_across_channels(
 
     It must not reset every time `_probe_candidates` is called for a new
     channel. run_pipeline calls _probe_candidates once per channel, and
-    real deployments have far fewer than 25 candidates per channel
-    (CLAUDE.md's own cost model: ~8 candidates/channel;
-    max_streams_per_channel defaults to 10) - so a per-call-local counter
-    would never reach 25, and the heartbeat/save would never fire during a
-    real multi-channel run.
+    real deployments have far fewer than 25 candidates per channel (a rough
+    cost model puts it around 8 candidates/channel; max_streams_per_channel
+    defaults to 10) - so a per-call-local counter would never reach 25, and
+    the heartbeat/save would never fire during a real multi-channel run.
     """
     settings = load_settings({"settings": {}})
     state = State(path=tmp_path / "state.json")
@@ -1987,7 +1867,7 @@ def test_handle_probe_result_calls_save_stream_stats_on_valid(tmp_path, monkeypa
         candidate, VALID, valid_stats, 275, "ok",
         resolved=None, state=state,
         log=types.SimpleNamespace(info=lambda *_a, **_kw: None),
-        progress_cb=None, probed_before=0, mode="probe_only",
+        progress_cb=None, probed_before=0, mode="run",
     )
 
     assert result is True
@@ -2011,7 +1891,7 @@ def test_handle_probe_result_skips_save_on_invalid(tmp_path, monkeypatch):
         candidate, INVALID, {}, None, "dead",
         resolved=None, state=state,
         log=types.SimpleNamespace(info=lambda *_a, **_kw: None),
-        progress_cb=None, probed_before=0, mode="probe_only",
+        progress_cb=None, probed_before=0, mode="run",
     )
 
     assert result is True
@@ -2025,9 +1905,9 @@ def test_gevent_patched_is_false_without_gevent_installed():
     """Both spawn() and execution_model() must use one shared gevent check.
 
     The dev/test environment has no gevent installed (only the live
-    Dispatcharr container is guaranteed to, per CLAUDE.md §4), so both
-    functions must fall back to the plain-thread path through the shared
-    _gevent_patched() helper.
+    Dispatcharr container is expected to), so both functions must fall
+    back to the plain-thread path through the shared _gevent_patched()
+    helper.
     """
     assert pipeline_module._gevent_patched() is False
     assert pipeline_module.execution_model() == "daemon thread"
