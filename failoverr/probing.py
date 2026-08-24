@@ -247,16 +247,12 @@ def probe(url, ffprobe_path, timeout, runner=run_command):
         return ProbeResult(INCONCLUSIVE, {}, f"could not run ffprobe: {exc}")
     elapsed_ms = round((time.monotonic() - started) * 1000)
     result = classify(returncode, stdout, stderr)
-    if result.verdict != VALID:
-        _log.debug(
-            "FAILOVERR probe: url=%s verdict=%s reason=%s elapsed_ms=%d",
-            url, result.verdict, result.reason, elapsed_ms,
-        )
-        return result
     _log.debug(
         "FAILOVERR probe: url=%s verdict=%s reason=%s elapsed_ms=%d",
         url, result.verdict, result.reason, elapsed_ms,
     )
+    if result.verdict != VALID:
+        return result
     return result._replace(response_time_ms=elapsed_ms)
 
 

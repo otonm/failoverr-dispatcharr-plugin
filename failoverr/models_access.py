@@ -12,9 +12,7 @@ import logging
 import shutil
 import subprocess
 
-from django.db.models import UniqueConstraint
-
-from .ordering import rewrite_plan
+from .ordering import ORDER_OFFSET, rewrite_plan
 
 logger = logging.getLogger("failoverr")
 
@@ -59,6 +57,12 @@ def _import_channel_stream(channel_model):
 
 def _detect_unique_order_constraint(model, order_field):
     """Report a unique (channel, order) constraint: it forces the offset trick."""
+    # Kept in-function on purpose (CLAUDE.md): this is the module's only
+    # Django dependency, and hoisting it to the top makes models_access -
+    # and everything importing it - unimportable without Django installed.
+    # test_no_module_level_django_or_dispatcharr_imports enforces this.
+    from django.db.models import UniqueConstraint
+
     for unique_together in getattr(model._meta, "unique_together", ()) or ():
         if order_field in unique_together:
             return True
@@ -144,17 +148,16 @@ def environment_report(ffprobe_path, ffmpeg_path):
         "ffprobe": _binary_version(ffprobe_path),
         "ffmpeg": _binary_version(ffmpeg_path),
         "gevent": _gevent_status(),
-        "rapidfuzz": _module_available("rapidfuzz"),
         "celery_beat": _module_available("django_celery_beat"),
+        # both halves of scheduling._timezone's chain: zoneinfo first, pytz
+        # as the fallback. Reporting only one makes a timezone failure
+        # undiagnosable from the report alone.
         "zoneinfo": _module_available("zoneinfo"),
         "pytz": _module_available("pytz"),
     }
 
 
-_ORDER_OFFSET = 100000
-
-
-def plan_writes(current, ordered_ids, detach_ids, use_offset, offset=_ORDER_OFFSET):
+def plan_writes(current, ordered_ids, detach_ids, use_offset):
     """Turn a channel plan into concrete write operations.
 
     `current` maps attached stream_id -> current order. Returns attach /
@@ -165,7 +168,7 @@ def plan_writes(current, ordered_ids, detach_ids, use_offset, offset=_ORDER_OFFS
     wants to remain attached, not just newly matched ones — a currently
     attached stream that is kept but merely omitted from `ordered_ids` is
     neither detached nor given a final order; its order keeps escalating by
-    `offset` on every run that omits it, since it is never assigned a
+    ORDER_OFFSET on every run that omits it, since it is never assigned a
     position by the pass below. The Phase 5 candidate-assembly step
     ("newly matched streams + streams already attached", CLAUDE.md §6) is
     what is meant to guarantee this in practice.
@@ -177,19 +180,20 @@ def plan_writes(current, ordered_ids, detach_ids, use_offset, offset=_ORDER_OFFS
     return {
         "attach": [sid for sid in ordered_ids if sid not in current],
         "detach": [sid for sid in detach_ids if sid not in keep],
-        "orders": rewrite_plan(current, ordered_ids, use_offset, offset),
+        "orders": rewrite_plan(current, ordered_ids, use_offset),
     }
 
 
-def placeholder_orders(current, attach, offset=_ORDER_OFFSET):
+def placeholder_orders(current, attach):
     """Distinct create-time orders for newly attached rows.
 
-    Provably disjoint from rewrite_plan's bump range (v + offset for v in
-    current.values()) regardless of how many rows exist or their values,
-    since it starts past the highest possible bump target.
+    Provably disjoint from rewrite_plan's bump range (v + ORDER_OFFSET for
+    v in current.values()) regardless of how many rows exist or their
+    values, since it starts past the highest possible bump target. Both
+    sides read the one ORDER_OFFSET defined in ordering.py.
     """
     high_water = max(current.values(), default=-1)
-    return [offset + high_water + 1 + index for index in range(len(attach))]
+    return [ORDER_OFFSET + high_water + 1 + index for index in range(len(attach))]
 
 
 def apply_channel_plan(resolved, channel, ordered_ids, detach_ids, dry_run):

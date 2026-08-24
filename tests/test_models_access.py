@@ -10,6 +10,7 @@ from failoverr.models_access import (
     plan_writes,
     resolve_field,
 )
+from failoverr.ordering import rewrite_plan
 
 
 class FakeField:
@@ -116,12 +117,20 @@ def test_placeholder_orders_are_disjoint_from_the_bump_range():
     """The invariant that broke twice during task review.
 
     New-row placeholder orders must never collide with rewrite_plan's bump
-    range.
+    range. The range is read back out of rewrite_plan rather than recomputed
+    here: a hardcoded `v + 100000` would still pass if the two halves ever
+    stopped sharing ORDER_OFFSET, which is the only way this can break.
+
+    Sized so a divergence would actually show: a delta of 1..len(attach)
+    collides, larger deltas overshoot the placeholders entirely.
     """
     current = {10: 0, 11: 1, 12: 2}
-    bump_targets = {v + 100000 for v in current.values()}
-    placeholders = placeholder_orders(current, attach=[20, 21])
-    assert not (set(placeholders) & bump_targets)
+    attach = list(range(20, 30))
+    placeholders = set(placeholder_orders(current, attach))
+    bump_targets = {
+        order for _, order in rewrite_plan(current, [*attach, 10, 11, 12], True)
+    }
+    assert not (placeholders & bump_targets)
 
 
 def test_placeholder_orders_are_mutually_distinct():
@@ -274,7 +283,10 @@ def test_apply_channel_plan_use_offset_path_placeholder_bump_rewrite():
     1. Bump existing rows by offset (placeholder_orders)
     2. Create new rows with placeholder orders
     3. Rewrite all rows to their final positions
-    This ensures no unique constraint violation on (channel, order).
+    Covers the sequencing only - FakeChannelStreamModel does not enforce
+    uniqueness, so the no-collision half of the invariant is pinned by
+    test_placeholder_orders_are_disjoint_from_the_bump_range above and by
+    UniqueOrderStore in test_ordering.py.
     """
     channel = types.SimpleNamespace(name="Test Channel")
     link_model = FakeChannelStreamModel(

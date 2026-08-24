@@ -26,6 +26,7 @@ from .ordering import (
     Candidate,
     order_candidates,
 )
+from .plugin import Plugin
 from .state import DEFAULT_PATH as STATE_PATH
 from .state import INCONCLUSIVE, INVALID, VALID, State
 
@@ -42,49 +43,21 @@ _REPORT_COLUMNS = [
 # the exports directory without bound.
 _MAX_REPORTS = 100
 
+# strip_tokens/codec_priority/channel_names are excluded: load_settings
+# parses them itself (_csv_tuple / splitlines) and must fall through to
+# naming.py's/ordering.py's own constants, not a re-parsed copy of the
+# field's string default - see load_settings below.
+# ponytail: pipeline reads Plugin.fields directly; extract a settings.py
+# if this dependency inversion (entry point -> core) ever bites.
+_TEXT_LIST_KEYS = frozenset({"strip_tokens", "codec_priority", "channel_names"})
+
 _DEFAULTS = {
-    "dry_run": True,
-    "ffprobe_path": "/usr/local/bin/ffprobe",
-    "ffmpeg_path": "/usr/local/bin/ffmpeg",
-    "probe_timeout_seconds": 15,
-    "channel_group": "",
-    "match_mode": "strict",
-    "fuzzy_threshold": 85,
-    "map_number_words": True,
-    "order_strategy": "quality_first",
-    "rank_by_resolution": True,
-    "rank_by_response_time": True,
-    "rank_by_codec": True,
-    "rank_by_fps": True,
-    "rank_by_bitrate": True,
-    "response_time_bucket_ms": DEFAULT_RESPONSE_TIME_BUCKET_MS,
-    "max_streams_per_channel": 10,
-    "probe_ttl_hours": 24,
-    "per_account_concurrency": 1,
-    "account_cooldown_seconds": 2,
-    "global_concurrency": 4,
-    "removal_failure_threshold": 3,
-    "blank_detect": False,
-    "blank_detect_seconds": 5,
-    "max_probes_per_run": 400,
-    "max_run_minutes": 60,
-    "schedule_enabled": False,
-    "cron_expression": "0 4 * * *",
-    "timezone": "UTC",
+    f["id"]: f["default"]
+    for f in Plugin.fields
+    if f["type"] != "info" and f["id"] not in _TEXT_LIST_KEYS
 }
-
-_INT_KEYS = (
-    "probe_timeout_seconds", "fuzzy_threshold", "max_streams_per_channel",
-    "probe_ttl_hours", "per_account_concurrency", "account_cooldown_seconds",
-    "global_concurrency", "removal_failure_threshold", "blank_detect_seconds",
-    "max_probes_per_run", "max_run_minutes", "response_time_bucket_ms",
-)
-
-_BOOL_KEYS = (
-    "dry_run", "map_number_words", "blank_detect", "schedule_enabled",
-    "rank_by_resolution", "rank_by_response_time", "rank_by_codec",
-    "rank_by_fps", "rank_by_bitrate",
-)
+_INT_KEYS = tuple(f["id"] for f in Plugin.fields if f["type"] == "number")
+_BOOL_KEYS = tuple(f["id"] for f in Plugin.fields if f["type"] == "boolean")
 _FALSE_STRINGS = ("false", "0", "no", "off")
 
 
@@ -322,13 +295,6 @@ def _rotate_reports(directory, pattern="failoverr-*.csv", keep=_MAX_REPORTS):
         try:
             stale.unlink(missing_ok=True)
             logger.debug("FAILOVERR report rotation: pruned %s", stale)
-        except OSError as exc:
-            logger.debug(
-                "FAILOVERR report rotation: failed to prune %s: %s", stale, exc
-            )
-    for stale in reports[keep:]:
-        try:
-            stale.unlink(missing_ok=True)
         except OSError as exc:
             logger.debug(
                 "FAILOVERR report rotation: failed to prune %s: %s", stale, exc
@@ -595,6 +561,29 @@ def acquire_lock(name, now=None, ttl=_LOCK_TTL_SECONDS):
         return True
 
 
+def _bump_lock(holder, now=None, progress=None):
+    """Shared read-check-write body for refresh_lock() and update_progress().
+
+    Bumps "since" (and "progress" when given) if this process still owns the
+    lock - i.e. holder is None (unconditional) or matches the current
+    holder. Returns (wrote, actual_holder) so each caller can log its own
+    message; kept as a private helper (not called via either public name) so
+    a test that monkeypatches refresh_lock or update_progress by name only
+    intercepts that one, not both.
+    """
+    now = time.time() if now is None else now
+    with _lock_file() as fh:
+        data = _read_locked(fh)
+        actual_holder = data.get("holder")
+        if holder is not None and actual_holder != holder:
+            return False, actual_holder
+        data["since"] = now
+        if progress is not None:
+            data["progress"] = progress
+        _write_locked(fh, data)
+        return True, actual_holder
+
+
 def refresh_lock(holder=None, now=None):
     """Keep a long-running run's lock from going stale mid-run.
 
@@ -608,18 +597,14 @@ def refresh_lock(holder=None, now=None):
     ``holder=None`` (the default for tests and the force/clear path) is
     unconditional - it bumps whichever lock is present.
     """
-    now = time.time() if now is None else now
-    with _lock_file() as fh:
-        data = _read_locked(fh)
-        if holder is not None and data.get("holder") != holder:
-            logger.debug(
-                "FAILOVERR refresh_lock: no-op for %r (lock held by %r)",
-                holder, data.get("holder"),
-            )
-            return
-        data["since"] = now
-        _write_locked(fh, data)
+    wrote, actual_holder = _bump_lock(holder, now=now)
+    if wrote:
         logger.debug("FAILOVERR refresh_lock: refreshed for %r", holder or "any")
+    else:
+        logger.debug(
+            "FAILOVERR refresh_lock: no-op for %r (lock held by %r)",
+            holder, actual_holder,
+        )
 
 
 def release_lock(holder=None):
@@ -650,20 +635,17 @@ def update_progress(holder, **fields):
     Cheap, best-effort, and self-correcting: if the lock has since been
     released or stolen by someone else, this silently does nothing rather
     than resurrecting a finished/replaced lock with stale progress. Also
-    doubles as a heartbeat (bumps "since"), same as refresh_lock().
+    doubles as a heartbeat (bumps "since"), same as refresh_lock() - the two
+    share _bump_lock()'s read-check-write body.
     """
-    with _lock_file() as fh:
-        data = _read_locked(fh)
-        if data.get("holder") != holder:
-            logger.debug(
-                "FAILOVERR update_progress: no-op for %r (lock held by %r)",
-                holder, data.get("holder"),
-            )
-            return
-        data["since"] = time.time()
-        data["progress"] = fields
-        _write_locked(fh, data)
+    wrote, actual_holder = _bump_lock(holder, progress=fields)
+    if wrote:
         logger.debug("FAILOVERR update_progress: updated for %r", holder)
+    else:
+        logger.debug(
+            "FAILOVERR update_progress: no-op for %r (lock held by %r)",
+            holder, actual_holder,
+        )
 
 
 def request_cancel():

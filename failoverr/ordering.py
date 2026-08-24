@@ -18,6 +18,14 @@ DEFAULT_CODEC_PRIORITY = ("hevc", "h265", "h264", "avc")
 # to still work, the same trick already used for resolution tiers.
 DEFAULT_RESPONSE_TIME_BUCKET_MS = 250
 
+# rewrite_plan bumps existing rows by this much when a unique (channel,
+# order) constraint requires clearing space for the final 0..n-1 positions.
+# Public and shared: models_access.placeholder_orders starts its create-time
+# orders past this same value, and that disjointness is what keeps the two
+# halves of the offset trick from colliding. One constant, not two copies -
+# a divergence of 1..n (n = rows attached in a pass) silently collides.
+ORDER_OFFSET = 100000
+
 # (minimum height, tier). Higher tier sorts first.
 _TIERS = ((2160, 4), (1440, 3), (1080, 2), (720, 1))
 
@@ -197,11 +205,11 @@ def order_candidates(  # noqa: PLR0913, PLR0917 - one ranking factor per toggle
     )
 
 
-def rewrite_plan(current, desired, use_offset, offset=100000):
+def rewrite_plan(current, desired, use_offset):
     """Ordered (stream_id, new_order) assignments to reach `desired`.
 
     When a unique (channel, order) constraint exists, every existing row is
-    first bumped by `offset` — which preserves relative uniqueness — so that
+    first bumped by ORDER_OFFSET — which preserves relative uniqueness — so that
     final positions 0..n-1 are free to assign in any order.
 
     An empty `desired` returns an empty plan: a channel that matched nothing
@@ -212,6 +220,6 @@ def rewrite_plan(current, desired, use_offset, offset=100000):
     plan = []
     if use_offset:
         for stream_id, order in sorted(current.items(), key=lambda kv: kv[1]):
-            plan.append((stream_id, order + offset))
+            plan.append((stream_id, order + ORDER_OFFSET))
     plan.extend((stream_id, index) for index, stream_id in enumerate(desired))
     return plan
