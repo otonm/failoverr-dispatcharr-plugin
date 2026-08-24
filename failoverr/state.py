@@ -68,10 +68,12 @@ class State:
         try:
             tmp.write_text(payload)
             tmp.replace(self.path)  # atomic
-        except Exception:
+        finally:
+            # No-op on success: tmp.replace() already moved the file, so
+            # missing_ok=True makes this unlink harmless either way -
+            # cleanup on a failed write, nothing to do on a successful one.
             with contextlib.suppress(OSError):
                 tmp.unlink(missing_ok=True)
-            raise
         log.debug("FAILOVERR State.save: completed write to %s", self.path)
 
     def _entry(self, stream_id):

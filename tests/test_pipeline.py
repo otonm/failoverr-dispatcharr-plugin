@@ -23,10 +23,10 @@ from failoverr.pipeline import (
     load_settings,
     lock_status,
     plan_channel,
-    refresh_lock,
     release_lock,
     report_path,
     run_pipeline,
+    update_progress,
     write_report,
 )
 from failoverr.probing import ProbeResult
@@ -432,21 +432,17 @@ def test_load_settings_applies_defaults_for_missing_keys():
     assert settings["removal_failure_threshold"] == 3
 
 
-def test_load_settings_defaults_the_ranking_toggles_to_true():
+def test_load_settings_defaults_the_ranking_toggle_to_true():
     settings = load_settings({"settings": {}})
-    assert settings["rank_by_resolution"] is True
-    assert settings["rank_by_response_time"] is True
-    assert settings["rank_by_codec"] is True
-    assert settings["rank_by_fps"] is True
     assert settings["rank_by_bitrate"] is True
     assert settings["response_time_bucket_ms"] == 250
 
 
-def test_load_settings_coerces_the_ranking_toggles():
+def test_load_settings_coerces_the_ranking_toggle():
     settings = load_settings({"settings": {
-        "rank_by_fps": "false", "response_time_bucket_ms": "500",
+        "rank_by_bitrate": "false", "response_time_bucket_ms": "500",
     }})
-    assert settings["rank_by_fps"] is False
+    assert settings["rank_by_bitrate"] is False
     assert settings["response_time_bucket_ms"] == 500
 
 
@@ -716,17 +712,16 @@ def test_run_preview_assembles_matched_and_attached_candidates_via_the_shared_me
     assert actions.get("IT: RAI 1 HD") == "attach"
 
 
-def test_channel_candidates_reads_the_link_table_once_per_channel_per_pass(
+def test_channel_candidates_reads_the_link_table_once_per_channel(
     tmp_path, monkeypatch,
 ):
-    """Regression: the attached-link table was queried up to 4x per channel.
+    """Regression: the attached-link table was queried more than once per channel.
 
     _channel_candidates used to call both attached_rows() and
-    iter_attached_rows() - two queries for data available in one - and was
-    itself called twice per channel (the stale-count pre-pass plus the main
-    loop): 4 link-table reads per channel per run. attached_rows is gone now
-    and attached_ids is derived from iter_attached_rows' StreamRows, so the
-    link table is read once per pass: 2 per channel (pre-pass + main), not 4.
+    iter_attached_rows() - two queries for data available in one.
+    attached_rows is gone now and attached_ids is derived from
+    iter_attached_rows' StreamRows, so the link table is read exactly once
+    per channel per run.
     """
     channel_a = types.SimpleNamespace(name="RAI 1")
     channel_b = types.SimpleNamespace(name="RAI 2")
@@ -767,15 +762,13 @@ def test_channel_candidates_reads_the_link_table_once_per_channel_per_pass(
 
     run_pipeline({"settings": {}}, mode="run")
 
-    # 2 channels x (1 pre-pass + 1 main loop) = 4 link-table reads. The
-    # pre-merge code did attached_rows + iter_attached_rows per pass = 8.
-    assert calls["n"] == 4, (
-        f"link table read {calls['n']} times for 2 channels; expected 4 "
-        "(one per channel per pass), not the pre-merge 8"
+    assert calls["n"] == 2, (
+        f"link table read {calls['n']} times for 2 channels; expected 2 "
+        "(one per channel)"
     )
 
 
-def test_refresh_lock_prevents_a_steal_at_the_original_ttl_deadline():
+def test_update_progress_heartbeat_prevents_a_steal_at_the_original_ttl_deadline():
     """Finding: a long run must keep its own lock fresh.
 
     Without a heartbeat, a second run could steal the lock once
@@ -783,9 +776,9 @@ def test_refresh_lock_prevents_a_steal_at_the_original_ttl_deadline():
     """
     acquire_lock("run", now=0.0)
     # Well before the original deadline, the run heartbeats its lock.
-    refresh_lock(now=1000.0)
+    update_progress(None, now=1000.0)
     # At the moment the lock would have gone stale relative to the original
-    # acquisition (now=0.0), it must still be held - the refresh worked.
+    # acquisition (now=0.0), it must still be held - the heartbeat worked.
     assert acquire_lock("preview", now=LOCK_TTL_SECONDS + 1) is False
     # It does go stale relative to the refreshed timestamp, once enough
     # time has passed since THAT.
@@ -809,18 +802,18 @@ def test_release_lock_no_ops_when_it_no_longer_owns_the_lock():
     assert lock_status()["holder"] == "reorder_only"
 
 
-def test_refresh_lock_no_ops_when_it_no_longer_owns_the_lock():
+def test_update_progress_heartbeat_no_ops_when_it_no_longer_owns_the_lock():
     """Regression: refresh_lock bumped any lock's since, not just its own.
 
     A stale run heartbeating after its lock was cleared and re-acquired
     would bump the NEW run's since, making the new lock look freshly held
-    by the wrong run. refresh_lock now checks it still owns the lock.
+    by the wrong run. update_progress checks it still owns the lock.
     """
     acquire_lock("run", now=0.0)
     release_lock()
     acquire_lock("reorder_only", now=10.0)
-    # Run A's refresh_lock("run") must NOT touch B's lock timestamp.
-    refresh_lock("run", now=9999.0)
+    # Run A's heartbeat must NOT touch B's lock timestamp.
+    update_progress("run", now=9999.0)
     assert lock_status()["holder"] == "reorder_only"
     assert lock_status()["since"] == 10.0
 
@@ -864,13 +857,17 @@ def test_run_pipeline_heartbeats_the_lock_between_channels(
             state.record(r.stream_id, r.url, VALID)
 
     refreshes = []
-    real_refresh = pipeline_module.refresh_lock
+    real_update_progress = pipeline_module.update_progress
 
-    def counting_refresh(*args, **kwargs):
-        refreshes.append(True)
-        return real_refresh(*args, **kwargs)
+    def counting_update_progress(*args, **kwargs):
+        # Only the bare heartbeat call (no progress fields) counts here -
+        # _start_channel_progress/on_probe also call update_progress, but
+        # with fields, and this test is only about the plain heartbeat.
+        if not kwargs:
+            refreshes.append(True)
+        return real_update_progress(*args, **kwargs)
 
-    monkeypatch.setattr(pipeline_module, "refresh_lock", counting_refresh)
+    monkeypatch.setattr(pipeline_module, "update_progress", counting_update_progress)
     monkeypatch.setattr(
         pipeline_module, "select_channels",
         lambda *_a, **_kw: [channel_a, channel_b],
@@ -1287,14 +1284,13 @@ def test_run_pipeline_publishes_per_channel_progress_to_the_lock_file(
     assert progress["channel_name"] == "RAI 1"
 
 
-def test_run_pipeline_publishes_per_stream_progress_while_probing(
+def test_run_pipeline_publishes_current_stream_while_probing(
     tmp_path, monkeypatch
 ):
-    """The user-visible "stream N of M" figure, tracked one probe at a time.
+    """The last-probed stream name, tracked one probe at a time.
 
-    Two never-probed candidates give an exact denominator (2) to check
-    against, and the final published progress must reflect the last one
-    actually probed - not some earlier per-channel snapshot.
+    The final published progress must reflect the last stream actually
+    probed - not some earlier per-channel snapshot.
     """
     channel = types.SimpleNamespace(name="RAI 1")
     attached = [row(1, "IT: RAI 1 HD", "A"), row(2, "IT: Rai 1 4K", "B")]
@@ -1306,17 +1302,16 @@ def test_run_pipeline_publishes_per_stream_progress_while_probing(
     run_pipeline({"settings": {}}, mode="probe_only")
 
     progress = lock_status()["progress"]
-    assert progress["streams_total"] == 2
-    assert progress["stream_index"] == 2
     assert progress["current_stream"] in {"IT: RAI 1 HD", "IT: Rai 1 4K"}
+    assert progress["channel_name"] == "RAI 1"
 
 
 def test_update_progress_noops_when_lock_holder_mismatches():
     """update_progress must silently no-op when it doesn't own the lock.
 
-    This mirrors the same guard in refresh_lock/release_lock - if the lock
-    has been stolen by another run, we must not resurrect the old lock with
-    stale progress data.
+    This mirrors the same guard in release_lock - if the lock has been
+    stolen by another run, we must not resurrect the old lock with stale
+    progress data.
     """
     acquire_lock("run", now=0.0)
     pipeline_module.update_progress("run", channel_name="RAI 1")
@@ -1406,30 +1401,6 @@ def test_run_pipeline_closes_old_django_connections_before_touching_the_orm(
     assert call_sequence == ["close_old_connections", "resolve_models"], (
         "_close_old_connections must be called before resolve_models (first ORM access)"
     )
-
-
-def test_start_inline_branch_closes_its_django_connection(tmp_path, monkeypatch):
-    """Covers the non-backgrounded execution path of start()."""
-    channel = types.SimpleNamespace(name="RAI 1")
-    attached = [row(1, "IT: RAI 1 HD", "A")]
-    state = _make_state(tmp_path)
-    state.record(1, attached[0].url, VALID)
-    _patch_common(monkeypatch, tmp_path, channel, attached, state)
-    monkeypatch.setattr(
-        models_access_module, "apply_channel_plan",
-        lambda *_a, **_kw: {"attached": 0, "detached": 0},
-    )
-
-    calls = []
-    monkeypatch.setattr(pipeline_module, "_close_connection",
-                        lambda: calls.append(True))
-
-    # channel_count (1) <= INLINE_CHANNEL_LIMIT and mode == "reorder_only":
-    # this takes start()'s inline branch, not the backgrounded one.
-    result = pipeline_module.start({"settings": {}}, mode="reorder_only")
-
-    assert result["status"] == "ok"
-    assert calls, "the inline branch must close its connection when done"
 
 
 def test_backgrounded_start_closes_its_django_connection(tmp_path, monkeypatch):
@@ -1601,8 +1572,9 @@ def test_probe_candidates_logs_the_offending_stream_when_a_worker_raises(monkeyp
         def probe_one(self, *_args, **_kwargs):
             raise RuntimeError("simulated ffprobe crash")
 
-    monkeypatch.setattr(pipeline_module, "_models_access_save", lambda *_a, **_kw: None)
-    monkeypatch.setattr(pipeline_module, "_notify", lambda *_a, **_kw: None)
+    monkeypatch.setattr(
+        models_access_module, "save_stream_stats", lambda *_a, **_kw: None
+    )
 
     captured = {}
 
@@ -1662,7 +1634,9 @@ def test_probe_candidates_probes_different_providers_concurrently(monkeypatch):
         for i, provider in enumerate(["A", "B", "C", "D"], start=1)
     ]
 
-    monkeypatch.setattr(pipeline_module, "_models_access_save", lambda *_a, **_kw: None)
+    monkeypatch.setattr(
+        models_access_module, "save_stream_stats", lambda *_a, **_kw: None
+    )
     log = types.SimpleNamespace(info=lambda *_a, **_kw: None)
 
     result = {}
@@ -1723,7 +1697,9 @@ def test_probe_candidates_stops_launching_new_probes_once_stopped_mid_batch(
         for i, provider in enumerate(["A", "B", "C", "D"], start=1)
     ]
 
-    monkeypatch.setattr(pipeline_module, "_models_access_save", lambda *_a, **_kw: None)
+    monkeypatch.setattr(
+        models_access_module, "save_stream_stats", lambda *_a, **_kw: None
+    )
     canceled = {"flag": False}
     monkeypatch.setattr(pipeline_module, "cancel_requested", lambda: canceled["flag"])
     log = types.SimpleNamespace(info=lambda *_a, **_kw: None)
@@ -1786,7 +1762,9 @@ def test_probe_candidates_stop_shortcircuit_does_not_mark_stream_fresh(
         for i, provider in enumerate(["A", "B", "C", "D"], start=1)
     ]
 
-    monkeypatch.setattr(pipeline_module, "_models_access_save", lambda *_a, **_kw: None)
+    monkeypatch.setattr(
+        models_access_module, "save_stream_stats", lambda *_a, **_kw: None
+    )
     canceled = {"flag": False}
     monkeypatch.setattr(pipeline_module, "cancel_requested", lambda: canceled["flag"])
     log = types.SimpleNamespace(info=lambda *_a, **_kw: None)
@@ -1845,10 +1823,11 @@ def test_probe_candidates_refreshes_the_lock_and_saves_state_every_25_probes(
     refreshes = []
     monkeypatch.setattr(state, "save", lambda: saves.append(True))
     monkeypatch.setattr(
-        pipeline_module, "refresh_lock", lambda *_a, **_kw: refreshes.append(True)
+        pipeline_module, "update_progress", lambda *_a, **_kw: refreshes.append(True)
     )
-    monkeypatch.setattr(pipeline_module, "_models_access_save", lambda *_a, **_kw: None)
-    monkeypatch.setattr(pipeline_module, "_notify", lambda *_a, **_kw: None)
+    monkeypatch.setattr(
+        models_access_module, "save_stream_stats", lambda *_a, **_kw: None
+    )
 
     log = types.SimpleNamespace(info=lambda *_a, **_kw: None)
 
@@ -1858,7 +1837,7 @@ def test_probe_candidates_refreshes_the_lock_and_saves_state_every_25_probes(
 
     assert probed == 25
     assert len(saves) == 1, "state.save() should fire once at the 25th probe"
-    assert len(refreshes) == 1, "refresh_lock() should fire alongside it"
+    assert len(refreshes) == 1, "update_progress() heartbeat should fire alongside it"
 
 
 def test_probe_candidates_accumulates_the_heartbeat_cadence_across_channels(
@@ -1893,10 +1872,11 @@ def test_probe_candidates_accumulates_the_heartbeat_cadence_across_channels(
     refreshes = []
     monkeypatch.setattr(state, "save", lambda: saves.append(True))
     monkeypatch.setattr(
-        pipeline_module, "refresh_lock", lambda *_a, **_kw: refreshes.append(True)
+        pipeline_module, "update_progress", lambda *_a, **_kw: refreshes.append(True)
     )
-    monkeypatch.setattr(pipeline_module, "_models_access_save", lambda *_a, **_kw: None)
-    monkeypatch.setattr(pipeline_module, "_notify", lambda *_a, **_kw: None)
+    monkeypatch.setattr(
+        models_access_module, "save_stream_stats", lambda *_a, **_kw: None
+    )
 
     log = types.SimpleNamespace(info=lambda *_a, **_kw: None)
 
@@ -1939,7 +1919,9 @@ def test_probe_candidates_records_the_measured_response_time(tmp_path, monkeypat
         def probe_one(self, *_args, **_kwargs):
             return ProbeResult(VALID, valid_stats, "ok", 275)
 
-    monkeypatch.setattr(pipeline_module, "_models_access_save", lambda *_a, **_kw: None)
+    monkeypatch.setattr(
+        models_access_module, "save_stream_stats", lambda *_a, **_kw: None
+    )
     log = types.SimpleNamespace(info=lambda *_a, **_kw: None)
 
     pipeline_module._probe_candidates(
@@ -1966,7 +1948,9 @@ def test_blank_detected_stream_does_not_record_a_response_time(tmp_path, monkeyp
         def probe_one(self, *_args, **_kwargs):
             return ProbeResult(VALID, valid_stats, "ok", 275)
 
-    monkeypatch.setattr(pipeline_module, "_models_access_save", lambda *_a, **_kw: None)
+    monkeypatch.setattr(
+        models_access_module, "save_stream_stats", lambda *_a, **_kw: None
+    )
     monkeypatch.setattr(probing_module, "is_blank", lambda *_a, **_kw: True)
     log = types.SimpleNamespace(info=lambda *_a, **_kw: None)
 
@@ -1977,8 +1961,8 @@ def test_blank_detected_stream_does_not_record_a_response_time(tmp_path, monkeyp
     assert state.response_time_ms(1) is None
 
 
-def test_handle_probe_result_calls_models_access_save_on_valid(tmp_path, monkeypatch):
-    """_handle_probe_result must call _models_access_save for VALID probes.
+def test_handle_probe_result_calls_save_stream_stats_on_valid(tmp_path, monkeypatch):
+    """_handle_probe_result must save stream stats for VALID probes.
 
     The save path could be deleted and every test would pass (all sites stub
     it to no-op). This test ensures the call actually happens.
@@ -1996,7 +1980,7 @@ def test_handle_probe_result_calls_models_access_save_on_valid(tmp_path, monkeyp
     def fake_save(_resolved, stream_id, stats):
         save_calls.append((stream_id, stats))
 
-    monkeypatch.setattr(pipeline_module, "_models_access_save", fake_save)
+    monkeypatch.setattr(models_access_module, "save_stream_stats", fake_save)
 
     # Call _handle_probe_result directly with a VALID verdict
     result = pipeline_module._handle_probe_result(
@@ -2013,13 +1997,13 @@ def test_handle_probe_result_calls_models_access_save_on_valid(tmp_path, monkeyp
 
 
 def test_handle_probe_result_skips_save_on_invalid(tmp_path, monkeypatch):
-    """_handle_probe_result must NOT call _models_access_save for INVALID."""
+    """_handle_probe_result must NOT save stream stats for INVALID."""
     state = State(path=tmp_path / "state.json")
     candidate = row(1, "IT: RAI 1 HD", "A")
 
     save_calls = []
     monkeypatch.setattr(
-        pipeline_module, "_models_access_save",
+        models_access_module, "save_stream_stats",
         lambda *a, **_kw: save_calls.append(a)
     )
 
@@ -2049,18 +2033,3 @@ def test_gevent_patched_is_false_without_gevent_installed():
     assert pipeline_module.execution_model() == "daemon thread"
 
 
-def test_notify_leaves_a_trace_when_the_websocket_update_fails(caplog):
-    """Regression: a bare `pass` left a notification failure with no trace.
-
-    A recurring best-effort notification failure left zero trace. It must at
-    least log at debug so a recurring send_websocket_update failure is
-    diagnosable from the log.
-    """
-    import logging
-
-    with caplog.at_level(logging.DEBUG, logger="failoverr"):
-        pipeline_module._notify({"type": "failoverr"})
-
-    assert any(
-        "progress notification failed" in r.message for r in caplog.records
-    ), caplog.records

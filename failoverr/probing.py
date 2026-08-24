@@ -243,7 +243,11 @@ def probe(url, ffprobe_path, timeout, runner=run_command):
     started = time.monotonic()
     try:
         returncode, stdout, stderr = runner(argv, timeout)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001 - runner is caller-injectable (tests stub it), can raise anything
+        # Anything raised here is a failure to run the probe at all, not a
+        # verdict about the stream - INCONCLUSIVE, same as an unrecognised
+        # ffprobe exit in classify(), so it can never contribute to
+        # removing a stream on its own.
         return ProbeResult(INCONCLUSIVE, {}, f"could not run ffprobe: {exc}")
     elapsed_ms = round((time.monotonic() - started) * 1000)
     result = classify(returncode, stdout, stderr)
@@ -282,7 +286,7 @@ def is_blank(url, ffmpeg_path, seconds, runner=run_command):
             return False
         black = sum(float(d) for d in _BLACK_DURATION.findall(stderr or ""))
         return black >= seconds * _BLANK_FRACTION
-    except Exception:  # noqa: BLE001
+    except Exception:  # noqa: BLE001 - "fails open" (see docstring) means catching everything
         _log.debug(
             "FAILOVERR blank-detect failed open for %s: %s",
             url, exc_info=True,

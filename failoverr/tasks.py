@@ -32,6 +32,9 @@ except ImportError:
 @shared_task(name=TASK_NAME)
 def scheduled_run():
     """Run the same code path a manual Run button press takes - no duplicated logic."""
+    # Dispatcharr-only, and this function only ever runs for real inside a
+    # celery worker that already has it - lazy so the module still imports
+    # (and @shared_task above still registers) without it.
     from apps.plugins.loader import PluginManager
 
     result = PluginManager.get().run_action(PLUGIN_KEY, "run", {})

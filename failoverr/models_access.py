@@ -5,9 +5,16 @@ provider-link fields are resolved at runtime via resolve_field(), and
 failure names what IS available so a mismatch is diagnosable from the
 error alone. The through-model's own channel/stream FK names are NOT
 resolved this way - they're assumed to be `channel`/`stream_id`.
+
+Every django.*/apps.* import below lives inside the function that uses
+it, never at module level - that's what lets this module (and everything
+that imports it) load with neither Django nor Dispatcharr installed, the
+same contract test_no_module_level_django_or_dispatcharr_imports enforces
+for every file in this package.
 """
 
 import dataclasses
+import importlib
 import logging
 import shutil
 import subprocess
@@ -16,8 +23,8 @@ from .ordering import ORDER_OFFSET, rewrite_plan
 
 logger = logging.getLogger("failoverr")
 
-_ORDER_FIELD_CANDIDATES = ["order", "position", "priority", "sort_order"]
-_PROVIDER_FIELD_CANDIDATES = ["m3u_account", "m3u_source", "account", "source"]
+_ORDER_FIELD_CANDIDATES = ["order"]
+_PROVIDER_FIELD_CANDIDATES = ["m3u_account"]
 
 
 class FieldResolutionError(Exception):
@@ -46,21 +53,10 @@ class ResolvedModels:
     has_unique_order_constraint: bool
 
 
-def _import_channel_stream(channel_model):
-    """CLAUDE.md §4: importable directly, or reachable through the M2M."""
-    try:
-        from apps.channels.models import ChannelStream
-    except (ImportError, AttributeError):
-        return channel_model.streams.through
-    return ChannelStream
-
-
 def _detect_unique_order_constraint(model, order_field):
     """Report a unique (channel, order) constraint: it forces the offset trick."""
-    # Kept in-function on purpose (CLAUDE.md): this is the module's only
-    # Django dependency, and hoisting it to the top makes models_access -
-    # and everything importing it - unimportable without Django installed.
-    # test_no_module_level_django_or_dispatcharr_imports enforces this.
+    # Lazy per the module docstring - this is the specific import that
+    # originally motivated the policy (it used to sit at module level).
     from django.db.models import UniqueConstraint
 
     for unique_together in getattr(model._meta, "unique_together", ()) or ():
@@ -77,9 +73,15 @@ def _detect_unique_order_constraint(model, order_field):
 
 
 def resolve_models():
+    # Lazy per the module docstring: apps.channels.models only exists inside
+    # a running Dispatcharr instance.
     from apps.channels.models import Channel, Stream
 
-    channel_stream = _import_channel_stream(Channel)
+    # Channel.streams.through is authoritative regardless of whether the
+    # M2M's through-model has its own importable name (CLAUDE.md §4): when
+    # one is set via `through=`, Django's .through returns exactly that
+    # class either way.
+    channel_stream = Channel.streams.through
     order_field = resolve_field(
         channel_stream, _ORDER_FIELD_CANDIDATES, "stream ordering"
     )
@@ -119,8 +121,6 @@ def _binary_version(path):
 
 
 def _module_available(name):
-    import importlib
-
     try:
         module = importlib.import_module(name)
     except Exception as exc:  # noqa: BLE001 - importing a module can raise anything
@@ -131,6 +131,8 @@ def _module_available(name):
 def _gevent_status():
     """Decides the execution model. See spec §6."""
     try:
+        # gevent is an optional third-party dependency, not stdlib - it may
+        # not be installed at all outside the live Dispatcharr container.
         from gevent import monkey
     except ImportError:
         return {"gevent": False, "patched": {}}
@@ -198,6 +200,7 @@ def placeholder_orders(current, attach):
 
 def apply_channel_plan(resolved, channel, ordered_ids, detach_ids, dry_run):
     """Write one channel's plan. All order changes in a single transaction."""
+    # Lazy per the module docstring.
     from django.db import transaction
 
     link_model = resolved.channel_stream_model
@@ -256,6 +259,7 @@ def save_stream_stats(resolved, stream_id, stats):
     a Failoverr probe. Plugin-private bookkeeping never goes here — it lives
     in the sidecar.
     """
+    # Lazy per the module docstring.
     from django.db import transaction
     from django.utils import timezone
 

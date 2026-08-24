@@ -85,38 +85,29 @@ def _response_time_component(response_time_ms, bucket_ms):
     return -((int(response_time_ms) // bucket_ms) * bucket_ms)
 
 
-def quality_key(  # noqa: PLR0913, PLR0917 - one ranking factor per toggle
+def quality_key(
     stats,
     codec_priority=DEFAULT_CODEC_PRIORITY,
     response_time_ms=None,
     response_time_bucket_ms=DEFAULT_RESPONSE_TIME_BUCKET_MS,
-    rank_by_resolution=True,
-    rank_by_response_time=True,
-    rank_by_codec=True,
-    rank_by_fps=True,
     rank_by_bitrate=True,
 ):
     """Sort key, descending. Derived from probe data only, never from names.
 
     Order is fixed: resolution -> response time -> codec -> fps -> bitrate,
-    with height as an unconditional final tiebreaker that is never itself
-    toggleable — it is a sub-tier tiebreak, not an independent factor. Each
-    factor above can be individually disabled; a disabled factor is omitted
-    from the key entirely rather than zeroed, so it plays no role at all.
+    with height as an unconditional final tiebreaker. Only bitrate is
+    toggleable - it is the one factor that, left on, tends to break every
+    other tie before quality_first's provider interleaving ever gets a
+    chance to fire (see the field's help_text).
     """
     stats = stats or {}
     height = _height(stats)
-    key = []
-    if rank_by_resolution:
-        key.append(_tier(height))
-    if rank_by_response_time:
-        key.append(
-            _response_time_component(response_time_ms, response_time_bucket_ms)
-        )
-    if rank_by_codec:
-        key.append(_codec_rank(stats, codec_priority))
-    if rank_by_fps:
-        key.append(_number(stats.get("source_fps")))
+    key = [
+        _tier(height),
+        _response_time_component(response_time_ms, response_time_bucket_ms),
+        _codec_rank(stats, codec_priority),
+        _number(stats.get("source_fps")),
+    ]
     if rank_by_bitrate:
         key.append(_number(stats.get("video_bitrate")))
     key.append(height)
@@ -140,12 +131,14 @@ def _interleave(groups):
     return [c for row in zip_longest(*groups) for c in row if c is not None]
 
 
-def _quality_first(candidates, codec_priority, response_time_bucket_ms, toggles):
+def _quality_first(
+    candidates, codec_priority, response_time_bucket_ms, rank_by_bitrate
+):
     buckets = defaultdict(list)
     for candidate in candidates:
         key = quality_key(
             candidate.stats, codec_priority, candidate.response_time_ms,
-            response_time_bucket_ms, **toggles,
+            response_time_bucket_ms, rank_by_bitrate,
         )
         buckets[key].append(candidate)
     ordered = []
@@ -154,11 +147,13 @@ def _quality_first(candidates, codec_priority, response_time_bucket_ms, toggles)
     return ordered
 
 
-def _provider_first(candidates, codec_priority, response_time_bucket_ms, toggles):
+def _provider_first(
+    candidates, codec_priority, response_time_bucket_ms, rank_by_bitrate
+):
     def _key(candidate):
         return quality_key(
             candidate.stats, codec_priority, candidate.response_time_ms,
-            response_time_bucket_ms, **toggles,
+            response_time_bucket_ms, rank_by_bitrate,
         )
 
     ranked = [
@@ -168,15 +163,11 @@ def _provider_first(candidates, codec_priority, response_time_bucket_ms, toggles
     return _interleave(ranked)
 
 
-def order_candidates(  # noqa: PLR0913, PLR0917 - one ranking factor per toggle
+def order_candidates(
     candidates,
     strategy="quality_first",
     codec_priority=DEFAULT_CODEC_PRIORITY,
     response_time_bucket_ms=DEFAULT_RESPONSE_TIME_BUCKET_MS,
-    rank_by_resolution=True,
-    rank_by_response_time=True,
-    rank_by_codec=True,
-    rank_by_fps=True,
     rank_by_bitrate=True,
 ):
     """Rank candidates and interleave providers.
@@ -189,19 +180,12 @@ def order_candidates(  # noqa: PLR0913, PLR0917 - one ranking factor per toggle
     candidates = list(candidates)
     if not candidates:
         return []
-    toggles = {
-        "rank_by_resolution": rank_by_resolution,
-        "rank_by_response_time": rank_by_response_time,
-        "rank_by_codec": rank_by_codec,
-        "rank_by_fps": rank_by_fps,
-        "rank_by_bitrate": rank_by_bitrate,
-    }
     if strategy == "provider_first":
         return _provider_first(
-            candidates, codec_priority, response_time_bucket_ms, toggles
+            candidates, codec_priority, response_time_bucket_ms, rank_by_bitrate
         )
     return _quality_first(
-        candidates, codec_priority, response_time_bucket_ms, toggles
+        candidates, codec_priority, response_time_bucket_ms, rank_by_bitrate
     )
 
 

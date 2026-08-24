@@ -68,17 +68,12 @@ def test_dry_run_defaults_to_on():
     assert field["default"] is True
 
 
-def test_ranking_toggles_default_to_true():
+def test_rank_by_bitrate_defaults_to_true():
     from failoverr.plugin import Plugin
 
-    toggle_ids = (
-        "rank_by_resolution", "rank_by_response_time", "rank_by_codec",
-        "rank_by_fps", "rank_by_bitrate",
-    )
-    for field_id in toggle_ids:
-        field = next(f for f in Plugin.fields if f["id"] == field_id)
-        assert field["type"] == "boolean"
-        assert field["default"] is True
+    field = next(f for f in Plugin.fields if f["id"] == "rank_by_bitrate")
+    assert field["type"] == "boolean"
+    assert field["default"] is True
 
 
 def test_response_time_bucket_ms_field_exists_with_a_sane_default():

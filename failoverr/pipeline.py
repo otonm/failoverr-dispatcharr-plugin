@@ -1,7 +1,19 @@
 """Orchestration: indexing, matching, per-channel planning, reporting.
 
-Django imports are lazy (inside functions). The functions in this first
-section touch nothing but plain data so they can be tested offline.
+Actual django.*/apps.* calls are lazy (inside the functions that make
+them) so a bare pytest run never needs Django installed. models_access and
+probing are imported at module level below despite touching Django/ffprobe
+at call time: neither module itself has a top-level Django import (each is
+lazy the same way, one level down), so importing the module here costs
+nothing a bare pytest run can't afford.
+
+`probing` is imported as a module and called as `probing.is_blank(...)`,
+not `from .probing import is_blank`, so a test's
+`monkeypatch.setattr(probing, "is_blank", ...)` takes effect here - a
+direct name import would bind the original function once at import time
+and never see the replacement. `Prober` doesn't need that: tests patch
+its `probe_one` method on the class itself, and a class is the same
+object no matter which name it's imported under.
 """
 
 import concurrent.futures
@@ -18,6 +30,7 @@ import time
 from collections import defaultdict
 from typing import NamedTuple
 
+from . import models_access, probing
 from .naming import DEFAULT_STRIP_TOKENS, normalize
 from .naming import matches as name_matches
 from .ordering import (
@@ -27,6 +40,7 @@ from .ordering import (
     order_candidates,
 )
 from .plugin import Plugin
+from .probing import Prober
 from .state import DEFAULT_PATH as STATE_PATH
 from .state import INCONCLUSIVE, INVALID, VALID, State
 
@@ -123,8 +137,7 @@ def find_matches(channel_tokens, index, mode="strict", threshold=85):
 def plan_channel(  # noqa: PLR0913, PLR0917 - interface fixed by the task spec
     attached_ids, candidates, state, threshold, max_streams,
     strategy, codec_priority, response_time_bucket_ms=DEFAULT_RESPONSE_TIME_BUCKET_MS,
-    rank_by_resolution=True, rank_by_response_time=True, rank_by_codec=True,
-    rank_by_fps=True, rank_by_bitrate=True,
+    rank_by_bitrate=True,
 ):
     """Decide this channel's final stream list.
 
@@ -173,10 +186,6 @@ def plan_channel(  # noqa: PLR0913, PLR0917 - interface fixed by the task spec
             strategy=strategy,
             codec_priority=codec_priority,
             response_time_bucket_ms=response_time_bucket_ms,
-            rank_by_resolution=rank_by_resolution,
-            rank_by_response_time=rank_by_response_time,
-            rank_by_codec=rank_by_codec,
-            rank_by_fps=rank_by_fps,
             rank_by_bitrate=rank_by_bitrate,
         )
 
@@ -359,16 +368,14 @@ def _build_channel_report_rows(  # noqa: PLR0913, PLR0917
 def _plan_channel_args(settings):
     """Extract the plan_channel arguments from settings.
 
-    Shared by run_preview and run_pipeline so the 11-argument call cannot
-    drift between the two sites.
+    Shared by run_preview and run_pipeline so the call cannot drift between
+    the two sites.
     """
     return (
         settings["removal_failure_threshold"],
         settings["max_streams_per_channel"],
         settings["order_strategy"], settings["codec_priority"],
         settings["response_time_bucket_ms"],
-        settings["rank_by_resolution"], settings["rank_by_response_time"],
-        settings["rank_by_codec"], settings["rank_by_fps"],
         settings["rank_by_bitrate"],
     )
 
@@ -415,8 +422,6 @@ def iter_attached_rows(resolved, channel, settings):
 
 def run_preview(context):
     """Read-only. Match and order from cached probe data, write a CSV."""
-    from . import models_access
-
     log = context.get("logger") or logger
     settings = load_settings(context)
     resolved = models_access.resolve_models()
@@ -562,14 +567,12 @@ def acquire_lock(name, now=None, ttl=_LOCK_TTL_SECONDS):
 
 
 def _bump_lock(holder, now=None, progress=None):
-    """Shared read-check-write body for refresh_lock() and update_progress().
+    """Shared read-check-write body for update_progress().
 
     Bumps "since" (and "progress" when given) if this process still owns the
     lock - i.e. holder is None (unconditional) or matches the current
-    holder. Returns (wrote, actual_holder) so each caller can log its own
-    message; kept as a private helper (not called via either public name) so
-    a test that monkeypatches refresh_lock or update_progress by name only
-    intercepts that one, not both.
+    holder. Returns (wrote, actual_holder) so the caller can log its own
+    message.
     """
     now = time.time() if now is None else now
     with _lock_file() as fh:
@@ -582,29 +585,6 @@ def _bump_lock(holder, now=None, progress=None):
             data["progress"] = progress
         _write_locked(fh, data)
         return True, actual_holder
-
-
-def refresh_lock(holder=None, now=None):
-    """Keep a long-running run's lock from going stale mid-run.
-
-    Without this, a run past its TTL looks abandoned to acquire_lock even
-    though it is still working - a second run can then steal the lock, and
-    the first run's eventual release_lock() would clear the SECOND run's
-    lock too. Like update_progress(), this checks lock identity first: a
-    run whose lock was force-cleared and re-acquired by another run no-ops
-    rather than resurrecting or bumping the new holder's timestamp.
-
-    ``holder=None`` (the default for tests and the force/clear path) is
-    unconditional - it bumps whichever lock is present.
-    """
-    wrote, actual_holder = _bump_lock(holder, now=now)
-    if wrote:
-        logger.debug("FAILOVERR refresh_lock: refreshed for %r", holder or "any")
-    else:
-        logger.debug(
-            "FAILOVERR refresh_lock: no-op for %r (lock held by %r)",
-            holder, actual_holder,
-        )
 
 
 def release_lock(holder=None):
@@ -629,16 +609,21 @@ def release_lock(holder=None):
         logger.debug("FAILOVERR release_lock: released by %r", holder or "any")
 
 
-def update_progress(holder, **fields):
+def update_progress(holder, now=None, **fields):
     """Publish live progress into the lock file for Show Status to read.
 
     Cheap, best-effort, and self-correcting: if the lock has since been
     released or stolen by someone else, this silently does nothing rather
     than resurrecting a finished/replaced lock with stale progress. Also
-    doubles as a heartbeat (bumps "since"), same as refresh_lock() - the two
-    share _bump_lock()'s read-check-write body.
+    doubles as a plain heartbeat (bumps "since") when called with no
+    fields, e.g. ``update_progress(mode)`` - that call leaves "progress"
+    untouched rather than clobbering it with an empty dict, which is what
+    lets this same function cover both jobs.
+
+    ``holder=None`` (used by tests and the force/clear path) is
+    unconditional - it bumps whichever lock is present.
     """
-    wrote, actual_holder = _bump_lock(holder, progress=fields)
+    wrote, actual_holder = _bump_lock(holder, now=now, progress=fields or None)
     if wrote:
         logger.debug("FAILOVERR update_progress: updated for %r", holder)
     else:
@@ -818,6 +803,8 @@ def _gevent_patched():
     decides both how work is spawned and what Show Status reports.
     """
     try:
+        # gevent is an optional third-party dependency, not stdlib - it may
+        # not be installed at all outside the live Dispatcharr container.
         from gevent import monkey
 
         return monkey.is_module_patched("subprocess")
@@ -828,6 +815,8 @@ def _gevent_patched():
 def spawn(fn, *args):
     """Run in the background without freezing the Dispatcharr worker."""
     if _gevent_patched():
+        # Only reachable once _gevent_patched() has already confirmed
+        # gevent is importable, so no ImportError guard is needed here.
         from gevent import spawn as gevent_spawn
 
         return gevent_spawn(fn, *args)
@@ -838,18 +827,6 @@ def spawn(fn, *args):
 
 def execution_model():
     return "gevent greenlet" if _gevent_patched() else "daemon thread"
-
-
-_INLINE_CHANNEL_LIMIT = 15
-
-
-def _notify(payload):
-    try:
-        from core.utils import send_websocket_update
-
-        send_websocket_update("updates", "update", payload)
-    except Exception:  # notifications must never break a run - but leave a trace
-        logger.debug("FAILOVERR progress notification failed", exc_info=True)
 
 
 def _select_probe_batch(  # noqa: PLR0913, PLR0917 - mirrors _probe_candidates' interface
@@ -909,8 +886,8 @@ def _probe_candidates(  # noqa: PLR0913, PLR0917 - interface fixed by the task s
     before any future is submitted - so neither Budget nor State needs a
     lock. Only prober.probe_one() (already thread-safe) and is_blank()
     (stateless) run inside worker threads; state.record(),
-    models_access_save(), and the heartbeat/save cadence all stay on this
-    thread, processed in completion order.
+    models_access.save_stream_stats(), and the heartbeat/save cadence all
+    stay on this thread, processed in completion order.
 
     probed_so_far is the run-wide probe count before this call, so the
     25-probe heartbeat/save cadence accumulates across the whole run
@@ -928,8 +905,6 @@ def _probe_candidates(  # noqa: PLR0913, PLR0917 - interface fixed by the task s
     whatever already started keeps running to completion - "wait for the
     current probe, then stop," not "wait for this whole channel."
     """
-    from .probing import is_blank
-
     to_probe = _select_probe_batch(candidates, state, settings, prober, budget, log)
     if not to_probe:
         return 0
@@ -941,7 +916,7 @@ def _probe_candidates(  # noqa: PLR0913, PLR0917 - interface fixed by the task s
         verdict, stats = result.verdict, result.stats
         response_time_ms = result.response_time_ms
         reason = result.reason
-        if verdict == VALID and settings["blank_detect"] and is_blank(
+        if verdict == VALID and settings["blank_detect"] and probing.is_blank(
             candidate_row.url, settings["ffmpeg_path"], settings["blank_detect_seconds"]
         ):
             verdict, stats, response_time_ms = INVALID, {}, None
@@ -962,6 +937,10 @@ def _probe_candidates(  # noqa: PLR0913, PLR0917 - interface fixed by the task s
                 stats, response_time_ms = result[2], result[3]
                 reason = result[4]
             except Exception:
+                # One bad probe (a bug in work(), not just a network error -
+                # those are already turned into an INCONCLUSIVE ProbeResult
+                # by probe()) must not crash the whole batch or lose the
+                # other futures already completed or in flight.
                 candidate_row = future_to_row[future]
                 log.exception(
                     "FAILOVERR probe worker raised unexpectedly "
@@ -1002,54 +981,24 @@ def _handle_probe_result(  # noqa: PLR0913, PLR0917 - one call site, _probe_cand
     )
     try:
         if verdict == VALID and stats:
-            _models_access_save(resolved, candidate_row.stream_id, stats)
+            models_access.save_stream_stats(resolved, candidate_row.stream_id, stats)
         probed_total = probed_before + 1
         if progress_cb is not None:
             progress_cb(candidate_row, verdict, probed_total)
         if probed_total % 25 == 0:
-            refresh_lock(mode)
+            update_progress(mode)
             state.save()
-            _notify({"type": "failoverr", "probed": probed_total})
     except Exception:
+        # state.record() above already succeeded, so the probe verdict is
+        # safe regardless of what happens here - everything in this try is
+        # best-effort bookkeeping (saved stats, progress callback, the
+        # heartbeat/save cadence) that must not un-record a real probe
+        # result just because one of those side effects broke.
         log.exception(
             "FAILOVERR post-probe ops failed for stream=%s; "
             "verdict recorded, continuing",
             candidate_row.stream_id,
         )
-    return True
-
-
-def _check_cancel_between_channels(budget, log, mode, channel):
-    """Stop check run before any work starts on the next channel.
-
-    Catches Stop pressed between channels - including for reorder_only,
-    which never calls _probe_candidates and so never touches budget.allow()
-    on its own.
-    """
-    if not cancel_requested():
-        return False
-    budget.canceled = True
-    budget.reason = budget.reason or "canceled by user"
-    log.info(
-        "FAILOVERR %s stopping early before channel %r: %s",
-        mode, channel.name, budget.reason,
-    )
-    return True
-
-
-def _budget_exhausted_mid_channel(budget, log, mode, channel):
-    """Stop/budget check run after probing, before this channel's writes.
-
-    Catches Stop pressed (or the probe/time budget running out) partway
-    through this channel's own probe batch, so a truncated probe pass
-    never gets committed via apply_channel_plan.
-    """
-    if not budget.reason:
-        return False
-    log.info(
-        "FAILOVERR %s stopping early before writing channel %r: %s",
-        mode, channel.name, budget.reason,
-    )
     return True
 
 
@@ -1066,9 +1015,9 @@ def _channel_candidates(mode, channel, index, resolved, settings):
     """Build the matched + already-attached candidate set for one channel.
 
     The candidate set requirements 3 and 5 share (CLAUDE.md §6 step 5) -
-    shared by run_pipeline's main loop, _count_stale_candidates' pre-pass,
-    and run_preview, so the three can never drift apart on what counts as a
-    candidate (preview must show what a run would actually produce).
+    shared by run_pipeline's main loop and run_preview, so the two can
+    never drift apart on what counts as a candidate (preview must show
+    what a run would actually produce).
 
     One attached-link query (iter_attached_rows), not two: attached_ids is
     derived from the same StreamRows the candidate set is built from, so the
@@ -1091,33 +1040,8 @@ def _channel_candidates(mode, channel, index, resolved, settings):
     return matched, attached_ids, list(by_id.values())
 
 
-def _count_stale_candidates(  # noqa: PLR0913, PLR0917 - one call site, run_pipeline
-    mode, channels, index, resolved, settings, state,
-):
-    """How many candidates this run would actually probe, computed up front.
-
-    An estimate, not a promise: it can't know which providers will abort
-    mid-run (Prober.aborted_providers only grows as probing happens), or
-    whether the probe/time budget will cut the run short first - either can
-    make the real count come in under this. It exists purely to give Show
-    Status an honest "stream N of <this>" denominator instead of none.
-    reorder_only never probes anything, so it's always 0 there.
-    """
-    if mode == "reorder_only":
-        return 0
-    total = 0
-    for channel in channels:
-        _, _, candidates = _channel_candidates(mode, channel, index, resolved, settings)
-        total += sum(
-            1 for c in candidates
-            if not state.is_fresh(c.stream_id, c.url, settings["probe_ttl_hours"])
-        )
-    return total
-
-
 def _start_channel_progress(  # noqa: PLR0913, PLR0917 - one call site, run_pipeline's loop
-    mode, totals, channel_index, channels_total, channel, streams_total,
-    matched, attached_ids,
+    mode, totals, channel_index, channels_total, channel, matched, attached_ids,
 ):
     """Ping progress at channel start; return this channel's per-probe callback.
 
@@ -1130,19 +1054,17 @@ def _start_channel_progress(  # noqa: PLR0913, PLR0917 - one call site, run_pipe
     """
     new_not_attached = {row.stream_id for row in matched} - attached_ids
     update_progress(
-        mode, stream_index=totals["probed"], streams_total=streams_total,
-        current_stream=None, channel_name=channel.name,
+        mode, current_stream=None, channel_name=channel.name,
         channel_index=channel_index, channels_total=channels_total,
         new_found=totals["new_found"], attached=totals["attached"],
         detached=totals["detached"],
     )
 
-    def on_probe(candidate_row, verdict, stream_index):
+    def on_probe(candidate_row, verdict, _stream_index):
         if candidate_row.stream_id in new_not_attached and verdict == VALID:
             totals["new_found"] += 1
         update_progress(
-            mode, stream_index=stream_index, streams_total=streams_total,
-            current_stream=candidate_row.name, channel_name=channel.name,
+            mode, current_stream=candidate_row.name, channel_name=channel.name,
             channel_index=channel_index, channels_total=channels_total,
             new_found=totals["new_found"], attached=totals["attached"],
             detached=totals["detached"],
@@ -1151,18 +1073,17 @@ def _start_channel_progress(  # noqa: PLR0913, PLR0917 - one call site, run_pipe
     return on_probe
 
 
-def _models_access_save(resolved, stream_id, stats):
-    from . import models_access
-
-    models_access.save_stream_stats(resolved, stream_id, stats)
-
-
 def _close_old_connections():
     """Drop Django DB connections past CONN_MAX_AGE.
 
     run_pipeline runs outside Django's request/response cycle (a background
     thread/greenlet, or the scheduler thread), so the usual per-request
     cleanup signal never fires here - do it explicitly instead.
+
+    Kept as its own function, not inlined at the one call site: this is
+    also the seam tests monkeypatch to skip a real `django.db` import in
+    the bare pytest run that has no Django installed - a name the import
+    itself couldn't provide.
     """
     from django.db import close_old_connections
 
@@ -1172,8 +1093,9 @@ def _close_old_connections():
 def _close_connection():
     """Release this thread's Django DB connection once a run is done.
 
-    Same reasoning as _close_old_connections: nothing else closes it for a
-    thread/greenlet that never went through a Django request.
+    Same reasoning as _close_old_connections, including the test-seam one:
+    nothing else closes it for a thread/greenlet that never went through a
+    Django request.
     """
     from django.db import connection
 
@@ -1182,9 +1104,6 @@ def _close_connection():
 
 def run_pipeline(context, mode="run"):
     """Single entry point for Run, Reorder Only, and Probe Only."""
-    from . import models_access
-    from .probing import Prober
-
     log = context.get("logger") or logger
     settings = load_settings(context)
     _close_old_connections()
@@ -1204,7 +1123,7 @@ def run_pipeline(context, mode="run"):
     # pool and otherwise runs without a refresh), so a long indexing pass
     # can't let the lock go stale before the channel loop ever starts. No-op
     # when this process doesn't hold the lock (holder mismatch).
-    refresh_lock(mode)
+    update_progress(mode)
     prober = Prober(
         settings["ffprobe_path"], settings["probe_timeout_seconds"],
         settings["per_account_concurrency"], settings["global_concurrency"],
@@ -1212,9 +1131,6 @@ def run_pipeline(context, mode="run"):
     )
 
     channels_total = len(channels)
-    streams_total = _count_stale_candidates(
-        mode, channels, index, resolved, settings, state
-    )
 
     rows = []
     totals = {
@@ -1227,15 +1143,24 @@ def run_pipeline(context, mode="run"):
             # 25-probe cadence never fires during a reorder_only run (no probing)
             # or between channels, so without this the lock could go stale during
             # a non-probing phase and be force-cleared mid-run.
-            refresh_lock(mode)
-            if _check_cancel_between_channels(budget, log, mode, channel):
+            update_progress(mode)
+            if cancel_requested():
+                # Catches Stop pressed between channels - including for
+                # reorder_only, which never calls _probe_candidates and so
+                # never touches budget.allow() on its own.
+                budget.canceled = True
+                budget.reason = budget.reason or "canceled by user"
+                log.info(
+                    "FAILOVERR %s stopping early before channel %r: %s",
+                    mode, channel.name, budget.reason,
+                )
                 break
 
             matched, attached_ids, candidates = _channel_candidates(
                 mode, channel, index, resolved, settings
             )
             on_probe = _start_channel_progress(
-                mode, totals, channel_index, channels_total, channel, streams_total,
+                mode, totals, channel_index, channels_total, channel,
                 matched, attached_ids,
             )
 
@@ -1249,7 +1174,14 @@ def run_pipeline(context, mode="run"):
                 totals["channels"] += 1
                 continue
 
-            if _budget_exhausted_mid_channel(budget, log, mode, channel):
+            if budget.reason:
+                # Stop pressed (or the probe/time budget running out) partway
+                # through this channel's own probe batch - a truncated probe
+                # pass must never get committed via apply_channel_plan.
+                log.info(
+                    "FAILOVERR %s stopping early before writing channel %r: %s",
+                    mode, channel.name, budget.reason,
+                )
                 break
 
             ordered, detach = plan_channel(
@@ -1295,13 +1227,12 @@ def run_pipeline(context, mode="run"):
         mode, verb, degraded, totals["channels"], totals["probed"],
         totals["attached"], totals["detached"], settings["dry_run"], path,
     )
-    _notify({"type": "failoverr", "status": status, **totals})
     return {"status": status, "report": path, "degraded_providers":
             sorted(str(p) for p in prober.aborted_providers), **totals}
 
 
 def start(context, mode="run"):
-    """Acquire the lock and run, inline for small jobs, backgrounded otherwise."""
+    """Acquire the lock and run in the background."""
     log = context.get("logger") or logger
     settings = load_settings(context)
     # The lock's TTL must outlive a legitimate run, not just the default 30
@@ -1323,21 +1254,16 @@ def start(context, mode="run"):
     _clear_cancel()  # clear cancel flag, now that we hold the lock
 
     try:
-        from . import models_access
-
         resolved = models_access.resolve_models()
         channel_count = len(select_channels(resolved, settings))
     except Exception as exc:
+        # Anything from a bad field resolution to a DB connectivity error
+        # can land here, and every one of them must still release the lock
+        # this function just acquired - a stuck lock from a failed startup
+        # would block every future run, not just this one.
         release_lock(mode)
         log.exception("FAILOVERR %s FAILED", mode)
         return {"status": "error", "message": str(exc)}
-
-    if channel_count <= _INLINE_CHANNEL_LIMIT and mode == "reorder_only":
-        try:
-            return run_pipeline(context, mode)
-        finally:
-            release_lock(mode)
-            _close_connection()
 
     def background():
         try:

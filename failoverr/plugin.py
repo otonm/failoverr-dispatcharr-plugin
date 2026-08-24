@@ -1,15 +1,26 @@
 """Failoverr - Dispatcharr plugin entry point.
 
-Django and Dispatcharr imports are lazy (inside functions) so the pure
-modules stay importable in a bare pytest run.
+Actual django.*/apps.* calls are lazy (inside the functions that make
+them) so a bare pytest run never needs Django installed. models_access,
+naming, scheduling and state.State are imported below despite that: none
+of those modules has a top-level Django import (each is lazy the same way,
+one level down), so importing them here costs nothing a bare pytest run
+can't afford. `pipeline` is the one exception, and it stays function-local
+everywhere it's used: pipeline.py itself does `from .plugin import
+Plugin` at module level, so a module-level `from . import pipeline` here
+would be a real circular import, not just an unnecessary one.
 """
 
-import collections
-import datetime
+import json
 import logging
-import threading
 
-from . import tasks  # noqa: F401 - import-time side effect: registers @shared_task.
+from . import (
+    models_access,
+    naming,
+    scheduling,
+    tasks,  # noqa: F401 - import-time side effect: registers @shared_task.
+)
+from .state import State
 
 # Dispatcharr's loader imports THIS file directly (preferring plugin.py over
 # __init__.py when both exist), and its celery worker only ever registers a
@@ -19,9 +30,8 @@ from . import tasks  # noqa: F401 - import-time side effect: registers @shared_t
 
 logger = logging.getLogger("failoverr")
 
-# How many raw stream_stats rows Diagnose shows, and how many it scans.
+# How many raw stream_stats rows Diagnose shows.
 _STATS_SAMPLES = 3
-_STATS_SCAN_LIMIT = 2000
 
 _BACKUP_WARNING = (
     "There is no undo. Back up your Dispatcharr database before running this."
@@ -30,145 +40,94 @@ _BACKUP_WARNING = (
 # Substrings that mark a setting whose value must never reach the log.
 _REDACT = ("password", "secret", "api_key")
 
-_scheduler = None
-_scheduler_guard = threading.Lock()
-
 
 def _ensure_scheduler(context):
-    """Arm the schedule to match current settings - celery beat if available.
+    """Arm the schedule to match current settings via django-celery-beat.
 
     Never lets a bad setting (e.g. a malformed cron expression) escape to
     the caller - Diagnose/Run/etc. must still return their real result even
-    when the schedule can't be armed. Locked so two near-simultaneous calls
-    can't each start a Scheduler and leak one's thread.
-
-    §10: django-celery-beat is more robust than the thread (it survives a
-    celery worker restart without needing this function to be called
-    again, and its schedule fires from a separate process rather than a
-    thread inside whichever uwsgi worker happened to handle the enabling
-    request) - prefer it whenever it's importable, and only fall back to
-    the thread otherwise. A scheduled run fires inside the celery worker
-    process while a manual Run fires inside uwsgi's - pipeline.py's lock
-    file (not an in-memory dict) is what keeps those from overlapping.
+    when the schedule can't be armed. A scheduled run fires inside the
+    celery worker process while a manual Run fires inside uwsgi's -
+    pipeline.py's lock file (not an in-memory dict) is what keeps those
+    from overlapping.
     """
-    global _scheduler  # noqa: PLW0603 - module-level handle so stop() can reach it too
-    from . import pipeline, scheduling
+    from . import pipeline  # circular otherwise - see the module docstring
 
     settings = pipeline.load_settings(context)
-    with _scheduler_guard:
-        if _scheduler is not None:
-            _scheduler.stop()
-            _scheduler = None
-
-        if scheduling.celery_beat_available():
-            try:
-                # matches_cron takes naive datetimes for shape validation only
-                scheduling.matches_cron(
-                    settings["cron_expression"], datetime.datetime.now()  # noqa: DTZ005
-                )
-                scheduling.sync_celery_beat(
-                    settings["cron_expression"], settings["schedule_enabled"]
-                )
-            except Exception:
-                logger.exception(
-                    "FAILOVERR celery-beat schedule not armed: bad cron_expression %r",
-                    settings["cron_expression"],
-                )
-                return None
-            logger.info(
-                "FAILOVERR celery-beat schedule armed: %r (enabled=%s)",
-                settings["cron_expression"], settings["schedule_enabled"],
-            )
-            return None
-
-        if not settings["schedule_enabled"]:
-            return None
-        try:
-            new_scheduler = scheduling.Scheduler(
-                settings["cron_expression"],
-                settings["timezone"],
-                lambda: pipeline.start(context, "run"),
-            )
-            new_scheduler.start()
-        except Exception:
-            logger.exception(
-                "FAILOVERR scheduler not armed: bad cron_expression %r or timezone %r",
-                settings["cron_expression"], settings["timezone"],
-            )
-            return None
-        _scheduler = new_scheduler
-        return _scheduler
+    if not scheduling.celery_beat_available():
+        logger.warning("FAILOVERR django-celery-beat unavailable; schedule not armed")
+        return
+    try:
+        scheduling.sync_celery_beat(
+            settings["cron_expression"], settings["schedule_enabled"]
+        )
+    except Exception:
+        # Broad on purpose, per the docstring above: a bad cron_expression
+        # is the expected failure, but anything else create_or_update_
+        # periodic_task raises must be swallowed the same way - the
+        # caller's real result still has to come back.
+        logger.exception(
+            "FAILOVERR celery-beat schedule not armed: bad cron_expression %r",
+            settings["cron_expression"],
+        )
+        return
+    logger.info(
+        "FAILOVERR celery-beat schedule armed: %r (enabled=%s)",
+        settings["cron_expression"], settings["schedule_enabled"],
+    )
 
 
 def _scheduler_report(scheduling):
-    """Report which scheduler backend is active, and its one gotcha, for Diagnose."""
+    """Report whether the schedule can be armed, and its one gotcha, for Diagnose."""
     if scheduling.celery_beat_available():
         return {
             "backend": "celery_beat",
             "note": (
                 "Scheduled via django-celery-beat: runs in Dispatcharr's "
-                "system timezone (Settings > General), not the Timezone "
-                "field below. A freshly-enabled or freshly-changed schedule "
-                "won't fire until the celery worker process next restarts "
-                "or forks a new child - it only re-imports plugins at that "
-                "point."
+                "system timezone (Settings > General). A freshly-enabled or "
+                "freshly-changed schedule won't fire until the celery "
+                "worker process next restarts or forks a new child - it "
+                "only re-imports plugins at that point."
             ),
         }
-    return {"backend": "thread", "note": None}
-
-
-def _flatten(value, path=""):
-    """Yield (dotted.path, leaf) pairs. Empty containers are leaves."""
-    if isinstance(value, dict) and value:
-        for key, item in value.items():
-            yield from _flatten(item, f"{path}.{key}" if path else str(key))
-    elif isinstance(value, (list, tuple)) and any(
-        isinstance(item, (dict, list, tuple)) for item in value
-    ):
-        for index, item in enumerate(value):
-            yield from _flatten(item, f"{path}[{index}]")
-    else:
-        yield path or "value", value
+    return {
+        "backend": "unavailable",
+        "note": "django-celery-beat is not installed; scheduling is disabled.",
+    }
 
 
 def _log_report(log, action, label, payload):
-    """Log one prefixed line per value.
+    """Log one prefixed line per top-level key.
 
     Dispatcharr shows nothing in the UI, so `docker logs -f dispatcharr |
     grep FAILOVERR` is the only channel - and grep is line-based, so a
-    single multi-line dump would match on its first line only.
+    single multi-line dump would match on its first line only. A nested
+    value (diagnose's result, mostly) is rendered as one JSON blob rather
+    than one line per leaf, so it still fits on its own greppable line.
     """
-    for path, value in _flatten(payload):
-        lowered = path.lower()
-        shown = "***" if any(word in lowered for word in _REDACT) else value
-        log.info("FAILOVERR %s %s.%s = %s", action, label, path, shown)
+    for key, value in (payload or {}).items():
+        if any(word in key.lower() for word in _REDACT):
+            shown = "***"
+        elif isinstance(value, (dict, list, tuple)):
+            shown = json.dumps(value, default=str)
+        else:
+            shown = value
+        log.info("FAILOVERR %s %s.%s = %s", action, label, key, shown)
 
 
 def _status_message(lock, stop_requested, streams_tracked):
-    """Build Show Status's human-readable line from the lock file's progress.
-
-    Per-stream progress ("stream N of M") only exists once something has
-    actually been probed this run - reorder_only never probes anything, and
-    a run/probe_only where everything is still cache-fresh has nothing to
-    probe either, so both fall back to per-channel progress instead.
-    """
+    """Build Show Status's human-readable line from the lock file's progress."""
     if not lock["holder"]:
         return f"Idle. {streams_tracked} streams tracked."
     holder = lock["holder"]
     progress = lock["progress"]
     if not progress:
         message = f"Running {holder}: starting up."
-    elif progress.get("streams_total"):
-        message = (
-            f"Running {holder}. Processing stream "
-            f"{progress.get('stream_index', 0)} of {progress['streams_total']} "
-            f"({progress.get('channel_name', '')}). "
-            f"Found {progress.get('new_found', 0)} new streams."
-        )
     else:
         message = (
             f"Running {holder}: channel {progress.get('channel_index')} of "
-            f"{progress.get('channels_total')} ({progress.get('channel_name')})."
+            f"{progress.get('channels_total')} ({progress.get('channel_name')}). "
+            f"Found {progress.get('new_found', 0)} new streams."
         )
     if stop_requested:
         message += " Stop requested - finishing current probe, then stopping."
@@ -326,64 +285,15 @@ class Plugin:
             ),
         },
         {
-            "id": "rank_by_resolution",
-            "label": "Rank by resolution",
-            "type": "boolean",
-            "default": True,
-            "help_text": (
-                "Highest priority ranking factor when on. Turning it off "
-                "does not stop resolution from ever mattering - the raw "
-                "height is still used as the final tiebreaker below - it "
-                "just stops resolution tier from taking priority over "
-                "response time, codec, fps, and bitrate."
-            ),
-        },
-        {
-            "id": "rank_by_response_time",
-            "label": "Rank by response time",
-            "type": "boolean",
-            "default": True,
-            "help_text": (
-                "Ranks by how long the last successful probe took to "
-                "complete - this includes connecting, several seconds of "
-                "downloading stream data, and parsing, not just initial "
-                "connection time, so it is influenced by stream bitrate "
-                "as well as server responsiveness. Second priority after "
-                "resolution, ahead of codec, fps, and bitrate. Streams "
-                "never probed, or only probed as invalid or "
-                "inconclusive, sort last on this factor."
-            ),
-        },
-        {
-            "id": "rank_by_codec",
-            "label": "Rank by codec",
-            "type": "boolean",
-            "default": True,
-            "help_text": (
-                "Uses the codec priority list below as a ranking factor. "
-                "Third priority, after resolution and response time."
-            ),
-        },
-        {
-            "id": "rank_by_fps",
-            "label": "Rank by frame rate",
-            "type": "boolean",
-            "default": True,
-            "help_text": (
-                "Uses measured frame rate as a ranking factor. Fourth "
-                "priority, after resolution, response time, and codec."
-            ),
-        },
-        {
             "id": "rank_by_bitrate",
             "label": "Rank by bitrate",
             "type": "boolean",
             "default": True,
             "help_text": (
                 "Uses measured video bitrate as a ranking factor. Lowest "
-                "priority of the five - only breaks ties left over after "
-                "resolution, response time, codec, and fps. Bitrate is "
-                "measured per-probe and rarely comes out identical "
+                "priority - only breaks ties left over after resolution, "
+                "response time, codec, and fps, which always rank. Bitrate "
+                "is measured per-probe and rarely comes out identical "
                 "between streams, so leaving this on usually prevents an "
                 "exact tie from ever reaching this point - which means "
                 "quality_first's provider interleaving rarely triggers "
@@ -408,7 +318,7 @@ class Plugin:
                 "streams, so even a well-tuned bucket does not guarantee "
                 "provider interleaving on its own - turning off 'Rank by "
                 "bitrate' removes the factor most likely to break that "
-                "tie again. Only used when 'Rank by response time' is on."
+                "tie again."
             ),
         },
         {
@@ -546,20 +456,10 @@ class Plugin:
             "type": "string",
             "default": "0 4 * * *",
             "help_text": (
-                "Standard five-field cron. The default is 04:00 daily. Probing "
-                "consumes provider connections, so pick an hour when nobody "
-                "is watching."
-            ),
-        },
-        {
-            "id": "timezone",
-            "label": "Timezone",
-            "type": "string",
-            "default": "UTC",
-            "help_text": (
-                "Timezone the cron expression is interpreted in, e.g. "
-                "Europe/Rome. Falls back to UTC with a log warning if the "
-                "system has no timezone database."
+                "Standard five-field cron, interpreted in Dispatcharr's "
+                "system timezone (Settings > General). The default is "
+                "04:00 daily. Probing consumes provider connections, so "
+                "pick an hour when nobody is watching."
             ),
         },
     ]
@@ -701,7 +601,13 @@ class Plugin:
             return {"status": "error", "message": f"Unknown action: {action}"}
         try:
             result = handler(params or {}, context)
-        except Exception as exc:  # surfaced to the log rather than swallowed
+        except Exception as exc:
+            # This is the plugin's outer boundary: whichever of the nine
+            # action handlers just ran can fail in ways specific to it (a
+            # bad ffprobe path, a Django error, a malformed setting), and
+            # every one of them has to come back as a normal error dict -
+            # an uncaught exception here would surface as a raw traceback
+            # in Dispatcharr's UI instead, logged rather than swallowed.
             log.exception("FAILOVERR %s FAILED", action)
             return {"status": "error", "message": str(exc)}
         _log_report(log, action, "result", result)
@@ -719,7 +625,7 @@ class Plugin:
         return result
 
     def _diagnose(self, params, context):
-        from . import models_access, naming, pipeline, scheduling
+        from . import pipeline  # circular otherwise - see the module docstring
 
         log = context.get("logger") or logger
         log.info("FAILOVERR diagnose START: loading settings and resolving models")
@@ -734,23 +640,14 @@ class Plugin:
         stream_model = resolved.stream_model
         pool_size = stream_model.objects.count()
 
-        # Sample stream_stats without loading the pool: what keys are really
-        # in use, and what do three real rows look like?
-        key_counts = collections.Counter()
-        samples = []
-        sampled = 0
-        for stats in (
+        # A few real stream_stats rows, so Diagnose shows what Dispatcharr
+        # actually populates without loading the whole pool.
+        samples = [
+            stats for stats in
             stream_model.objects.exclude(stream_stats__isnull=True)
-            .values_list("stream_stats", flat=True)
-            .iterator(chunk_size=500)
-        ):
-            sampled += 1
-            if isinstance(stats, dict):
-                key_counts.update(stats.keys())
-                if len(samples) < _STATS_SAMPLES:
-                    samples.append(stats)
-            if sampled >= _STATS_SCAN_LIMIT:
-                break
+            .values_list("stream_stats", flat=True)[:_STATS_SAMPLES]
+            if isinstance(stats, dict)
+        ]
 
         channel_model = resolved.channel_model
         channel_names = list(
@@ -774,8 +671,6 @@ class Plugin:
             "environment": environment,
             "pool": {
                 "stream_count": pool_size,
-                "sampled": sampled,
-                "stream_stats_keys": dict(key_counts.most_common()),
                 "stream_stats_samples": samples,
             },
             "channels": {
@@ -830,7 +725,6 @@ class Plugin:
 
     def _show_status(self, params, context):
         from . import pipeline
-        from .state import State
 
         state = State.load(pipeline.STATE_PATH)
         lock = pipeline.lock_status()
@@ -852,18 +746,14 @@ class Plugin:
 
     def stop(self, context=None):
         """Stop the scheduler. Called on disable/delete/reload."""
-        global _scheduler  # noqa: PLW0603 - module-level handle set by _ensure_scheduler
-        from . import scheduling
-
         log = (context or {}).get("logger") or logger
         log.info("FAILOVERR scheduler stop (disable/delete/reload)")
         try:
-            with _scheduler_guard:
-                if _scheduler is not None:
-                    _scheduler.stop()
-                    _scheduler = None
             scheduling.disable_celery_beat()
         except Exception:
+            # Called from Dispatcharr's disable/delete/reload hook, which
+            # has nowhere to surface a raised exception - log it and return
+            # rather than let the plugin loader see a crash.
             log.exception("FAILOVERR scheduler stop FAILED")
             return
         log.info("FAILOVERR scheduler stop COMPLETED")

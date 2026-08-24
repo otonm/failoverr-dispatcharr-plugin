@@ -3,7 +3,7 @@ import types
 import pytest
 
 from failoverr.models_access import FieldResolutionError
-from failoverr.plugin import Plugin, _flatten, _scheduler_report
+from failoverr.plugin import Plugin, _scheduler_report
 
 
 def test_unknown_action_returns_error_not_exception():
@@ -44,31 +44,13 @@ def _stub(result):
     return lambda *_args, **_kwargs: result
 
 
-def test_flatten_gives_every_leaf_its_own_dotted_path():
-    payload = {
-        "channels": {
-            "total": 2,
-            "normalization_examples": [
-                {"name": "RAI 1", "tokens": ["rai", "1"]},
-            ],
-        },
-    }
-    assert dict(_flatten(payload)) == {
-        "channels.total": 2,
-        "channels.normalization_examples[0].name": "RAI 1",
-        "channels.normalization_examples[0].tokens": ["rai", "1"],
-    }
-
-
-def test_flatten_treats_empty_containers_as_leaves():
-    assert list(_flatten({"a": {}, "b": []})) == [("a", {}), ("b", [])]
-
-
 def test_every_logged_line_is_greppable(monkeypatch):
     """Check the grep contract.
 
     Dispatcharr shows nothing in the UI and grep is line-based, so a
-    line without the prefix is a line the user can never find.
+    line without the prefix is a line the user can never find. A nested
+    value renders as one JSON blob on its key's line rather than one line
+    per leaf.
     """
     log = FakeLogger()
     monkeypatch.setattr(Plugin, "_diagnose", _stub({"status": "ok", "a": {"b": 1}}))
@@ -76,7 +58,7 @@ def test_every_logged_line_is_greppable(monkeypatch):
 
     assert all(line.startswith("FAILOVERR ") for line in log.lines), log.lines
     assert "FAILOVERR diagnose settings.match_mode = strict" in log.lines
-    assert "FAILOVERR diagnose result.a.b = 1" in log.lines
+    assert 'FAILOVERR diagnose result.a = {"b": 1}' in log.lines
     assert "FAILOVERR diagnose COMPLETED" in log.lines
 
 
@@ -154,12 +136,12 @@ def test_diagnose_computes_settings_via_pipeline_load_settings(monkeypatch):
     assert calls[0] is context
 
 
-def test_scheduler_report_names_the_thread_backend_when_celery_beat_is_absent():
+def test_scheduler_report_flags_unavailable_when_celery_beat_is_absent():
     fake_scheduling = types.SimpleNamespace(celery_beat_available=lambda: False)
 
     report = _scheduler_report(fake_scheduling)
 
-    assert report == {"backend": "thread", "note": None}
+    assert report["backend"] == "unavailable"
 
 
 def test_scheduler_report_flags_the_worker_restart_caveat_for_celery_beat():
