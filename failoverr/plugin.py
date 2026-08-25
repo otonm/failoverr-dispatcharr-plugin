@@ -628,7 +628,6 @@ class Plugin:
             "streams_tracked": len(state.streams),
             "last_run": meta.get("last_run"),
             "last_mode": meta.get("last_mode"),
-            "degraded_providers": meta.get("degraded_providers") or [],
             "budget_stop": meta.get("budget_stop"),
             "message": _status_message(
                 lock, pipeline.cancel_requested(), len(state.streams)

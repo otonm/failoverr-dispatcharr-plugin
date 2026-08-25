@@ -9,7 +9,6 @@ from failoverr.probing import (
     classify,
     is_blank,
     probe,
-    should_abort_provider,
 )
 from failoverr.state import INCONCLUSIVE, INVALID, VALID
 
@@ -359,6 +358,7 @@ def test_probe_does_not_attach_response_time_on_an_invalid_result():
     result = probe(
         "http://p.example/1.ts", "ffprobe", 15,
         runner=fake_runner(1, "", "Invalid data found when processing input"),
+        sleep_fn=lambda _s: None,
     )
     assert result.response_time_ms is None
 
@@ -376,6 +376,57 @@ def test_probe_reports_a_runner_exception_as_inconclusive():
     result = probe("http://p.example/1.ts", "ffprobe", 15, runner=exploding_runner)
     assert result.verdict == INCONCLUSIVE
     assert "missing" in result.reason
+
+
+def test_probe_retries_once_and_recovers_from_a_transient_invalid_result():
+    """A live stream's transient join glitch must not read as dead."""
+    outcomes = [
+        (1, "", "Invalid data found when processing input"),
+        (0, ffprobe_json([VIDEO, AUDIO]), ""),
+    ]
+
+    def flaky_runner(_argv, _timeout):
+        return outcomes.pop(0)
+
+    result = probe(
+        "http://p.example/1.ts", "ffprobe", 15,
+        runner=flaky_runner, sleep_fn=lambda _s: None,
+    )
+    assert result.verdict == VALID
+
+
+def test_probe_does_not_mask_a_genuinely_dead_stream():
+    """A defect that reproduces on retry must still be reported as invalid."""
+    calls = []
+    result = probe(
+        "http://p.example/1.ts", "ffprobe", 15,
+        runner=fake_runner(
+            1, "", "Invalid data found when processing input", record=calls,
+        ),
+        sleep_fn=lambda _s: None,
+    )
+    assert result.verdict == INVALID
+    assert len(calls) == 2
+
+
+def test_probe_waits_before_retrying_an_invalid_result():
+    slept = []
+    probe(
+        "http://p.example/1.ts", "ffprobe", 15,
+        runner=fake_runner(1, "", "Invalid data found when processing input"),
+        sleep_fn=slept.append,
+    )
+    assert slept == [2]
+
+
+def test_probe_does_not_sleep_when_the_first_attempt_is_valid():
+    slept = []
+    probe(
+        "http://p.example/1.ts", "ffprobe", 15,
+        runner=fake_runner(0, ffprobe_json([VIDEO, AUDIO])),
+        sleep_fn=slept.append,
+    )
+    assert slept == []
 
 
 # --- Blank detection: opt-in and fail-open ---------------------------------
@@ -425,28 +476,7 @@ def test_malformed_black_duration_fails_open():
                     runner=fake_runner(0, "", malformed_stderr)) is False
 
 
-# --- Concurrency and provider abort -------------------------------------------
-
-
-def test_provider_not_aborted_below_the_minimum_sample():
-    """One genuinely dead stream must not abort a healthy provider."""
-    assert should_abort_provider([INVALID] * 4) is False
-
-
-def test_provider_aborted_when_every_verdict_is_bad():
-    assert should_abort_provider([INCONCLUSIVE] * 5) is True
-    assert should_abort_provider([INVALID] * 5) is True
-    assert should_abort_provider([INVALID, INCONCLUSIVE] * 3) is True
-
-
-def test_a_single_success_prevents_abort():
-    assert should_abort_provider([INCONCLUSIVE] * 9 + [VALID]) is False
-
-
-def test_an_early_success_does_not_permanently_disable_the_breaker():
-    """A provider degrading later (rate-limited after early hits) must still trip."""
-    verdicts = [VALID] + [INVALID] * 20
-    assert should_abort_provider(verdicts) is True
+# --- Concurrency -----------------------------------------------------------
 
 
 def test_per_provider_concurrency_is_never_exceeded():
@@ -478,27 +508,6 @@ def test_per_provider_concurrency_is_never_exceeded():
     assert peak["A"] == 1, "provider connection cap was exceeded"
 
 
-def test_probes_on_an_aborted_provider_return_inconclusive_without_running():
-    calls = []
-
-    def failing_probe(url, _ffprobe_path, _timeout, _runner=None):
-        calls.append(url)
-        return ProbeResult(INCONCLUSIVE, {}, "connection limit")
-
-    prober = Prober("ffprobe", 15, per_account=1, global_limit=4, cooldown=0,
-                    probe_fn=failing_probe, sleep_fn=lambda _s: None)
-    for i in range(5):
-        prober.probe_one("A", f"u{i}")
-    assert "A" in prober.aborted_providers
-
-    before = len(calls)
-    result = prober.probe_one("A", "u-after-abort")
-    assert len(calls) == before, "no further probes may be sent to this provider"
-    assert result.verdict == INCONCLUSIVE, (
-        "an aborted provider's streams must never be marked invalid"
-    )
-
-
 def test_cooldown_is_applied_between_probes_on_one_provider():
     slept = []
     prober = Prober("ffprobe", 15, per_account=1, global_limit=4, cooldown=2,
@@ -509,31 +518,18 @@ def test_cooldown_is_applied_between_probes_on_one_provider():
     assert slept == [2, 2]
 
 
-def test_aborting_a_provider_logs_the_breaker_trip(caplog):
-    """Regression: the provider-abort decision fired with no log line.
+def test_one_stream_going_bad_does_not_affect_a_sibling_on_the_same_provider():
+    """A verdict must be strictly per-stream, never influenced by siblings."""
+    def probe_fn(url, _ffprobe_path, _timeout, _runner=None):
+        return ProbeResult(INVALID, {}, "dead") if url == "bad" else \
+            ProbeResult(VALID, {}, "ok")
 
-    The highest-impact decision in the module (stop probing a provider
-    mid-run) used to fire with no log line at all - the provider showed up
-    only in the run's final 'DEGRADED' marker, not in docker logs per-trip,
-    and without naming which provider went bad.
-    """
-    import logging
-
-    def always_bad(_url, _ffprobe, _timeout):
-        return ProbeResult(INVALID, {}, "dead")
-
-    prober = Prober(
-        "ffprobe", 15, per_account=1, global_limit=4, cooldown=0,
-        probe_fn=always_bad, sleep_fn=lambda _s: None,
+    prober = Prober("ffprobe", 15, per_account=1, global_limit=4, cooldown=0,
+                    probe_fn=probe_fn, sleep_fn=lambda _s: None)
+    for _ in range(10):
+        prober.probe_one("A", "bad")
+    result = prober.probe_one("A", "good")
+    assert result.verdict == VALID, (
+        "a healthy stream must still be probed and pass, no matter how many "
+        "other streams on the same provider just failed"
     )
-
-    with caplog.at_level(logging.WARNING, logger="failoverr"):
-        for i in range(5):
-            prober.probe_one("Acme", f"u{i}")
-
-    assert "Acme" in prober.aborted_providers
-    matched = [
-        r for r in caplog.records
-        if "Acme" in r.message and "aborted" in r.message
-    ]
-    assert matched, caplog.records

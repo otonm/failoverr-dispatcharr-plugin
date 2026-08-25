@@ -732,9 +732,7 @@ def execution_model():
     return "gevent greenlet" if _gevent_patched() else "daemon thread"
 
 
-def _select_probe_batch(  # noqa: PLR0913, PLR0917 - mirrors _probe_candidates' interface
-    candidates, state, settings, prober, budget, log,
-):
+def _select_probe_batch(candidates, state, settings, budget, log):
     """Which candidates get probed this call, reserving their budget.
 
     Sequential and side-effecting (spends budget) by design: this is the
@@ -743,31 +741,19 @@ def _select_probe_batch(  # noqa: PLR0913, PLR0917 - mirrors _probe_candidates' 
     """
     to_probe = []
     skipped_fresh = 0
-    skipped_aborted = 0
     for row in candidates:
         if state.is_fresh(row.stream_id, row.url, settings["probe_ttl_hours"]):
             skipped_fresh += 1
-            continue
-        if row.provider_id in prober.aborted_providers:
-            # probe_one already no-ops for an aborted provider; skip the
-            # call entirely so its candidates don't burn budget that
-            # healthy providers could otherwise use - across calls. A
-            # provider that crosses the abort threshold partway through
-            # THIS batch still has its already-selected remaining
-            # candidates dispatched and charged, since the whole batch is
-            # selected up front, before any probe runs.
-            skipped_aborted += 1
             continue
         if not budget.allow():
             log.info("FAILOVERR run stopping early: %s", budget.reason)
             break
         budget.spend()
         to_probe.append(row)
-    if skipped_fresh or skipped_aborted:
+    if skipped_fresh:
         log.debug(
-            "FAILOVERR _select_probe_batch: candidates=%d fresh=%d "
-            "aborted_provider=%d to_probe=%d",
-            len(candidates), skipped_fresh, skipped_aborted, len(to_probe)
+            "FAILOVERR _select_probe_batch: candidates=%d fresh=%d to_probe=%d",
+            len(candidates), skipped_fresh, len(to_probe)
         )
     return to_probe
 
@@ -808,7 +794,7 @@ def _probe_candidates(  # noqa: PLR0913, PLR0917 - interface fixed by the task s
     whatever already started keeps running to completion - "wait for the
     current probe, then stop," not "wait for this whole channel."
     """
-    to_probe = _select_probe_batch(candidates, state, settings, prober, budget, log)
+    to_probe = _select_probe_batch(candidates, state, settings, budget, log)
     if not to_probe:
         return 0
 
@@ -1079,22 +1065,19 @@ def run_pipeline(context, mode="run"):
         state.meta.update({
             "last_run": time.time(),
             "last_mode": mode,
-            "degraded_providers": sorted(str(p) for p in prober.aborted_providers),
             "budget_stop": budget.reason,
         })
         state.save()
 
     path = write_report(rows, report_path(mode))
     status, verb = _run_outcome(budget)
-    degraded = " DEGRADED" if prober.aborted_providers else ""
     log.info(
-        "FAILOVERR %s %s%s: %s channels, %s probed, %s attached, "
+        "FAILOVERR %s %s: %s channels, %s probed, %s attached, "
         "%s detached, dry_run=%s, report %s",
-        mode, verb, degraded, totals["channels"], totals["probed"],
+        mode, verb, totals["channels"], totals["probed"],
         totals["attached"], totals["detached"], settings["dry_run"], path,
     )
-    return {"status": status, "report": path, "degraded_providers":
-            sorted(str(p) for p in prober.aborted_providers), **totals}
+    return {"status": status, "report": path, **totals}
 
 
 def start(context, mode="run"):

@@ -11,7 +11,6 @@ import re
 import subprocess
 import threading
 import time
-from collections import defaultdict
 from typing import NamedTuple
 
 from .state import INCONCLUSIVE, INVALID, VALID
@@ -63,6 +62,10 @@ _INVALID_PATTERNS = [
 
 _INCONCLUSIVE_RE = re.compile("|".join(_INCONCLUSIVE_PATTERNS), re.IGNORECASE)
 _INVALID_RE = re.compile("|".join(_INVALID_PATTERNS), re.IGNORECASE)
+
+# Give a live stream's transient glitch (ad stinger, PCR discontinuity,
+# encoder hiccup) time to clear before the retry samples it again.
+_INVALID_RETRY_DELAY_SECONDS = 2
 
 
 class ProbeResult(NamedTuple):
@@ -222,12 +225,7 @@ def _validate_url(url):
     return url.split("://", 1)[0].lower() in _ALLOWED_SCHEMES
 
 
-def probe(url, ffprobe_path, timeout, runner=run_command):
-    if not _validate_url(url):
-        scheme = url.split("://", 1)[0].lower() if "://" in url else "unknown"
-        return ProbeResult(
-            INCONCLUSIVE, {}, f"url scheme not allowed: scheme={scheme!r}",
-        )
+def _probe_once(url, ffprobe_path, timeout, runner):
     argv = [
         ffprobe_path,
         "-v", "error",
@@ -258,6 +256,23 @@ def probe(url, ffprobe_path, timeout, runner=run_command):
     if result.verdict != VALID:
         return result
     return result._replace(response_time_ms=elapsed_ms)
+
+
+def probe(url, ffprobe_path, timeout, runner=run_command, sleep_fn=time.sleep):
+    if not _validate_url(url):
+        scheme = url.split("://", 1)[0].lower() if "://" in url else "unknown"
+        return ProbeResult(
+            INCONCLUSIVE, {}, f"url scheme not allowed: scheme={scheme!r}",
+        )
+    result = _probe_once(url, ffprobe_path, timeout, runner)
+    if result.verdict == INVALID:
+        # A single sample reading as corrupt can be a genuine dead stream or
+        # a transient live-stream glitch; one retry after a short delay
+        # tells them apart. A truly dead stream reports the same defect
+        # again.
+        sleep_fn(_INVALID_RETRY_DELAY_SECONDS)
+        result = _probe_once(url, ffprobe_path, timeout, runner)
+    return result
 
 
 def is_blank(url, ffmpeg_path, seconds, runner=run_command):
@@ -294,24 +309,6 @@ def is_blank(url, ffmpeg_path, seconds, runner=run_command):
         return False
 
 
-# Never abort a provider on a sample of one: a provider that legitimately
-# carries a single dead stream is not a provider that is down.
-_PROVIDER_ABORT_MINIMUM = 5
-
-
-def should_abort_provider(verdicts):
-    """Determine if a provider should be aborted based on its probing verdicts.
-
-    Returns True when a provider's most recent _PROVIDER_ABORT_MINIMUM verdicts
-    are all bad. Windowed to the tail rather than the whole run's history, so
-    one early success can't permanently disable the breaker against later
-    degradation (e.g. rate-limiting after hundreds of prior successes).
-    """
-    if len(verdicts) < _PROVIDER_ABORT_MINIMUM:
-        return False
-    return all(v != VALID for v in verdicts[-_PROVIDER_ABORT_MINIMUM:])
-
-
 class Prober:
     """Runs probes under a per-provider cap and a global cap.
 
@@ -330,9 +327,6 @@ class Prober:
         self._global = threading.Semaphore(max(1, int(global_limit)))
         self._locks = {}
         self._locks_guard = threading.Lock()
-        self._verdicts = defaultdict(list)
-        self._verdicts_guard = threading.Lock()
-        self.aborted_providers = set()
 
     def _semaphore(self, provider_id):
         with self._locks_guard:
@@ -341,26 +335,10 @@ class Prober:
             return self._locks[provider_id]
 
     def probe_one(self, provider_id, url):
-        if provider_id in self.aborted_providers:
-            return ProbeResult(
-                INCONCLUSIVE, {},
-                "provider aborted this run; existing ranking left untouched",
-            )
-
         provider_sem = self._semaphore(provider_id)
         with self._global, provider_sem:
             result = self.probe_fn(url, self.ffprobe_path, self.timeout)
         if self.cooldown:
             with provider_sem:
                 self.sleep_fn(self.cooldown)
-
-        with self._verdicts_guard:
-            verdicts = self._verdicts[provider_id]
-            verdicts.append(result.verdict)
-            if should_abort_provider(verdicts):
-                self.aborted_providers.add(provider_id)
-                _log.warning(
-                    "FAILOVERR provider %s aborted: last %d probes all bad",
-                    provider_id, _PROVIDER_ABORT_MINIMUM,
-                )
         return result

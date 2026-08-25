@@ -1107,9 +1107,9 @@ def test_run_pipeline_reports_ok_on_a_normal_finish(tmp_path, monkeypatch):
 def test_run_pipeline_finally_populates_state_meta(tmp_path, monkeypatch):
     """run_pipeline's finally block must populate state.meta for Show Status.
 
-    The finally block updates last_run, last_mode, degraded_providers, and
-    budget_stop. Show Status depends on this metadata being present even
-    when the run is canceled or interrupted.
+    The finally block updates last_run, last_mode, and budget_stop. Show
+    Status depends on this metadata being present even when the run is
+    canceled or interrupted.
     """
     channel = types.SimpleNamespace(name="RAI 1")
     attached = [row(1, "IT: RAI 1 HD", "A")]
@@ -1124,7 +1124,6 @@ def test_run_pipeline_finally_populates_state_meta(tmp_path, monkeypatch):
     reloaded = State.load(tmp_path / "state.json")
     assert reloaded.meta["last_mode"] == "run"
     assert reloaded.meta["last_run"] > 0
-    assert reloaded.meta["degraded_providers"] == []
     assert reloaded.meta["budget_stop"] is None
 
     # Canceled run
@@ -1344,95 +1343,6 @@ def test_backgrounded_run_releases_the_lock_even_if_run_pipeline_crashes(monkeyp
     pipeline_module.start({"settings": {}}, mode="run")
 
     assert lock_status()["holder"] is None
-
-
-# --- Aborted-provider budget waste (Fix 4) ----------------------------------
-
-
-def test_probe_candidates_skips_candidates_on_an_already_aborted_provider():
-    """A provider that aborted early must not keep burning probe budget.
-
-    prober.probe_one() already no-ops for an aborted provider, but the old
-    loop still called budget.spend() for that no-op - letting one bad
-    provider with many candidates starve healthy providers of their share.
-    """
-    settings = load_settings({"settings": {}})
-    state = State(path=pathlib.Path("/nonexistent/does-not-matter.json"))
-    budget = Budget(max_probes=10, max_minutes=60, now_fn=lambda: 0.0)
-    candidate = row(1, "IT: RAI 1 HD", "A")
-
-    class AbortedProber:
-        aborted_providers = {"A"}
-
-        def probe_one(self, *_args, **_kwargs):
-            raise AssertionError(
-                "must not probe a candidate on an already-aborted provider"
-            )
-
-    log = types.SimpleNamespace(
-        info=lambda *_a, **_kw: None, debug=lambda *_a, **_kw: None
-    )
-
-    probed = pipeline_module._probe_candidates(
-        [candidate], state, settings, AbortedProber(), budget,
-        resolved=None, log=log,
-    )
-
-    assert probed == 0
-    assert budget.probes == 0, "an aborted provider's candidates must not spend budget"
-
-
-def test_select_probe_batch_mid_batch_provider_abort_still_probes_selected(
-    tmp_path
-):
-    """Mid-batch provider abort: already-selected candidates still get probed.
-
-    _select_probe_batch selects the entire batch up front, before any probe
-    runs. If a provider crosses the abort threshold during the batch, its
-    already-selected remaining candidates are still dispatched and charged.
-    Only subsequent calls to _select_probe_batch will skip them.
-    """
-    settings = load_settings({"settings": {}})
-    budget = Budget(max_probes=10, max_minutes=60, now_fn=lambda: 0.0)
-
-    # 3 candidates from provider A, none fresh
-    candidates = [
-        row(1, "IT: RAI 1 HD", 1),
-        row(2, "IT: RAI 2 HD", 1),
-        row(3, "IT: RAI 3 HD", 1),
-    ]
-
-    class ProberMidAbort:
-        aborted_providers = set()
-
-        def probe_one(self, provider_id, url):
-            if provider_id == 1 and "2" in url:
-                # Simulate provider 1 aborting on the 2nd probe
-                self.aborted_providers.add(1)
-            return ProbeResult(VALID, {}, "ok")
-
-    log = types.SimpleNamespace(
-        info=lambda *_a, **_kw: None, debug=lambda *_a, **_kw: None
-    )
-
-    # First call: all 3 selected (provider not aborted yet)
-    state1 = State(path=tmp_path / "state1.json")
-    prober = ProberMidAbort()
-    to_probe_1 = pipeline_module._select_probe_batch(
-        candidates, state1, settings, prober, budget, log
-    )
-    assert len(to_probe_1) == 3
-    assert budget.probes == 3
-
-    # Second call: provider A now aborted, should skip all
-    state2 = State(path=tmp_path / "state2.json")
-    prober2 = ProberMidAbort()
-    prober2.aborted_providers = {1}  # already aborted (provider_id is int)
-    to_probe_2 = pipeline_module._select_probe_batch(
-        candidates, state2, settings, prober2, budget, log
-    )
-    assert len(to_probe_2) == 0
-    assert budget.probes == 3  # no additional budget spent
 
 
 def test_probe_candidates_logs_the_offending_stream_when_a_worker_raises(monkeypatch):
