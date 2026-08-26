@@ -1133,6 +1133,22 @@ def run_pipeline(context, mode="run"):
             rows.extend(_build_channel_report_rows(
                 channel, ordered, detach, candidates, attached_ids, state
             ))
+
+            # Probed-valid candidates that lost the max_streams_per_channel
+            # cutoff would otherwise vanish with no trace anywhere - the
+            # exact gap that made a legitimately-outranked new provider look
+            # like a matching bug. run_preview already reports every
+            # matched-but-unplanned candidate; give run the same visibility.
+            planned = set(ordered) | set(detach)
+            for candidate_row in candidates:
+                if candidate_row.stream_id in planned:
+                    continue
+                verdict = state.last_verdict(candidate_row.stream_id)
+                rows.append(_report_row(
+                    channel, "", candidate_row.stream_id, candidate_row, state,
+                    "not attached - outranked" if verdict == VALID
+                    else "not attached - not qualified",
+                ))
     finally:
         state.meta.update({
             "last_run": time.time(),

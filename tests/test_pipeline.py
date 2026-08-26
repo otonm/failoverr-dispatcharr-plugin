@@ -980,6 +980,57 @@ def test_run_pipeline_report_includes_the_response_time_column(tmp_path, monkeyp
     assert rows[0]["response_time_ms"] == "180"
 
 
+def test_run_pipeline_reports_a_valid_candidate_truncated_by_the_streams_cap(
+    tmp_path, monkeypatch,
+):
+    """A valid, matched candidate that loses the max_streams_per_channel cutoff.
+
+    It must still show up in the report - otherwise it vanishes with no
+    trace, indistinguishable from a matching bug (the exact confusion a new
+    provider's streams caused: probed valid in the log, absent from the CSV).
+    """
+    channel = types.SimpleNamespace(name="RAI 1")
+    winner = row(1, "IT: RAI 1 HD", 1, height=1080)
+    loser = row(2, "IT: Rai 1 4K", 2, height=720)
+    state = _make_state(tmp_path)
+    state.record(1, winner.url, VALID, response_time_ms=100)
+    state.record(2, loser.url, VALID, response_time_ms=100)
+
+    monkeypatch.setattr(
+        pipeline_module, "select_channels", lambda *_a, **_kw: [channel]
+    )
+    monkeypatch.setattr(
+        pipeline_module, "iter_attached_rows", lambda *_a, **_kw: iter([])
+    )
+    monkeypatch.setattr(
+        pipeline_module, "iter_pool", lambda *_a, **_kw: iter([winner, loser])
+    )
+    monkeypatch.setattr(
+        pipeline_module.State, "load", staticmethod(lambda *_a, **_kw: state)
+    )
+    monkeypatch.setattr(
+        pipeline_module, "report_path", lambda mode: tmp_path / f"{mode}.csv"
+    )
+    monkeypatch.setattr(models_access_module, "resolve_models", object)
+    monkeypatch.setattr(pipeline_module, "_close_old_connections", lambda: None)
+    monkeypatch.setattr(pipeline_module, "_close_connection", lambda: None)
+    monkeypatch.setattr(
+        models_access_module, "apply_channel_plan",
+        lambda *_a, **_kw: {"attached": 1, "detached": 0},
+    )
+
+    result = run_pipeline(
+        {"settings": {"max_streams_per_channel": 1}}, mode="run"
+    )
+
+    with pathlib.Path(result["report"]).open(newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    by_stream = {r["stream"]: r for r in rows}
+    assert by_stream["IT: RAI 1 HD"]["action"] == "attach"
+    assert by_stream["IT: Rai 1 4K"]["action"] == "not attached - outranked"
+    assert by_stream["IT: Rai 1 4K"]["verdict"] == "valid"
+
+
 # --- Broken channel marker ---------------------------------------------
 
 
