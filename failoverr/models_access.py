@@ -207,6 +207,18 @@ def apply_channel_plan(resolved, channel, ordered_ids, detach_ids, dry_run):
     return summary
 
 
+def rename_channel(resolved, channel, new_name):
+    """Write the broken-marker rename. Single field, so no transaction needed.
+
+    new_name is computed from channel.name as read earlier in this run's
+    loop - a concurrent manual rename in the Dispatcharr UI mid-run would
+    be overwritten here. Accepted: low odds, and it self-heals next run,
+    since channel.name is always re-read fresh from the DB at the top of
+    the next select_channels() call.
+    """
+    resolved.channel_model.objects.filter(id=channel.id).update(name=new_name)
+
+
 def save_stream_stats(resolved, stream_id, stats):
     """Write probe results using the key names Dispatcharr already uses.
 

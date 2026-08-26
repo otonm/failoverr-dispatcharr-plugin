@@ -192,6 +192,61 @@ def plan_channel(  # noqa: PLR0913, PLR0917 - interface fixed by the task spec
     return kept + never_probed_ids, detach
 
 
+def apply_broken_suffix(name, suffix, is_broken):
+    """Add or remove `suffix` from `name` for the broken-channel marker.
+
+    Idempotent either way: a name already carrying the suffix while still
+    broken, or already without it while healthy, comes back unchanged.
+    """
+    suffix = suffix or ""
+    if not suffix:
+        return name
+    has_suffix = name.endswith(suffix)
+    if is_broken and not has_suffix:
+        return name + suffix
+    if not is_broken and has_suffix:
+        return name[: -len(suffix)]
+    return name
+
+
+def _channel_broken_state(candidates, state):
+    """True/False once something conclusive is known; None to leave it alone.
+
+    A VALID verdict anywhere wins. Broken requires every candidate to be
+    conclusively INVALID - a candidate still unresolved (never probed, or
+    stuck INCONCLUSIVE) means "not yet known", not "confirmed dead", so it
+    blocks the broken verdict the same way it blocks plan_channel's ranking.
+    """
+    verdicts = {state.last_verdict(c.stream_id) for c in candidates}
+    if VALID in verdicts:
+        return False
+    if verdicts and verdicts <= {INVALID}:
+        return True
+    return None
+
+
+def _update_broken_marker(  # noqa: PLR0913, PLR0917 - one call site, run_pipeline's loop
+    resolved, channel, candidates, state, settings, log, mode,
+):
+    is_broken = _channel_broken_state(candidates, state)
+    if is_broken is None:
+        return
+    new_name = apply_broken_suffix(
+        channel.name, settings["broken_channel_suffix"], is_broken
+    )
+    if new_name == channel.name:
+        return
+    if not settings["dry_run"]:
+        models_access.rename_channel(resolved, channel, new_name)
+    log.info(
+        "FAILOVERR %s: channel %r %s -> %r%s",
+        mode, channel.name,
+        "marked broken" if is_broken else "cleared broken marker",
+        new_name, " (dry_run, not saved)" if settings["dry_run"] else "",
+    )
+    channel.name = new_name
+
+
 def _csv_tuple(raw, fallback):
     parts = tuple(p.strip().lower() for p in str(raw or "").split(",") if p.strip())
     return parts or fallback
@@ -353,9 +408,21 @@ def iter_pool(resolved, settings):
 
 
 def select_channels(resolved, settings):
+    """Channels matching the configured filter.
+
+    channel_names matches exactly, so a channel this same run's marker
+    logic renamed to add/remove broken_channel_suffix would otherwise
+    silently fall out of - or into - the filter forever after. Matching
+    both the bare and suffixed form of each configured name keeps a
+    channel selectable across that rename either way.
+    """
     queryset = resolved.channel_model.objects.all()
     if settings["channel_names"]:
-        queryset = queryset.filter(name__in=settings["channel_names"])
+        names = set(settings["channel_names"])
+        suffix = settings["broken_channel_suffix"]
+        if settings["mark_broken_channels"] and suffix:
+            names |= {name + suffix for name in names}
+        queryset = queryset.filter(name__in=names)
     elif settings["channel_group"]:
         queryset = queryset.filter(channel_group__name=settings["channel_group"])
     return list(queryset)
@@ -1041,6 +1108,11 @@ def run_pipeline(context, mode="run"):
                     mode, channel.name, budget.reason,
                 )
                 break
+
+            if settings["mark_broken_channels"] and candidates:
+                _update_broken_marker(
+                    resolved, channel, candidates, state, settings, log, mode
+                )
 
             ordered, detach = plan_channel(
                 attached_ids, candidates, state,

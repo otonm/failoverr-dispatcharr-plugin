@@ -980,6 +980,202 @@ def test_run_pipeline_report_includes_the_response_time_column(tmp_path, monkeyp
     assert rows[0]["response_time_ms"] == "180"
 
 
+# --- Broken channel marker ---------------------------------------------
+
+
+def test_apply_broken_suffix_appends_once():
+    from failoverr.pipeline import apply_broken_suffix
+
+    once = apply_broken_suffix("RAI 1", " [BROKEN]", is_broken=True)
+    assert once == "RAI 1 [BROKEN]"
+    assert apply_broken_suffix(once, " [BROKEN]", is_broken=True) == once
+
+
+def test_apply_broken_suffix_strips_once_healthy():
+    from failoverr.pipeline import apply_broken_suffix
+
+    healed = apply_broken_suffix("RAI 1 [BROKEN]", " [BROKEN]", is_broken=False)
+    assert healed == "RAI 1"
+    assert apply_broken_suffix(healed, " [BROKEN]", is_broken=False) == healed
+
+
+def test_apply_broken_suffix_noop_on_blank_suffix():
+    from failoverr.pipeline import apply_broken_suffix
+
+    assert apply_broken_suffix("RAI 1", "", is_broken=True) == "RAI 1"
+
+
+def test_channel_broken_state_prefers_valid_over_invalid(tmp_path):
+    from failoverr.pipeline import _channel_broken_state
+
+    state = _make_state(tmp_path)
+    state.record(1, "http://a", VALID)
+    state.record(2, "http://b", INVALID)
+    candidates = [row(1, "A", "p"), row(2, "B", "p")]
+    assert _channel_broken_state(candidates, state) is False
+
+
+def test_channel_broken_state_true_when_only_invalid(tmp_path):
+    from failoverr.pipeline import _channel_broken_state
+
+    state = _make_state(tmp_path)
+    state.record(1, "http://a", INVALID)
+    assert _channel_broken_state([row(1, "A", "p")], state) is True
+
+
+def test_channel_broken_state_none_when_nothing_conclusive(tmp_path):
+    """Never-probed or inconclusive-only candidates leave the marker alone."""
+    from failoverr.pipeline import _channel_broken_state
+
+    state = _make_state(tmp_path)
+    state.record(1, "http://a", INCONCLUSIVE)
+    candidates = [row(1, "A", "p"), row(2, "B", "p")]  # 2 never probed
+    assert _channel_broken_state(candidates, state) is None
+
+
+def test_channel_broken_state_none_when_invalid_mixed_with_unresolved(tmp_path):
+    """One confirmed-invalid stream is not enough - every candidate must be.
+
+    Regression: an earlier version returned True as soon as any candidate
+    was INVALID, marking a channel broken while another of its candidates
+    was still genuinely unresolved (never probed) - exactly the "not yet
+    probed" case the marker is supposed to never act on.
+    """
+    from failoverr.pipeline import _channel_broken_state
+
+    state = _make_state(tmp_path)
+    state.record(1, "http://a", INVALID)
+    candidates = [row(1, "A", "p"), row(2, "B", "p")]  # 2 never probed
+    assert _channel_broken_state(candidates, state) is None
+
+
+class _FakeQuerySet(list):
+    def filter(self, **kwargs):
+        if "name__in" in kwargs:
+            names = set(kwargs["name__in"])
+            return _FakeQuerySet(c for c in self if c.name in names)
+        raise NotImplementedError(kwargs)
+
+
+class _FakeChannelModel:
+    def __init__(self, items):
+        self.objects = types.SimpleNamespace(all=lambda: _FakeQuerySet(items))
+
+
+def test_select_channels_matches_a_channel_after_the_marker_renamed_it():
+    """Regression: channel_names is an exact match.
+
+    A rename this same feature performs would otherwise drop the channel
+    out of its own configured filter forever - defeating the marker's
+    self-clearing.
+    """
+    from failoverr.pipeline import select_channels
+
+    channel = types.SimpleNamespace(id=1, name="RAI 1 [BROKEN]")
+    resolved = types.SimpleNamespace(channel_model=_FakeChannelModel([channel]))
+    settings = {
+        "channel_names": ["RAI 1"], "channel_group": "",
+        "mark_broken_channels": True, "broken_channel_suffix": " [BROKEN]",
+    }
+
+    assert select_channels(resolved, settings) == [channel]
+
+
+def test_select_channels_does_not_widen_the_filter_when_marking_is_off():
+    from failoverr.pipeline import select_channels
+
+    channel = types.SimpleNamespace(id=1, name="RAI 1 [BROKEN]")
+    resolved = types.SimpleNamespace(channel_model=_FakeChannelModel([channel]))
+    settings = {
+        "channel_names": ["RAI 1"], "channel_group": "",
+        "mark_broken_channels": False, "broken_channel_suffix": " [BROKEN]",
+    }
+
+    assert select_channels(resolved, settings) == []
+
+
+def test_run_pipeline_marks_a_channel_broken_when_every_stream_is_invalid(
+    tmp_path, monkeypatch,
+):
+    channel = types.SimpleNamespace(id=1, name="RAI 1")
+    attached = [row(1, "IT: RAI 1 HD", "A")]
+    state = _make_state(tmp_path)
+    state.record(1, attached[0].url, INVALID)  # fresh: no re-probe needed
+    _patch_common(monkeypatch, tmp_path, channel, attached, state)
+
+    renamed = []
+    monkeypatch.setattr(
+        models_access_module, "rename_channel",
+        lambda _resolved, ch, new_name: renamed.append((ch.name, new_name)),
+    )
+
+    run_pipeline({"settings": {"dry_run": False}}, mode="run")
+
+    assert renamed == [("RAI 1", "RAI 1 [BROKEN]")]
+
+
+def test_run_pipeline_clears_the_marker_once_a_stream_is_valid_again(
+    tmp_path, monkeypatch,
+):
+    channel = types.SimpleNamespace(id=1, name="RAI 1 [BROKEN]")
+    attached = [row(1, "IT: RAI 1 HD", "A")]
+    state = _make_state(tmp_path)
+    state.record(1, attached[0].url, VALID)
+    _patch_common(monkeypatch, tmp_path, channel, attached, state)
+
+    renamed = []
+    monkeypatch.setattr(
+        models_access_module, "rename_channel",
+        lambda _resolved, ch, new_name: renamed.append((ch.name, new_name)),
+    )
+
+    run_pipeline({"settings": {"dry_run": False}}, mode="run")
+
+    assert renamed == [("RAI 1 [BROKEN]", "RAI 1")]
+
+
+def test_run_pipeline_does_not_mark_broken_when_the_setting_is_off(
+    tmp_path, monkeypatch,
+):
+    channel = types.SimpleNamespace(id=1, name="RAI 1")
+    attached = [row(1, "IT: RAI 1 HD", "A")]
+    state = _make_state(tmp_path)
+    state.record(1, attached[0].url, INVALID)
+    _patch_common(monkeypatch, tmp_path, channel, attached, state)
+
+    renamed = []
+    monkeypatch.setattr(
+        models_access_module, "rename_channel",
+        lambda _resolved, ch, new_name: renamed.append((ch.name, new_name)),
+    )
+
+    run_pipeline(
+        {"settings": {"dry_run": False, "mark_broken_channels": False}}, mode="run"
+    )
+
+    assert renamed == []
+
+
+def test_run_pipeline_computes_but_does_not_save_the_marker_under_dry_run(
+    tmp_path, monkeypatch,
+):
+    channel = types.SimpleNamespace(id=1, name="RAI 1")
+    attached = [row(1, "IT: RAI 1 HD", "A")]
+    state = _make_state(tmp_path)
+    state.record(1, attached[0].url, INVALID)
+    _patch_common(monkeypatch, tmp_path, channel, attached, state)
+
+    renamed = []
+    monkeypatch.setattr(
+        models_access_module, "rename_channel",
+        lambda _resolved, ch, new_name: renamed.append((ch.name, new_name)),
+    )
+
+    run_pipeline({"settings": {}}, mode="run")  # dry_run defaults to True
+
+    assert renamed == [], "dry_run must never write the rename"
+
+
 # --- Run-ending status: completed / canceled / interrupted -----------------
 
 

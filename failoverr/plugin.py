@@ -206,7 +206,10 @@ class Plugin:
             "help_text": (
                 "One channel name per line. When set, only these channels are "
                 "processed and the group filter is ignored. Use this to test "
-                "on one channel before a full run."
+                "on one channel before a full run. If 'Mark channels with no "
+                "valid streams' is on, a name here also matches that channel "
+                "once it carries the broken suffix, so a marked channel is "
+                "not silently dropped from this list and can still recover."
             ),
         },
         {
@@ -375,6 +378,37 @@ class Plugin:
                 "Safety stop for a provider that hangs every connection. A "
                 "typical run takes 10 to 20 minutes. Stopping early is not "
                 "destructive - progress is saved."
+            ),
+        },
+        {
+            "id": "mark_broken_channels",
+            "label": "Mark channels with no valid streams",
+            "type": "boolean",
+            "default": True,
+            "help_text": (
+                "Appends a suffix to a channel's name once every one of its "
+                "matched and attached streams is confirmed invalid, so a "
+                "dead channel is obvious at a glance in the channel list. "
+                "The suffix is removed automatically once the channel has a "
+                "valid stream again. Only applies to channels that matched "
+                "or already have at least one stream - a channel that "
+                "matches nothing is left alone, as is one nothing has been "
+                "probed for yet. Ignored while dry run is on."
+            ),
+        },
+        {
+            "id": "broken_channel_suffix",
+            "label": "Broken channel suffix",
+            "type": "string",
+            "default": " [BROKEN]",
+            "help_text": (
+                "Appended to the channel name when 'Mark channels with no "
+                "valid streams' is on. Keep it inside brackets or "
+                "parentheses, like the default - that is what makes "
+                "matching ignore it, so a marked channel is still found "
+                "again once a stream becomes valid. A suffix without "
+                "brackets becomes part of the name Failoverr matches "
+                "against, which will break that channel's matching."
             ),
         },
         {
