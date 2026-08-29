@@ -136,7 +136,7 @@ def _status_message(lock, stop_requested, streams_tracked):
 
 class Plugin:
     name = "Failoverr"
-    version = "0.1.0"
+    version = "1.0.0"
     description = (
         "Matches M3U streams to your channels, probes them for real validity "
         "and quality, and maintains failover order with providers interleaved."
