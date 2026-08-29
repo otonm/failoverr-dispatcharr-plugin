@@ -26,8 +26,28 @@ eventually removed, and a stream that comes back gets restored automatically.
 
 ## Installing
 
-Drop the `failoverr/` directory into Dispatcharr's plugins directory and
-enable it from the Plugins page. Dispatcharr loads `plugin.py` directly.
+### From a release (recommended)
+
+1. Download `failoverr-vX.Y.Z.zip` from the
+   [Releases page](https://github.com/otonm/failoverr-dispatcharr-plugin/releases/latest).
+2. Extract it — this produces a `failoverr/` directory containing
+   `plugin.py`, `plugin.json`, and the rest of the plugin's code.
+3. Copy that `failoverr/` directory into Dispatcharr's plugins directory,
+   alongside any other plugins you have installed.
+4. In Dispatcharr, go to **Settings > Plugins**, find Failoverr, and enable
+   it. Dispatcharr loads `plugin.py` directly — no build step, no
+   dependencies to install.
+
+To upgrade, replace the `failoverr/` directory with the new release's and
+re-enable the plugin; your settings, probe cache, and reports are stored
+outside the plugin directory (`/data/failoverr/`, `/data/exports/`) and
+survive the upgrade.
+
+### From source
+
+Clone this repository and copy (or symlink) its `failoverr/` directory into
+Dispatcharr's plugins directory the same way — useful if you want to track
+`main` instead of a tagged release.
 
 ## First run
 
