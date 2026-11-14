@@ -514,6 +514,54 @@ def test_load_settings_parses_channel_aliases():
     }
 
 
+def test_alias_problems_names_each_malformed_line_by_number():
+    problems = pipeline_module.alias_problems({"settings": {"channel_aliases": (
+        "Sky Crime = Sky Crime Investigation\n"
+        "no equals sign here\n"
+        " = orphan alias\n"
+        "\n"
+        "Rai 1 = , ,\n"
+    )}})
+    assert [p.split(":")[0] for p in problems] == [
+        "Channel aliases line 2", "Channel aliases line 3", "Channel aliases line 5",
+    ]
+    assert "'no equals sign here'" in problems[0]
+
+
+def test_alias_problems_is_empty_for_a_blank_setting():
+    assert pipeline_module.alias_problems({"settings": {}}) == []
+
+
+def test_binary_problems_checks_ffmpeg_only_when_blank_detect_is_on(monkeypatch):
+    monkeypatch.setattr(models_access_module, "binary_version",
+                        lambda path: {"path": path, "present": False})
+    off = pipeline_module.binary_problems(load_settings({"settings": {}}))
+    on = pipeline_module.binary_problems(
+        load_settings({"settings": {"blank_detect": True}})
+    )
+    assert [p.split(" ")[0] for p in off] == ["ffprobe"]
+    assert [p.split(" ")[0] for p in on] == ["ffprobe", "ffmpeg"]
+
+
+def test_start_refuses_without_taking_the_lock_when_preflight_fails(monkeypatch):
+    monkeypatch.setattr(models_access_module, "binary_version",
+                        lambda path: {"path": path, "present": True})
+    result = pipeline_module.start({"settings": {"channel_aliases": "bad line"}})
+    assert result["status"] == "error"
+    assert "Channel aliases line 1" in result["message"]
+    assert lock_status()["holder"] is None
+
+
+def test_preview_refuses_on_a_malformed_alias_line(monkeypatch):
+    def unreachable():
+        raise AssertionError("preview must refuse before touching the ORM")
+
+    monkeypatch.setattr(models_access_module, "resolve_models", unreachable)
+    result = pipeline_module.run_preview({"settings": {"channel_aliases": "bad"}})
+    assert result["status"] == "error"
+    assert "Channel aliases line 1" in result["message"]
+
+
 def test_channel_candidates_include_streams_matched_by_alias(monkeypatch):
     """Regression: 'Sky Crime' matched none of its provider's streams.
 
@@ -1577,6 +1625,8 @@ def test_backgrounded_start_closes_its_django_connection(tmp_path, monkeypatch):
     # Run the "background" work synchronously so the assertion below doesn't
     # race a real thread.
     monkeypatch.setattr(pipeline_module, "spawn", lambda fn, *args: fn(*args))
+    monkeypatch.setattr(models_access_module, "binary_version",
+                        lambda path: {"path": path, "present": True})
 
     calls = []
     monkeypatch.setattr(pipeline_module, "_close_connection",

@@ -40,3 +40,38 @@ def test_scheduled_run_calls_run_action_with_the_run_action_id(fake_plugin_manag
 
 def test_scheduled_run_returns_run_actions_result(fake_plugin_manager):  # noqa: ARG001
     assert scheduled_run() == {"status": "ok"}
+
+
+def test_scheduled_run_logs_started_for_a_background_start(monkeypatch, caplog):
+    import logging
+
+    _fake_manager(monkeypatch, lambda: {"status": "started"})
+    with caplog.at_level(logging.INFO, logger="failoverr"):
+        scheduled_run()
+    assert "FAILOVERR scheduled_run (celery beat) STARTED" in caplog.text
+
+
+def test_scheduled_run_logs_failed_and_reraises_on_error(monkeypatch, caplog):
+    import logging
+
+    def boom():
+        raise RuntimeError("ffprobe not found")
+
+    _fake_manager(monkeypatch, boom)
+    with caplog.at_level(logging.INFO, logger="failoverr"), \
+            pytest.raises(RuntimeError):
+        scheduled_run()
+    assert "FAILOVERR scheduled_run (celery beat) FAILED" in caplog.text
+    assert "ffprobe not found" in caplog.text
+
+
+def _fake_manager(monkeypatch, outcome):
+    class FakeManager:
+        def run_action(self, *_args):
+            return outcome()
+
+    fake_loader = types.ModuleType("apps.plugins.loader")
+    fake_loader.PluginManager = types.SimpleNamespace(get=FakeManager)
+    monkeypatch.setitem(sys.modules, "apps", types.ModuleType("apps"))
+    monkeypatch.setitem(sys.modules, "apps.plugins", types.ModuleType("apps.plugins"))
+    monkeypatch.setitem(sys.modules, "apps.plugins.loader", fake_loader)

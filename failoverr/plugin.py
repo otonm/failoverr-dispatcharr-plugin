@@ -99,11 +99,12 @@ def _scheduler_report(scheduling):
 def _log_report(log, action, label, payload):
     """Log one prefixed line per top-level key.
 
-    Dispatcharr shows nothing in the UI, so `docker logs -f dispatcharr |
-    grep FAILOVERR` is the only channel - and grep is line-based, so a
-    single multi-line dump would match on its first line only. A nested
-    value (diagnose's result, mostly) is rendered as one JSON blob rather
-    than one line per leaf, so it still fits on its own greppable line.
+    Dispatcharr's UI shows only the result's message, so `docker logs -f
+    dispatcharr | grep FAILOVERR` is the only place for the rest - and grep
+    is line-based, so a single multi-line dump would match on its first
+    line only. A nested value (diagnose's result, mostly) is rendered as
+    one JSON blob rather than one line per leaf, so it still fits on its
+    own greppable line.
     """
     for key, value in (payload or {}).items():
         if any(word in key.lower() for word in _REDACT):
@@ -136,7 +137,7 @@ def _status_message(lock, stop_requested, streams_tracked):
 
 class Plugin:
     name = "Failoverr"
-    version = "1.1.0"
+    version = "1.2.0"
     description = (
         "Matches M3U streams to your channels, probes them for real validity "
         "and quality, and maintains failover order with providers interleaved."
@@ -162,9 +163,8 @@ class Plugin:
             "type": "string",
             "default": "/usr/local/bin/ffprobe",
             "help_text": (
-                "Wrong path means every probe fails as inconclusive and "
-                "nothing is ever attached. Run Diagnose to confirm this path "
-                "exists before your first run."
+                "A wrong path stops Run (and scheduled runs) from starting, "
+                "with an error naming the path. Diagnose checks it too."
             ),
         },
         {
@@ -174,7 +174,8 @@ class Plugin:
             "default": "/usr/local/bin/ffmpeg",
             "help_text": (
                 "Used only for blank-screen detection. Ignored when that "
-                "setting is off."
+                "setting is off; with it on, a wrong path stops Run from "
+                "starting."
             ),
         },
         {
@@ -243,7 +244,9 @@ class Plugin:
                 "probed and attached. Quality tokens and country prefixes are "
                 "ignored here as well, so one alias covers every quality "
                 "variant. An alias that names a different channel pulls that "
-                "channel's streams in."
+                "channel's streams in. A line that doesn't follow this format "
+                "stops Preview and Run from starting, with an error naming "
+                "the line number."
             ),
         },
         {
@@ -546,21 +549,18 @@ class Plugin:
             "clear_state": self._clear_state,
             "show_status": self._show_status,
         }
+        # Errors are raised, never returned: Dispatcharr shows a returned
+        # dict as a green notification whatever its status, and only an
+        # exception as a red one ("Failed to run plugin action: <message>").
         handler = handlers.get(action)
         if handler is None:
             log.error("FAILOVERR %s FAILED: unknown action", action)
-            return {"status": "error", "message": f"Unknown action: {action}"}
+            raise RuntimeError(f"Unknown action: {action}")
         try:
             result = handler(params or {}, context)
-        except Exception as exc:
-            # This is the plugin's outer boundary: whichever of the six
-            # action handlers just ran can fail in ways specific to it (a
-            # bad ffprobe path, a Django error, a malformed setting), and
-            # every one of them has to come back as a normal error dict -
-            # an uncaught exception here would surface as a raw traceback
-            # in Dispatcharr's UI instead, logged rather than swallowed.
+        except Exception:
             log.exception("FAILOVERR %s FAILED", action)
-            return {"status": "error", "message": str(exc)}
+            raise
         _log_report(log, action, "result", result)
         status = result.get("status") if isinstance(result, dict) else None
         # "started" means a background thread/greenlet just launched, not that
@@ -573,6 +573,8 @@ class Plugin:
             "interrupted": "INTERRUPTED",
         }.get(status, "COMPLETED")
         log.info("FAILOVERR %s %s", action, verb)
+        if status == "error":
+            raise RuntimeError(result.get("message") or f"{action} failed")
         return result
 
     def _diagnose(self, params, context):
@@ -586,6 +588,9 @@ class Plugin:
         resolved = models_access.resolve_models()
         environment = models_access.environment_report(
             settings["ffprobe_path"], settings["ffmpeg_path"],
+        )
+        problems = (
+            pipeline.alias_problems(context) + pipeline.binary_problems(settings)
         )
 
         stream_model = resolved.stream_model
@@ -601,12 +606,20 @@ class Plugin:
         ]
 
         channel_model = resolved.channel_model
+        channel_count = channel_model.objects.count()
         channel_names = list(
             channel_model.objects.values_list("name", flat=True)[:10]
         )
 
         result = {
-            "status": "ok",
+            "status": "error" if problems else "ok",
+            "message": (
+                "Diagnose found problems: " + "; ".join(problems)
+                if problems else
+                f"All checks passed: {pool_size} streams in the pool, "
+                f"{channel_count} channels."
+            ),
+            "problems": problems,
             "models": {
                 "channel_stream_model": str(resolved.channel_stream_model),
                 "order_field": resolved.order_field,
@@ -624,7 +637,7 @@ class Plugin:
                 "stream_stats_samples": samples,
             },
             "channels": {
-                "total": channel_model.objects.count(),
+                "total": channel_count,
                 "normalization_examples": [
                     {"name": n, "tokens": list(naming.normalize(
                         n,
@@ -637,9 +650,10 @@ class Plugin:
             "scheduler": _scheduler_report(scheduling),
         }
         _ensure_scheduler(context)
+        # Not the terminal line: run() logs COMPLETED, or FAILED on problems.
         log.info(
-            "FAILOVERR diagnose COMPLETED: pool=%d channels=%d",
-            pool_size, channel_model.objects.count()
+            "FAILOVERR diagnose summary: pool=%d channels=%d problems=%d",
+            pool_size, channel_count, len(problems),
         )
         return result
 

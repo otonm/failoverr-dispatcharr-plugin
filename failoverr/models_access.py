@@ -68,7 +68,7 @@ def resolve_models():
     )
 
 
-def _binary_version(path):
+def binary_version(path):
     resolved = shutil.which(path) or path
     try:
         proc = subprocess.run(
@@ -126,8 +126,8 @@ def _gevent_status():
 
 def environment_report(ffprobe_path, ffmpeg_path):
     return {
-        "ffprobe": _binary_version(ffprobe_path),
-        "ffmpeg": _binary_version(ffmpeg_path),
+        "ffprobe": binary_version(ffprobe_path),
+        "ffmpeg": binary_version(ffmpeg_path),
         "gevent": _gevent_status(),
         "celery_beat": _module_available("django_celery_beat"),
     }

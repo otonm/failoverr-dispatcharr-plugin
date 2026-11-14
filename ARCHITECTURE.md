@@ -8,7 +8,8 @@ and how to configure it, see [README.md](README.md).
 ```
 failoverr/
   plugin.py         Entry point: Plugin class, fields/actions, action handlers
-  pipeline.py        Orchestration: settings, indexing, matching, planning, run loop
+  pipeline.py        Orchestration: settings, preflight checks, indexing, matching,
+                     planning, run loop
   models_access.py   All ORM access + runtime field-name resolution
   naming.py           Pure: channel/stream name normalization
   ordering.py         Pure: quality ranking, provider interleaving, order-rewrite
@@ -57,13 +58,31 @@ carries the raw (possibly all-string) setting values from the UI;
 `context["logger"]` is Dispatcharr's logger for this plugin.
 
 `run()` is a thin dispatch table over six handlers (`diagnose`, `preview`,
-`run`→`_start`, `stop`, `clear_state`, `show_status`). It wraps every handler
-in `try/except Exception` — an uncaught exception must never surface as a
-raw traceback in Dispatcharr's UI — and logs a `FAILOVERR <action> START` /
-`COMPLETED`/`FAILED`/`STARTED`/`CANCELED`/`INTERRUPTED` line pair around each
-call, which is the whole observability story here: Dispatcharr's UI shows
-nothing, so `docker logs -f dispatcharr | grep FAILOVERR` is the intended
-debugging tool.
+`run`→`_start`, `stop`, `clear_state`, `show_status`). It logs a
+`FAILOVERR <action> START` / `COMPLETED`/`FAILED`/`STARTED`/`CANCELED`/
+`INTERRUPTED` line pair around each call, plus one line per top-level key
+of the result.
+
+Dispatcharr's UI shows only one thing from an action: a notification. A
+returned dict's `message` appears in a **green** one whatever its `status`;
+only an exception produces a **red** one ("Failed to run plugin action:
+<message>"). So `run()` never returns an error: a handler's exception is
+logged and re-raised, and an `{"status": "error"}` result is logged and
+then raised as `RuntimeError(message)`. Everything beyond that one message
+lives in the logs — `docker logs -f dispatcharr | grep FAILOVERR`.
+
+### Preflight checks
+
+`pipeline.alias_problems(context)` (one message per malformed "Channel
+aliases" line, with its line number) and `pipeline.binary_problems(settings)`
+(ffprobe always, ffmpeg only when blank detection is on, via
+`models_access.binary_version`) return human-readable problems.
+`pipeline.start()` refuses on either, before taking the lock, so a manual
+Run and a scheduled run both stop with a red notification / `FAILED` log
+line instead of probing with a missing binary or matching with a
+half-ignored alias list. `run_preview()` checks aliases only — it never
+probes. Diagnose reports both without refusing to run: it still gathers
+and logs everything else, then fails with the problem list.
 
 ### Settings
 
@@ -285,7 +304,10 @@ real action result must still come back even if arming the schedule failed.
 `PeriodicTask` row points at; it just calls
 `PluginManager.get().run_action("failoverr", "run", {})` — same code path as
 a manual Run button press, so there is no separate scheduled-run
-implementation to keep in sync. Dispatcharr's celery worker startup hook
+implementation to keep in sync. Because `Plugin.run` raises on errors, it
+logs `FAILOVERR scheduled_run (celery beat) FAILED: <message>` and re-raises
+(celery then records the task as failed); a successful start logs
+`STARTED`. Dispatcharr's celery worker startup hook
 imports every enabled plugin's `plugin.py` at each worker (re)start, which
 is what actually registers the task — celery beat itself never imports
 `plugin.py`, it only stores the dotted task name string. This is also why a

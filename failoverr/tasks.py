@@ -37,8 +37,14 @@ def scheduled_run():
     # (and @shared_task above still registers) without it.
     from apps.plugins.loader import PluginManager
 
-    result = PluginManager.get().run_action(PLUGIN_KEY, "run", {})
+    # Plugin.run raises on every error (that is what turns the GUI
+    # notification red), so a failure arrives here as an exception.
+    try:
+        result = PluginManager.get().run_action(PLUGIN_KEY, "run", {})
+    except Exception as exc:
+        logger.error("FAILOVERR scheduled_run (celery beat) FAILED: %s", exc)  # noqa: TRY400 - Plugin.run already logged the traceback
+        raise
     status = result.get("status") if isinstance(result, dict) else None
-    verb = "COMPLETED" if status == "ok" else "FAILED"
+    verb = "STARTED" if status == "started" else "COMPLETED"
     logger.info("FAILOVERR scheduled_run (celery beat) %s: %s", verb, result)
     return result

@@ -6,10 +6,9 @@ from failoverr.models_access import FieldResolutionError
 from failoverr.plugin import Plugin, _scheduler_report
 
 
-def test_unknown_action_returns_error_not_exception():
-    result = Plugin().run("no_such_action", {}, {})
-    assert result["status"] == "error"
-    assert "no_such_action" in result["message"]
+def test_unknown_action_raises_so_dispatcharr_shows_it_red():
+    with pytest.raises(RuntimeError, match="no_such_action"):
+        Plugin().run("no_such_action", {}, {})
 
 
 def test_field_resolution_failure_surfaces_as_readable_error(monkeypatch):
@@ -20,11 +19,9 @@ def test_field_resolution_failure_surfaces_as_readable_error(monkeypatch):
         )
 
     monkeypatch.setattr("failoverr.models_access.resolve_models", boom)
-    result = Plugin().run("diagnose", {}, {})
-    assert result["status"] == "error"
-    assert "Available fields" in result["message"], (
-        "the user must see what fields DO exist so they can report them"
-    )
+    # The user must see what fields DO exist so they can report them.
+    with pytest.raises(FieldResolutionError, match="Available fields"):
+        Plugin().run("diagnose", {}, {})
 
 
 class FakeLogger:
@@ -62,10 +59,17 @@ def test_every_logged_line_is_greppable(monkeypatch):
     assert "FAILOVERR diagnose COMPLETED" in log.lines
 
 
-def test_error_result_logs_failed_not_completed(monkeypatch):
+def test_error_result_raises_and_logs_failed_not_completed(monkeypatch):
+    """Dispatcharr shows a returned dict green whatever its status.
+
+    Only an exception turns the notification red.
+    """
     log = FakeLogger()
-    monkeypatch.setattr(Plugin, "_diagnose", _stub({"status": "error"}))
-    Plugin().run("diagnose", {}, {"logger": log})
+    monkeypatch.setattr(
+        Plugin, "_diagnose", _stub({"status": "error", "message": "it broke"})
+    )
+    with pytest.raises(RuntimeError, match="it broke"):
+        Plugin().run("diagnose", {}, {"logger": log})
     assert "FAILOVERR diagnose FAILED" in log.lines
     assert "FAILOVERR diagnose COMPLETED" not in log.lines
 
@@ -73,9 +77,10 @@ def test_error_result_logs_failed_not_completed(monkeypatch):
 @pytest.mark.parametrize("key", ["password", "secret", "api_key"])
 def test_secret_settings_are_not_logged(key):
     log = FakeLogger()
-    Plugin().run(
-        "no_such_action", {}, {"logger": log, "settings": {key: "hunter2"}}
-    )
+    with pytest.raises(RuntimeError):
+        Plugin().run(
+            "no_such_action", {}, {"logger": log, "settings": {key: "hunter2"}}
+        )
     assert "hunter2" not in "\n".join(log.lines)
     assert f"FAILOVERR no_such_action settings.{key} = ***" in log.lines
 
@@ -103,8 +108,12 @@ def test_every_declared_action_has_a_handler(action_id, monkeypatch, tmp_path):
     monkeypatch.setattr("failoverr.pipeline.STATE_PATH", state_path)
     monkeypatch.setattr("failoverr.state.DEFAULT_PATH", state_path)
 
-    result = Plugin().run(action_id, {}, {})
-    assert "Unknown action" not in result.get("message", "")
+    error = ""
+    try:
+        Plugin().run(action_id, {}, {})
+    except RuntimeError as exc:
+        error = str(exc)
+    assert "Unknown action" not in error
 
 
 def test_diagnose_computes_settings_via_pipeline_load_settings(monkeypatch):
@@ -129,9 +138,9 @@ def test_diagnose_computes_settings_via_pipeline_load_settings(monkeypatch):
     )
 
     context = {"settings": {"strip_tokens": "xx,yy"}}
-    result = Plugin().run("diagnose", {}, context)
+    with pytest.raises(RuntimeError, match="stop before touching the ORM"):
+        Plugin().run("diagnose", {}, context)
 
-    assert result["status"] == "error"
     assert len(calls) == 1
     assert calls[0] is context
 

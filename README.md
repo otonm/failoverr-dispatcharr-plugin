@@ -53,9 +53,10 @@ Dispatcharr's plugins directory the same way — useful if you want to track
 ## First run
 
 1. **Diagnose** (read-only) — confirms Failoverr can see your Dispatcharr
-   models, that `ffprobe`/`ffmpeg` are on the configured paths, and shows a
-   few examples of how your channel names normalize for matching. Run this
-   first, and again any time something looks wrong.
+   models, that `ffprobe`/`ffmpeg` are on the configured paths, that the
+   **Channel aliases** setting is well formed, and shows a few examples of
+   how your channel names normalize for matching. Run this first, and again
+   any time something looks wrong.
 2. Leave **Dry run** on and press **Preview** — read-only, shows exactly
    which streams would be attached and in what order, without probing or
    changing anything. Check the CSV report under `/data/exports/`.
@@ -76,6 +77,14 @@ Dispatcharr's plugins directory the same way — useful if you want to track
 | **Stop** | Asks a running Run to stop at its next checkpoint. Cooperative — the probe already in flight finishes first. |
 | **Clear State** | Wipes the probe cache (verdicts, failure counters). Every stream is re-checked from scratch on the next run. Does not touch attached streams. |
 | **Show Status** | Current progress of a running job, or the outcome of the last one. |
+
+Every action shows its result as a notification: green when it worked, red
+when it didn't. **Preview** and **Run** (including scheduled runs) refuse to
+start, with a red notification naming each problem, when a **Channel
+aliases** line is malformed; **Run** also refuses when `ffprobe` (or
+`ffmpeg`, with blank detection on) can't be found at its configured path.
+Diagnose lists the same problems. The full details of every action are in
+`docker logs -f dispatcharr | grep FAILOVERR`.
 
 ## Key settings
 
@@ -137,8 +146,11 @@ pruned automatically.
 
 ## Troubleshooting
 
-- **Nothing gets attached** — run Diagnose first and check the ffprobe path
-  is correct; a wrong path makes every probe come back inconclusive.
+- **Run refuses to start** — the red notification names each problem: fix
+  the "ffprobe path" / "ffmpeg path" setting, or the numbered "Channel
+  aliases" line it quotes.
+- **Nothing gets attached** — run Diagnose first, then check the CSV report
+  under `/data/exports/` for what happened to each stream.
 - **A channel matches nothing** — check Diagnose's normalization examples
   against your channel and stream names; a channel name containing a word
   that's also in "Quality tokens to ignore" will fail to match. If the

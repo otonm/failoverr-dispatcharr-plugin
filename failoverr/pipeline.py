@@ -297,13 +297,50 @@ def load_settings(context):
         for line in str(raw.get("channel_names") or "").splitlines()
         if line.strip()
     ]
-    settings["channel_aliases"] = {}
-    for line in str(raw.get("channel_aliases") or "").splitlines():
-        channel, sep, aliases = line.partition("=")
-        names = [a.strip() for a in aliases.split(",") if a.strip()]
-        if sep and channel.strip() and names:
-            settings["channel_aliases"][channel.strip()] = names
+    settings["channel_aliases"], _ = _parse_aliases(raw.get("channel_aliases"))
     return settings
+
+
+def _parse_aliases(text):
+    """Parse the aliases textarea into ({channel: [aliases]}, [problems])."""
+    aliases, problems = {}, []
+    for number, line in enumerate(str(text or "").splitlines(), start=1):
+        if not line.strip():
+            continue
+        channel, sep, rest = line.partition("=")
+        names = [a.strip() for a in rest.split(",") if a.strip()]
+        if sep and channel.strip() and names:
+            aliases[channel.strip()] = names
+        else:
+            problems.append(
+                f"Channel aliases line {number}: expected "
+                f"'Channel = alias, alias', got {line.strip()!r}"
+            )
+    return aliases, problems
+
+
+def alias_problems(context):
+    """Malformed lines in the Channel aliases setting, one message each."""
+    return _parse_aliases((context.get("settings") or {}).get("channel_aliases"))[1]
+
+
+def binary_problems(settings):
+    """Missing or broken ffprobe (always) and ffmpeg (blank detection only)."""
+    needed = [("ffprobe", settings["ffprobe_path"], "")]
+    if settings["blank_detect"]:
+        needed.append(
+            ("ffmpeg", settings["ffmpeg_path"], " (needed for blank detection)")
+        )
+    return [
+        f"{label} not found or not runnable at {path!r}{why}. "
+        f"Fix the '{label} path' setting."
+        for label, path, why in needed
+        if not models_access.binary_version(path)["present"]
+    ]
+
+
+def _refusal(problems):
+    return {"status": "error", "message": "Not started: " + "; ".join(problems)}
 
 
 def write_report(rows, path):
@@ -455,6 +492,11 @@ def run_preview(context):
     """Read-only. Match and order from cached probe data, write a CSV."""
     log = context.get("logger") or logger
     settings = load_settings(context)
+    # Preview never probes, so a missing ffprobe doesn't block it - but a
+    # bad alias line would make it show the wrong matches.
+    problems = alias_problems(context)
+    if problems:
+        return _refusal(problems)
     resolved = models_access.resolve_models()
     state = State.load(STATE_PATH)
 
@@ -1191,6 +1233,10 @@ def start(context, mode="run"):
     """Acquire the lock and run in the background."""
     log = context.get("logger") or logger
     settings = load_settings(context)
+    # Checked before the lock, so a refused start leaves nothing to clean up.
+    problems = alias_problems(context) + binary_problems(settings)
+    if problems:
+        return _refusal(problems)
     # The lock's TTL must outlive a legitimate run, not just the default 30
     # minutes: max_run_minutes defaults to 60, and a run within its budget
     # must not have its lock auto-stolen by a second acquire_lock partway
