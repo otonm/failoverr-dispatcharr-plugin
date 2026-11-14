@@ -228,6 +228,25 @@ class Plugin:
             ),
         },
         {
+            "id": "channel_aliases",
+            "label": "Channel aliases",
+            "type": "text",
+            "default": "",
+            "placeholder": (
+                "Sky Crime = Sky Crime Investigation, Sky Crime Invest\n"
+                "Rai 1 = Rai Uno Sud Tirol"
+            ),
+            "help_text": (
+                "One line per channel: your channel name, '=', then the other "
+                "names providers use for it, comma separated. Streams whose "
+                "names reduce to any of those are matched too, so they get "
+                "probed and attached. Quality tokens and country prefixes are "
+                "ignored here as well, so one alias covers every quality "
+                "variant. An alias that names a different channel pulls that "
+                "channel's streams in."
+            ),
+        },
+        {
             "id": "map_number_words",
             "label": "Treat spelled-out numbers as digits",
             "type": "boolean",

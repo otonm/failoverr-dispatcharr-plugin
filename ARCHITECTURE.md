@@ -72,8 +72,8 @@ typed values: numbers are coerced via `int(float(x))` (falling back to the
 field default and logging a warning on a bad value), booleans handle the
 `"false"`/`"0"`/`"no"`/`"off"` strings Dispatcharr may hand back (plain
 `bool("false")` is `True` in Python — the trap this exists to avoid),
-and `strip_tokens`/`codec_priority`/`channel_names` get their own
-comma/line parsing. `Plugin.fields` is the source of truth for defaults —
+and `strip_tokens`/`codec_priority`/`channel_names`/`channel_aliases` get
+their own comma/line parsing. `Plugin.fields` is the source of truth for defaults —
 `pipeline.py` reads it directly (`_DEFAULTS`, `_INT_KEYS`, `_BOOL_KEYS`),
 a deliberate dependency inversion (entry point → core) rather than a second
 place defaults could drift from `plugin.json`.
@@ -87,7 +87,9 @@ output, a token tuple. `build_index()` groups those by `frozenset(tokens)`
 in one pass. `find_matches()` (and `_channel_candidates()`, used by both
 `run_preview` and `run_pipeline` so the two can never disagree on what
 counts as a candidate) is then an O(1) dict lookup per channel — no per-pair
-comparison, matching only exact token-set equality.
+comparison, matching only exact token-set equality. `channel_aliases` adds
+more token sets to look up for a channel (one more lookup per alias), so a
+provider's longer name can be matched without loosening equality.
 
 `naming.normalize()` is pure text processing: NFKD-fold accents, lowercase,
 strip a leading country prefix (`IT:`), strip bracketed/parenthesized

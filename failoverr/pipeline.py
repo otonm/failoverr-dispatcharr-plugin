@@ -19,7 +19,7 @@ object no matter which name it's imported under.
 import concurrent.futures
 import contextlib
 import csv
-import datetime
+import datetime as dt
 import fcntl
 import json
 import logging
@@ -52,13 +52,15 @@ _REPORT_COLUMNS = [
 # the exports directory without bound.
 _MAX_REPORTS = 100
 
-# strip_tokens/codec_priority/channel_names are excluded: load_settings
-# parses them itself (_csv_tuple / splitlines) and must fall through to
+# strip_tokens/codec_priority/channel_names/channel_aliases are excluded:
+# load_settings parses them itself (_csv_tuple / splitlines) and must fall through to
 # naming.py's/ordering.py's own constants, not a re-parsed copy of the
 # field's string default - see load_settings below.
 # Note: pipeline reads Plugin.fields directly, a dependency inversion
 # (entry point -> core) - extract a settings.py if that ever bites.
-_TEXT_LIST_KEYS = frozenset({"strip_tokens", "codec_priority", "channel_names"})
+_TEXT_LIST_KEYS = frozenset({
+    "strip_tokens", "codec_priority", "channel_names", "channel_aliases",
+})
 
 _DEFAULTS = {
     f["id"]: f["default"]
@@ -295,6 +297,12 @@ def load_settings(context):
         for line in str(raw.get("channel_names") or "").splitlines()
         if line.strip()
     ]
+    settings["channel_aliases"] = {}
+    for line in str(raw.get("channel_aliases") or "").splitlines():
+        channel, sep, aliases = line.partition("=")
+        names = [a.strip() for a in aliases.split(",") if a.strip()]
+        if sep and channel.strip() and names:
+            settings["channel_aliases"][channel.strip()] = names
     return settings
 
 
@@ -331,7 +339,7 @@ def _rotate_reports(directory, pattern="failoverr-*.csv", keep=_MAX_REPORTS):
 def report_path(action):
     # datetime.timezone.utc, not datetime.UTC (py3.11+) - the container's
     # Python version is unconfirmed.
-    stamp = datetime.datetime.now(tz=datetime.timezone.utc).strftime("%Y%m%d-%H%M%S")  # noqa: UP017
+    stamp = dt.datetime.now(tz=dt.timezone.utc).strftime("%Y%m%d-%H%M%S")  # noqa: UP017
     return pathlib.Path(EXPORT_DIR) / f"failoverr-{action}-{stamp}.csv"
 
 
@@ -979,11 +987,22 @@ def _channel_candidates(channel, index, resolved, settings):
     derived from the same StreamRows the candidate set is built from, so the
     link table is read once per channel per pass, not twice.
     """
-    tokens = normalize(
-        channel.name or "", strip_tokens=settings["strip_tokens"],
-        map_number_words=settings["map_number_words"],
-    )
-    matched = find_matches(tokens, index)
+    def tokens_of(name):
+        return frozenset(normalize(
+            name or "", strip_tokens=settings["strip_tokens"],
+            map_number_words=settings["map_number_words"],
+        ))
+
+    # Aliases are keyed by the configured name's tokens, not its exact text,
+    # so "Sky Crime" still finds its aliases once renamed "Sky Crime [BROKEN]".
+    tokens = tokens_of(channel.name)
+    lookups = {tokens}
+    for name, aliases in settings["channel_aliases"].items():
+        if tokens and tokens_of(name) == tokens:
+            lookups.update(tokens_of(a) for a in aliases)
+    # Each row sits in exactly one index bucket, so distinct lookups never
+    # return the same stream twice.
+    matched = [r for t in lookups for r in find_matches(t, index)]
     by_id = {row.stream_id: row for row in matched}
     attached_ids = set()
     for row in iter_attached_rows(resolved, channel, settings):

@@ -501,6 +501,42 @@ def test_load_settings_parses_the_channel_name_list():
     assert settings["channel_names"] == ["RAI 1", "RAI 2"]
 
 
+def test_load_settings_parses_channel_aliases():
+    settings = load_settings({"settings": {"channel_aliases": (
+        "Sky Crime = Sky Crime Investigation, Sky Crime Invest\n"
+        "\n"
+        "no equals sign here\n"
+        " Rai 1 =  Rai Uno Sud Tirol ,, \n"
+    )}})
+    assert settings["channel_aliases"] == {
+        "Sky Crime": ["Sky Crime Investigation", "Sky Crime Invest"],
+        "Rai 1": ["Rai Uno Sud Tirol"],
+    }
+
+
+def test_channel_candidates_include_streams_matched_by_alias(monkeypatch):
+    """Regression: 'Sky Crime' matched none of its provider's streams.
+
+    The provider names them 'SKY CRIME INVESTIGATION' / 'SKY CRIME INVEST'.
+    """
+    pool = [
+        row(1, "IT: SKY CRIME INVEST 4K"),
+        row(2, "IT: SKY CRIME INVESTIGATION HD"),
+        row(3, "IT: SKY CRIME INVESTIGATION HEVC"),
+        row(4, "IT: SKY CRIME HD"),
+        row(5, "IT: SKY SPORT HD"),
+    ]
+    settings = load_settings({"settings": {"channel_aliases": (
+        "sky crime HD = Sky Crime Investigation, Sky Crime Invest, Sky Crime"
+    )}})
+    monkeypatch.setattr(pipeline_module, "iter_attached_rows",
+                        lambda *_a: iter([]))
+    matched, _, _ = pipeline_module._channel_candidates(
+        types.SimpleNamespace(name="Sky Crime"), build_index(pool), None, settings,
+    )
+    assert sorted(r.stream_id for r in matched) == [1, 2, 3, 4]
+
+
 @pytest.fixture(autouse=True)
 def _reset_lock(tmp_path, monkeypatch):
     monkeypatch.setattr(pipeline_module, "_LOCK_PATH", str(tmp_path / "run.lock"))

@@ -108,6 +108,7 @@ def test_every_settings_default_matches_the_field_default():
         "strip_tokens": DEFAULT_STRIP_TOKENS,
         "codec_priority": DEFAULT_CODEC_PRIORITY,
         "channel_names": [],
+        "channel_aliases": {},
     }
 
     for field in Plugin.fields:

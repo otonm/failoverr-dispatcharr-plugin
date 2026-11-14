@@ -14,7 +14,8 @@ eventually removed, and a stream that comes back gets restored automatically.
 
 ## What it does
 
-1. Matches every stream in your M3U pool to your existing channels by name.
+1. Matches every stream in your M3U pool to your existing channels by name
+   (or by any aliases you list for a channel).
 2. Probes each candidate stream with `ffprobe` — only ones that are actually
    playable (real video, real audio) are ever attached.
 3. Orders each channel's streams by measured quality (resolution, response
@@ -93,6 +94,10 @@ about up front.
 - **Quality tokens to ignore** — resolution/codec/misc tokens (`HD`, `4K`,
   `HEVC`, `backup`, ...) stripped before matching, so `RAI 1 HD` and `RAI 1
   4K` both reduce to `rai 1`.
+- **Channel aliases** — for providers that name a channel differently, one
+  line per channel: `Sky Crime = Sky Crime Investigation, Sky Crime Invest`.
+  Aliases are normalized like everything else, so quality variants are
+  covered.
 - **Treat spelled-out numbers as digits** — maps `Rai Uno` → `RAI 1` in
   English, Italian, German, and French.
 - **Codec priority / Rank by bitrate** — tune how ties in resolution are
@@ -136,7 +141,8 @@ pruned automatically.
   is correct; a wrong path makes every probe come back inconclusive.
 - **A channel matches nothing** — check Diagnose's normalization examples
   against your channel and stream names; a channel name containing a word
-  that's also in "Quality tokens to ignore" will fail to match.
+  that's also in "Quality tokens to ignore" will fail to match. If the
+  provider uses a longer or different name, add it under "Channel aliases".
 - **A schedule doesn't fire after being enabled** — a freshly-enabled or
   freshly-changed schedule only takes effect once Dispatcharr's celery
   worker next restarts or forks a new child process.
